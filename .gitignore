@@ -1,0 +1,100 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg
+*.egg-info/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+wheels/
+*.manifest
+*.spec
+pip-wheel-metadata/
+share/python-wheels/
+.installed.cfg
+
+# Distribution / packaging
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Type checkers / linters
+.mypy_cache/
+.dmypy.json
+.pytest_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# ---- Data / Models (大型产物，不入库) ----
+data/
+datasets/
+raw_data/
+outputs/
+output/
+runs/
+checkpoints/
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.onnx
+*.h5
+*.safetensors
+wandb/
+mlruns/
+logs/
+*.log
+
+# ---- Media (生成结果) ----
+*.mp4
+*.avi
+*.mov
+*.gif
+*.bvh
+*.fbx
+*.obj
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# ---- IDE / Editor ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ---- OS ----
+Thumbs.db
+desktop.ini
+
+# ---- Project-specific ----
+!requirements.txt
+!environment.yml

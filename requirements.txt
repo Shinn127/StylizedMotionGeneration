@@ -1,0 +1,16 @@
+# Core
+torch>=2.1
+torchvision
+numpy
+scipy
+matplotlib
+tqdm
+
+# Motion / 3D
+# (e.g.) bvh-toolbox, pytorch3d, trimesh
+
+# I/O & utilities
+pyyaml
+tensorboard
+wandb
+einops

@@ -1,0 +1,10 @@
+# Project conda environment
+#
+# The working environment for this project is the conda env `mcc`
+#   /opt/homebrew/Caskroom/miniforge/base/envs/mcc   (Python 3.13.13)
+#
+# Activate it before running anything:
+#   conda activate mcc
+#
+# This file is for documentation only — the canonical environment lives
+# in the shared `mcc` conda env rather than a per-project folder.
