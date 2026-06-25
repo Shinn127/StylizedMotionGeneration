@@ -1,5 +1,7 @@
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import csv
+import multiprocessing as mp
 from pathlib import Path
 
 import numpy as np
@@ -164,6 +166,30 @@ def _process_motion(path, mirror, prune_ends_and_fingers=False):
     }
 
 
+
+
+def _process_motion_pair(task):
+    path, prune_ends_and_fingers = task
+    motions = []
+    for mirror in [False, True]:
+        motion = _process_motion(path, mirror, prune_ends_and_fingers=prune_ends_and_fingers)
+        motions.append((mirror, motion))
+    return path.stem, motions
+
+
+def _process_all_motion_pairs(bvh_paths, prune_ends_and_fingers, workers):
+    workers = max(1, int(workers))
+    tasks = [(path, prune_ends_and_fingers) for path in bvh_paths]
+    if workers == 1:
+        results = (_process_motion_pair(task) for task in tqdm(tasks, desc="Processing motions"))
+        return list(results)
+
+    context = mp.get_context("fork")
+    chunksize = max(1, len(tasks) // (workers * 4))
+    with ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
+        results = executor.map(_process_motion_pair, tasks, chunksize=chunksize)
+        return list(tqdm(results, total=len(tasks), desc="Processing motions"))
+
 def build_lafan_tags():
     tags = []
     for path in sorted(LAFAN_SOURCE.glob("*.bvh")):
@@ -214,7 +240,7 @@ def source_path_for(dataset_name, range_name):
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
-def generate_database(dataset_name, output_dir, styles_arg=None, max_styles=None, prune_ends_and_fingers=False):
+def generate_database(dataset_name, output_dir, styles_arg=None, max_styles=None, prune_ends_and_fingers=False, workers=1):
     output_dir.mkdir(parents=True, exist_ok=True)
     if dataset_name == "lafan":
         tags_data = build_lafan_tags()
@@ -254,16 +280,16 @@ def generate_database(dataset_name, output_dir, styles_arg=None, max_styles=None
     bone_parents = None
     bone_names = None
 
-    for path in tqdm(bvh_paths, desc=f"Processing {dataset_name}"):
-        for mirror in [False, True]:
-            motion = _process_motion(path, mirror, prune_ends_and_fingers=prune_ends_and_fingers)
+    motion_pairs = _process_all_motion_pairs(bvh_paths, prune_ends_and_fingers, workers=workers)
+
+    for range_name, motions in motion_pairs:
+        for mirror, motion in motions:
             if bone_parents is None:
                 bone_parents = motion["parents"]
                 bone_names = motion["names"]
 
             offset = 0 if not range_starts else range_stops[-1]
             nframes = len(motion["positions"])
-            range_name = path.stem
 
             bone_positions.append(motion["positions"])
             bone_velocities.append(motion["velocities"])
@@ -333,6 +359,12 @@ def main():
         action="store_true",
         help="Exclude all *End terminal joints and all hand finger joint chains before building the database.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of worker processes for BVH preprocessing. Use 1 for serial processing.",
+    )
     args = parser.parse_args()
 
     default_output = PROCESSED_DIR / args.dataset
@@ -343,6 +375,7 @@ def main():
         styles_arg=args.styles,
         max_styles=args.max_styles,
         prune_ends_and_fingers=args.prune_ends_and_fingers,
+        workers=args.workers,
     )
     print(f"Saved database to {output_dir / 'database.npz'}")
 

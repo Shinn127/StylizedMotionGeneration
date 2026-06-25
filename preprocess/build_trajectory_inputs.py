@@ -1,13 +1,28 @@
 import argparse
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 import quat
 
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 PROCESSED_DIR = DATA_DIR / "processed"
+
+_WORKER_XROOT_POS = None
+_WORKER_XROOT_ROT = None
+_WORKER_XROOT_DIR = None
+_WORKER_TAG_RANGE_STARTS = None
+_WORKER_TAG_RANGE_STOPS = None
+_WORKER_TAG_RANGE_NAMES = None
+_WORKER_TAG_TAGS = None
+_WORKER_TAG_MIRROR = None
+_WORKER_SELECTED_TAGS = None
+_WORKER_FUTURE_FRAMES = None
+_WORKER_MAX_FUTURE = None
 
 
 def intersect_tagged_ranges(tag_range_starts, tag_range_stops, tag_tags, tags):
@@ -62,7 +77,91 @@ def resolve_database_path(dataset, database_path):
     return PROCESSED_DIR / dataset / "database.npz"
 
 
-def build_trajectory_inputs(database_path, output_path, tags=None, future_frames=None):
+
+def _init_worker(
+    xroot_pos,
+    xroot_rot,
+    xroot_dir,
+    tag_range_starts,
+    tag_range_stops,
+    tag_range_names,
+    tag_tags,
+    tag_mirror,
+    selected_tags,
+    future_frames,
+    max_future,
+):
+    global _WORKER_XROOT_POS
+    global _WORKER_XROOT_ROT
+    global _WORKER_XROOT_DIR
+    global _WORKER_TAG_RANGE_STARTS
+    global _WORKER_TAG_RANGE_STOPS
+    global _WORKER_TAG_RANGE_NAMES
+    global _WORKER_TAG_TAGS
+    global _WORKER_TAG_MIRROR
+    global _WORKER_SELECTED_TAGS
+    global _WORKER_FUTURE_FRAMES
+    global _WORKER_MAX_FUTURE
+
+    _WORKER_XROOT_POS = xroot_pos
+    _WORKER_XROOT_ROT = xroot_rot
+    _WORKER_XROOT_DIR = xroot_dir
+    _WORKER_TAG_RANGE_STARTS = tag_range_starts
+    _WORKER_TAG_RANGE_STOPS = tag_range_stops
+    _WORKER_TAG_RANGE_NAMES = tag_range_names
+    _WORKER_TAG_TAGS = tag_tags
+    _WORKER_TAG_MIRROR = tag_mirror
+    _WORKER_SELECTED_TAGS = selected_tags
+    _WORKER_FUTURE_FRAMES = future_frames
+    _WORKER_MAX_FUTURE = max_future
+
+
+def _build_range_samples(range_bounds):
+    rs, re = range_bounds
+    pose_indices = np.arange(rs + 1, re - _WORKER_MAX_FUTURE, dtype=np.int32)
+    if len(pose_indices) == 0:
+        return None
+
+    cpos = quat.inv_mul_vec(
+        _WORKER_XROOT_ROT[pose_indices][:, None],
+        _WORKER_XROOT_POS[pose_indices[:, None] + _WORKER_FUTURE_FRAMES] - _WORKER_XROOT_POS[pose_indices][:, None],
+    ).astype(np.float32)
+    cdir = quat.inv_mul_vec(
+        _WORKER_XROOT_ROT[pose_indices][:, None],
+        _WORKER_XROOT_DIR[pose_indices[:, None] + _WORKER_FUTURE_FRAMES],
+    ).astype(np.float32)
+
+    mask = (
+        (_WORKER_TAG_RANGE_STARTS == rs)
+        & (_WORKER_TAG_RANGE_STOPS == re)
+        & np.isin(_WORKER_TAG_TAGS, _WORKER_SELECTED_TAGS)
+    )
+    if np.any(mask):
+        range_name = _WORKER_TAG_RANGE_NAMES[mask][0]
+        mirror_flag = bool(_WORKER_TAG_MIRROR[mask][0])
+    else:
+        range_name = "unknown"
+        mirror_flag = False
+
+    sample_range_names = np.full(len(pose_indices), range_name, dtype=object)
+    sample_mirror = np.full(len(pose_indices), mirror_flag, dtype=bool)
+    return pose_indices, cpos, cdir, sample_range_names, sample_mirror
+
+
+def _build_all_range_samples(tasks, workers):
+    workers = max(1, int(workers))
+    if workers == 1:
+        results = (_build_range_samples(task) for task in tqdm(tasks, desc="Building trajectory"))
+        return [result for result in results if result is not None]
+
+    context = mp.get_context("fork")
+    chunksize = max(1, len(tasks) // (workers * 4))
+    with ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
+        results = executor.map(_build_range_samples, tasks, chunksize=chunksize)
+        return [result for result in tqdm(results, total=len(tasks), desc="Building trajectory") if result is not None]
+
+
+def build_trajectory_inputs(database_path, output_path, tags=None, future_frames=None, workers=1):
     data = np.load(database_path, allow_pickle=True)
 
     tag_range_starts = data["tag_range_starts"]
@@ -92,45 +191,29 @@ def build_trajectory_inputs(database_path, output_path, tags=None, future_frames
         selected_tags,
     )
 
-    indices = []
-    future_positions = []
-    future_directions = []
-    sample_range_names = []
-    sample_mirror = []
+    tasks = list(zip(selected_starts.tolist(), selected_stops.tolist()))
+    _init_worker(
+        xroot_pos,
+        xroot_rot,
+        xroot_dir,
+        tag_range_starts,
+        tag_range_stops,
+        tag_range_names,
+        tag_tags,
+        tag_mirror,
+        np.array(selected_tags, dtype=object),
+        future_frames,
+        max_future,
+    )
+    range_results = _build_all_range_samples(tasks, workers=workers)
 
-    for rs, re in zip(selected_starts, selected_stops):
-        pose_indices = np.arange(rs + 1, re - max_future, dtype=np.int32)
-        if len(pose_indices) == 0:
-            continue
-
-        cpos = quat.inv_mul_vec(
-            xroot_rot[pose_indices][:, None],
-            xroot_pos[pose_indices[:, None] + future_frames] - xroot_pos[pose_indices][:, None],
-        ).astype(np.float32)
-        cdir = quat.inv_mul_vec(
-            xroot_rot[pose_indices][:, None],
-            xroot_dir[pose_indices[:, None] + future_frames],
-        ).astype(np.float32)
-
-        indices.append(pose_indices)
-        future_positions.append(cpos)
-        future_directions.append(cdir)
-
-        mask = (tag_range_starts == rs) & (tag_range_stops == re) & np.isin(tag_tags, selected_tags)
-        if np.any(mask):
-            range_name = tag_range_names[mask][0]
-            mirror_flag = bool(tag_mirror[mask][0])
-        else:
-            range_name = "unknown"
-            mirror_flag = False
-        sample_range_names.append(np.full(len(pose_indices), range_name, dtype=object))
-        sample_mirror.append(np.full(len(pose_indices), mirror_flag, dtype=bool))
-
-    if not indices:
+    if not range_results:
         raise ValueError(
             f"No valid trajectory samples found for tags {selected_tags} and future frames {future_frames.tolist()} "
             f"in {database_path}"
         )
+
+    indices, future_positions, future_directions, sample_range_names, sample_mirror = zip(*range_results)
 
     indices = np.concatenate(indices, axis=0)
     future_positions = np.concatenate(future_positions, axis=0)
@@ -171,6 +254,12 @@ def main():
         default="20,40,60",
         help="Comma-separated future frame offsets, e.g. 20,40,60",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of worker processes for per-range trajectory generation. Use 1 for serial processing.",
+    )
     args = parser.parse_args()
 
     future_frames = [int(v.strip()) for v in args.future_frames.split(",") if v.strip()]
@@ -182,6 +271,7 @@ def main():
         output_path=output_path,
         tags=args.tags,
         future_frames=future_frames,
+        workers=args.workers,
     )
     print(f"Saved trajectory inputs to {output_path}")
 

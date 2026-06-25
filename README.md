@@ -38,29 +38,56 @@ StylizedMotionGeneration/
 
 ## Dataset Setup
 
-Create local symlinks under `data/raw/`:
+Create local links under `data/raw/`:
 
 ```bash
+mkdir -p data/raw data/processed
 ln -s /path/to/lafan data/raw/lafan
 ln -s /path/to/100style data/raw/100style
 ```
+
+If you copied the datasets directly into `data/raw/`, regular directories also work.
 
 Build a database in the style of `ControlOperators-main`:
 
 ```bash
 python preprocess/build_database.py --dataset lafan
 python preprocess/build_database.py --dataset 100style
-python preprocess/build_database.py --dataset 100style --max-styles 5 --output data/processed/100style_test5
-python preprocess/build_database.py --dataset 100style --max-styles 5 --prune-ends-and-fingers --output data/processed/100style_test5_pruned
+python preprocess/build_database.py --dataset 100style --max-styles 10 --output data/processed/100style_test10
+python preprocess/build_database.py --dataset 100style --max-styles 10 --prune-ends-and-fingers --output data/processed/100style_test10_pruned
 ```
 
-Outputs are written to `data/processed/<dataset>/database.npz`.
+Both preprocessing entry points support `--workers` for Ubuntu/Linux multi-process acceleration.
+On an 8-core desktop, a good starting point is `--workers 8`:
+
+```bash
+python preprocess/build_database.py \
+  --dataset 100style \
+  --max-styles 10 \
+  --prune-ends-and-fingers \
+  --workers 8 \
+  --output data/processed/100style_test10_pruned
+```
+
+Outputs are written to `data/processed/<name>/database.npz`.
 
 Build ControlOperators-style trajectory inputs from an existing database:
 
 ```bash
 python preprocess/build_trajectory_inputs.py --dataset lafan
-python preprocess/build_trajectory_inputs.py --dataset 100style --database data/processed/100style_test5/database.npz --tags all --output data/processed/100style_test5/trajectory.npz
+python preprocess/build_trajectory_inputs.py --dataset 100style --database data/processed/100style_test10/database.npz --tags all --output data/processed/100style_test10/trajectory.npz
+python preprocess/build_trajectory_inputs.py --dataset 100style --database data/processed/100style_test10_pruned/database.npz --tags all --output data/processed/100style_test10_pruned/trajectory.npz
+```
+
+Trajectory generation also supports `--workers`:
+
+```bash
+python preprocess/build_trajectory_inputs.py \
+  --dataset 100style \
+  --database data/processed/100style_test10_pruned/database.npz \
+  --tags all \
+  --workers 8 \
+  --output data/processed/100style_test10_pruned/trajectory.npz
 ```
 
 This writes `trajectory.npz` with:
@@ -72,13 +99,13 @@ This writes `trajectory.npz` with:
 Visualize database + trajectory inputs:
 
 ```bash
-python Visualization.py --database data/processed/100style_test5/database.npz --trajectory data/processed/100style_test5/trajectory.npz
+python Visualization.py --database data/processed/100style_test10/database.npz --trajectory data/processed/100style_test10/trajectory.npz
 ```
 
 Visualize a full database with the Geno skinned character:
 
 ```bash
-python Genoview.py --database data/processed/100style_test5/database.npz --trajectory data/processed/100style_test5/trajectory.npz
+python Genoview.py --database data/processed/100style_test10/database.npz --trajectory data/processed/100style_test10/trajectory.npz
 ```
 
 `Genoview.py` requires a full database whose joint count matches the Geno model.

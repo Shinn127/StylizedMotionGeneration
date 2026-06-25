@@ -12,7 +12,7 @@ class MultiHeadEMAVQ(nn.Module):
         codebook_size,
         decay=0.99,
         kmeans_init=True,
-        threshold_ema_dead_code=1,
+        threshold_ema_dead_code=32,
     ):
         super().__init__()
         if code_dim % num_heads != 0:

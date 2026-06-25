@@ -205,7 +205,9 @@ def between(x, y):
 
 def log(x, eps=1e-5):
     q_length = np.sqrt(np.sum(np.square(x[..., 1:]), axis=-1))[..., np.newaxis]
-    halfangle = np.where(q_length < eps, np.ones_like(q_length), np.arctan2(q_length, x[..., 0:1]) / q_length)
+    halfangle = np.ones_like(q_length)
+    mask = q_length >= eps
+    halfangle[mask] = np.arctan2(q_length[mask], x[..., 0:1][mask]) / q_length[mask]
     return halfangle * x[..., 1:]
 
 
