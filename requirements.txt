@@ -8,9 +8,12 @@ tqdm
 
 # Motion / 3D
 # (e.g.) bvh-toolbox, pytorch3d, trimesh
+cffi
+raylib
 
 # I/O & utilities
 pyyaml
 tensorboard
 wandb
 einops
+vector_quantize_pytorch

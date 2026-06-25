@@ -1,0 +1,17 @@
+window_size: 64
+batch_size: 32
+epochs: 10
+lr: 0.0002
+use_full_skeleton: false
+use_root_cond: true
+root_cond_dim: 6
+code_dim: 256
+codebook_size: 512
+num_heads: 8
+width: 512
+depth: 3
+down_t: 2
+stride_t: 2
+dilation_growth_rate: 3
+commit_weight: 0.25
+delta_weight: 1.0

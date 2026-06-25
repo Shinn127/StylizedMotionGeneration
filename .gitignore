@@ -69,6 +69,7 @@ wandb/
 mlruns/
 logs/
 *.log
+.conda-env-link
 
 # ---- Media (生成结果) ----
 *.mp4
