@@ -1,4 +1,4 @@
-feature_database: data/processed/100style_test5_pruned/feature_database.npz
+feature_database: data/processed/100style_test5_pruned/feature_database
 batch_size: 256
 epochs: 100
 lr: 0.0002

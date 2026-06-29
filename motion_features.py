@@ -207,7 +207,7 @@ def compute_feature_stats(
 
 
 def build_motion_feature_components(database: dict[str, np.ndarray]) -> MotionFeatureComponents:
-    names = database["names"].tolist()
+    names = list(database["names"])
     x_pos = database["positions"].astype(np.float32)
     x_rot = database["rotations"].astype(np.float32)
     x_vel = database["velocities"].astype(np.float32)
