@@ -1,7 +1,12 @@
 import argparse
 from pathlib import Path
+import sys
 
 import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if PROJECT_ROOT.as_posix() not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT.as_posix())
 
 from datasets.motion_dataset import MotionWindow, build_motion_store
 from motion_features import serialize_motion_feature_stats
