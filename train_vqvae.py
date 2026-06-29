@@ -14,7 +14,7 @@ import yaml
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from datasets.motion_dataset import MotionDataset, build_motion_store
+from datasets.feature_dataset import FeatureDataset, build_feature_store
 from models.vqvae import CausalMotionVQVAE
 from motion_features import serialize_motion_feature_stats
 
@@ -27,15 +27,13 @@ def default_num_workers() -> int:
 
 
 def load_config(config_path: Path | None) -> dict:
-    if config_path is None:
-        return {}
     with config_path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
 def parse_args(argv=None):
     pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument("--config", type=Path, default=None)
+    pre_parser.add_argument("--config", type=Path, required=True)
     pre_args, remaining = pre_parser.parse_known_args(argv)
     config = load_config(pre_args.config)
 
@@ -47,11 +45,10 @@ def parse_args(argv=None):
         return None if value is None else Path(value)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path, default=pre_args.config)
+    parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--split-train", default=cfg("split_train", "train"))
     parser.add_argument("--split-val", default=cfg("split_val", "val"))
-    parser.add_argument("--database-path", type=Path, default=cfg_path("database_path", None))
-    parser.add_argument("--window-size", type=int, default=cfg("window_size", 64))
+    parser.add_argument("--feature-database", type=Path, default=cfg_path("feature_database", None))
     parser.add_argument("--batch-size", type=int, default=cfg("batch_size", 32))
     parser.add_argument("--epochs", type=int, default=cfg("epochs", 100))
     parser.add_argument("--lr", type=float, default=cfg("lr", 2e-4))
@@ -66,11 +63,6 @@ def parse_args(argv=None):
     parser.add_argument("--prefetch-factor", type=int, default=cfg("prefetch_factor", 4))
     parser.add_argument("--log-every", type=int, default=cfg("log_every", 50))
     parser.add_argument("--run-name", type=str, default=cfg("run_name", None))
-    parser.add_argument("--use-full-skeleton", action="store_true", default=cfg("use_full_skeleton", False))
-    parser.add_argument("--use-root-cond", dest="use_root_cond", action="store_true")
-    parser.add_argument("--no-use-root-cond", dest="use_root_cond", action="store_false")
-    parser.set_defaults(use_root_cond=cfg("use_root_cond", True))
-    parser.add_argument("--root-cond-dim", type=int, default=cfg("root_cond_dim", 6))
     parser.add_argument("--code-dim", type=int, default=cfg("code_dim", 256))
     parser.add_argument("--codebook-size", type=int, default=cfg("codebook_size", 128))
     parser.add_argument("--num-heads", type=int, default=cfg("num_heads", 8))
@@ -88,7 +80,9 @@ def parse_args(argv=None):
     parser.add_argument("--persistent-workers", dest="persistent_workers", action="store_true")
     parser.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false")
     parser.set_defaults(persistent_workers=cfg("persistent_workers", True))
-    return parser.parse_args(remaining)
+    args = parser.parse_args(remaining)
+    args.config = pre_args.config
+    return args
 
 
 def set_seed(seed: int, deterministic: bool) -> None:
@@ -115,25 +109,9 @@ def dataloader_kwargs(args, shuffle: bool, pin_memory: bool) -> dict:
 
 
 def build_dataloaders(args, pin_memory: bool):
-    store = build_motion_store(
-        window_size=args.window_size,
-        database_path=args.database_path,
-        use_full_skeleton=args.use_full_skeleton,
-        use_root_cond=args.use_root_cond,
-        root_cond_dim=args.root_cond_dim,
-        seed=args.seed,
-    )
-    dataset_kwargs = {
-        "window_size": args.window_size,
-        "database_path": args.database_path,
-        "use_full_skeleton": args.use_full_skeleton,
-        "use_root_cond": args.use_root_cond,
-        "root_cond_dim": args.root_cond_dim,
-        "seed": args.seed,
-        "store": store,
-    }
-    train_dataset = MotionDataset(split=args.split_train, **dataset_kwargs)
-    val_dataset = MotionDataset(split=args.split_val, **dataset_kwargs)
+    store = build_feature_store(args.feature_database)
+    train_dataset = FeatureDataset(split=args.split_train, store=store)
+    val_dataset = FeatureDataset(split=args.split_val, store=store)
     train_loader = DataLoader(train_dataset, **dataloader_kwargs(args, shuffle=True, pin_memory=pin_memory))
     val_loader = DataLoader(val_dataset, **dataloader_kwargs(args, shuffle=False, pin_memory=pin_memory))
     return train_dataset, val_dataset, train_loader, val_loader
@@ -143,7 +121,7 @@ def build_model(args, motion_dim):
     return CausalMotionVQVAE(
         motion_dim=motion_dim,
         root_cond_dim=args.root_cond_dim,
-        use_root_cond=args.use_root_cond,
+        use_root_cond=True,
         code_dim=args.code_dim,
         codebook_size=args.codebook_size,
         num_heads=args.num_heads,
@@ -328,7 +306,7 @@ def build_run_config(args, run_name: str, train_dataset, val_dataset) -> dict:
         "argv": sys.argv,
         "args": serialize_args(args),
         "dataset": {
-            "database_path": str(train_dataset.database_path),
+            "feature_database": str(train_dataset.feature_database),
             "joint_subset": train_dataset.joint_subset,
             "motion_dim": train_dataset.motion_dim,
             "full_motion_dim": train_dataset.full_motion_dim,
@@ -380,7 +358,7 @@ def build_checkpoint(
         "config_path": str(config_path),
         "motion_dim": train_dataset.motion_dim,
         "full_motion_dim": train_dataset.full_motion_dim,
-        "use_root_cond": train_dataset.use_root_cond,
+        "use_root_cond": True,
         "root_cond_dim": train_dataset.root_cond_dim,
         "stats": serialize_motion_feature_stats(
             train_dataset.feature_stats(),
@@ -409,6 +387,7 @@ def main():
 
     train_dataset, val_dataset, train_loader, val_loader = build_dataloaders(args, pin_memory=use_pin_memory)
     feature_weights = torch.from_numpy(train_dataset.model_feature_weights().astype("float32"))
+    args.root_cond_dim = train_dataset.root_cond_dim
 
     model = build_model(args, motion_dim=train_dataset.motion_dim)
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:

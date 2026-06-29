@@ -1,5 +1,5 @@
-window_size: 64
-batch_size: 32
+feature_database: data/processed/100style_test5_pruned/feature_database.npz
+batch_size: 256
 epochs: 100
 lr: 0.0002
 min_lr: 0.00001
@@ -8,11 +8,8 @@ seed: 3407
 deterministic: false
 grad_clip_norm: 1.0
 save_every: 0
-use_full_skeleton: false
-use_root_cond: true
-root_cond_dim: 6
 code_dim: 256
-codebook_size: 512
+codebook_size: 128
 num_heads: 8
 width: 512
 depth: 3
