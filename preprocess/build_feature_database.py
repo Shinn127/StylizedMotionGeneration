@@ -1,9 +1,13 @@
 import argparse
+import os
+import multiprocessing as mp
 from pathlib import Path
 import sys
+from concurrent.futures import ProcessPoolExecutor
 import zlib
 
 import numpy as np
+from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if PROJECT_ROOT.as_posix() not in sys.path:
@@ -26,6 +30,7 @@ def parse_args():
     parser.add_argument("--window-size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--root-cond-dim", type=int, default=6)
+    parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 1) - 1))
     return parser.parse_args()
 
 
@@ -191,6 +196,28 @@ def _save_raw_shard(output_dir: Path, shard_idx: int, components) -> Path:
     return raw_path
 
 
+def _build_feature_shard(task):
+    shard_idx, spec, train_mask, prune_ends_and_fingers, raw_dir = task
+    motion = _process_motion(
+        spec["path"],
+        spec["mirror"],
+        prune_ends_and_fingers=prune_ends_and_fingers,
+    )
+    components = build_motion_feature_components(motion)
+    raw_path = _save_raw_shard(raw_dir, shard_idx, components)
+    return {
+        "shard_idx": shard_idx,
+        "range_name": spec["range_name"],
+        "mirror": spec["mirror"],
+        "nframes": spec["nframes"],
+        "names": motion["names"],
+        "parents": motion["parents"],
+        "components": components,
+        "train_mask": np.asarray(train_mask, dtype=bool),
+        "raw_path": raw_path,
+    }
+
+
 def _build_shard_specs(dataset_name, styles_arg, max_styles, prune_ends_and_fingers):
     if dataset_name == "lafan":
         tags_data = build_lafan_tags()
@@ -294,32 +321,42 @@ def main():
     for shard_idx, start_idx, end_idx, _range_idx in split_windows["train_windows"].tolist():
         train_frame_masks[int(shard_idx)][int(start_idx):int(end_idx)] = True
 
+    raw_dir = args.output / "_raw"
+    tasks = [
+        (shard_idx, spec, train_frame_masks[shard_idx], args.prune_ends_and_fingers, raw_dir)
+        for shard_idx, spec in enumerate(shard_specs)
+    ]
+
+    stats_acc = FeatureStatsAccumulator()
     names = None
     parents = None
-    joint_subset = None
-    stats_acc = None
-    raw_paths = []
-    for shard_idx, spec in enumerate(shard_specs):
-        motion = _process_motion(
-            spec["path"],
-            spec["mirror"],
-            prune_ends_and_fingers=args.prune_ends_and_fingers,
-        )
-        if names is None:
-            names = motion["names"]
-            parents = motion["parents"]
-            joint_subset = "prune_ends_and_fingers" if args.prune_ends_and_fingers else "full"
-            stats_acc = FeatureStatsAccumulator()
+    joint_subset = "prune_ends_and_fingers" if args.prune_ends_and_fingers else "full"
+    raw_paths = [None] * len(tasks)
 
-        components = build_motion_feature_components(motion)
-        stats_acc.update(components, train_frame_masks[shard_idx])
-        raw_paths.append(_save_raw_shard(args.output / "_raw", shard_idx, components))
+    workers = max(1, int(args.workers))
+    if workers == 1:
+        results = [_build_feature_shard(task) for task in tqdm(tasks, desc="Building shards")]
+    else:
+        context = mp.get_context("fork")
+        chunksize = max(1, len(tasks) // (workers * 4))
+        with ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
+            results = list(tqdm(executor.map(_build_feature_shard, tasks, chunksize=chunksize), total=len(tasks), desc="Building shards"))
+
+    for result in results:
+        shard_idx = result["shard_idx"]
+        if names is None:
+            names = result["names"]
+            parents = result["parents"]
+        stats_acc.update(result["components"], result["train_mask"])
+        raw_paths[shard_idx] = result["raw_path"]
 
     stats = stats_acc.finalize(names)
 
     motion_files = []
     root_cond_files = []
     for shard_idx, raw_path in enumerate(raw_paths):
+        if raw_path is None:
+            raise RuntimeError(f"Missing raw shard path for shard {shard_idx}")
         raw_x = np.load(raw_path, mmap_mode="r")
         norm_x = ((raw_x.astype(np.float32) - stats.offset) / stats.scale).astype(np.float32)
         motion = norm_x[:, args.root_cond_dim :]
