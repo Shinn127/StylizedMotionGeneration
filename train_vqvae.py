@@ -1,16 +1,22 @@
 import argparse
 import json
+import math
 import os
+import random
+import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+import yaml
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from datasets.motion_dataset import MotionDataset
 from models.vqvae import CausalMotionVQVAE
+from motion_features import serialize_motion_feature_stats
 
 
 def default_num_workers() -> int:
@@ -20,44 +26,79 @@ def default_num_workers() -> int:
     return min(8, cpu_count - 1)
 
 
-def parse_args():
+def load_config(config_path: Path | None) -> dict:
+    if config_path is None:
+        return {}
+    with config_path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def parse_args(argv=None):
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=Path, default=None)
+    pre_args, remaining = pre_parser.parse_known_args(argv)
+    config = load_config(pre_args.config)
+
+    def cfg(name, default):
+        return config.get(name, default)
+
+    def cfg_path(name, default):
+        value = cfg(name, default)
+        return None if value is None else Path(value)
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--split-train", default="train")
-    parser.add_argument("--split-val", default="val")
-    parser.add_argument("--database-path", type=Path, default=None)
-    parser.add_argument("--window-size", type=int, default=64)
-    parser.add_argument("--window-stride", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--num-workers", type=int, default=default_num_workers())
-    parser.add_argument("--prefetch-factor", type=int, default=4)
-    parser.add_argument("--log-every", type=int, default=50)
-    parser.add_argument("--run-name", type=str, default=None)
-    parser.add_argument("--use-full-skeleton", action="store_true")
+    parser.add_argument("--config", type=Path, default=pre_args.config)
+    parser.add_argument("--split-train", default=cfg("split_train", "train"))
+    parser.add_argument("--split-val", default=cfg("split_val", "val"))
+    parser.add_argument("--database-path", type=Path, default=cfg_path("database_path", None))
+    parser.add_argument("--window-size", type=int, default=cfg("window_size", 64))
+    parser.add_argument("--batch-size", type=int, default=cfg("batch_size", 32))
+    parser.add_argument("--epochs", type=int, default=cfg("epochs", 100))
+    parser.add_argument("--lr", type=float, default=cfg("lr", 2e-4))
+    parser.add_argument("--min-lr", type=float, default=cfg("min_lr", 1e-5))
+    parser.add_argument("--warmup-epochs", type=int, default=cfg("warmup_epochs", 2))
+    parser.add_argument("--seed", type=int, default=cfg("seed", 3407))
+    parser.add_argument("--deterministic", action="store_true", default=cfg("deterministic", False))
+    parser.add_argument("--grad-clip-norm", type=float, default=cfg("grad_clip_norm", 1.0))
+    parser.add_argument("--resume", type=Path, default=cfg_path("resume", None))
+    parser.add_argument("--save-every", type=int, default=cfg("save_every", 0))
+    parser.add_argument("--num-workers", type=int, default=cfg("num_workers", default_num_workers()))
+    parser.add_argument("--prefetch-factor", type=int, default=cfg("prefetch_factor", 4))
+    parser.add_argument("--log-every", type=int, default=cfg("log_every", 50))
+    parser.add_argument("--run-name", type=str, default=cfg("run_name", None))
+    parser.add_argument("--use-full-skeleton", action="store_true", default=cfg("use_full_skeleton", False))
     parser.add_argument("--use-root-cond", dest="use_root_cond", action="store_true")
     parser.add_argument("--no-use-root-cond", dest="use_root_cond", action="store_false")
-    parser.set_defaults(use_root_cond=True)
-    parser.add_argument("--root-cond-dim", type=int, default=6)
-    parser.add_argument("--code-dim", type=int, default=256)
-    parser.add_argument("--codebook-size", type=int, default=128)
-    parser.add_argument("--num-heads", type=int, default=8)
-    parser.add_argument("--width", type=int, default=512)
-    parser.add_argument("--depth", type=int, default=3)
-    parser.add_argument("--down-t", type=int, default=2)
-    parser.add_argument("--stride-t", type=int, default=2)
-    parser.add_argument("--dilation-growth-rate", type=int, default=3)
-    parser.add_argument("--commit-weight", type=float, default=0.25)
-    parser.add_argument("--delta-weight", type=float, default=1.0)
-    parser.add_argument("--outdir", type=Path, default=Path("outputs/vqvae"))
-    parser.add_argument("--data-parallel", action="store_true")
+    parser.set_defaults(use_root_cond=cfg("use_root_cond", True))
+    parser.add_argument("--root-cond-dim", type=int, default=cfg("root_cond_dim", 6))
+    parser.add_argument("--code-dim", type=int, default=cfg("code_dim", 256))
+    parser.add_argument("--codebook-size", type=int, default=cfg("codebook_size", 128))
+    parser.add_argument("--num-heads", type=int, default=cfg("num_heads", 8))
+    parser.add_argument("--width", type=int, default=cfg("width", 512))
+    parser.add_argument("--depth", type=int, default=cfg("depth", 3))
+    parser.add_argument("--down-t", type=int, default=cfg("down_t", 2))
+    parser.add_argument("--dilation-growth-rate", type=int, default=cfg("dilation_growth_rate", 3))
+    parser.add_argument("--commit-weight", type=float, default=cfg("commit_weight", 0.25))
+    parser.add_argument("--delta-weight", type=float, default=cfg("delta_weight", 1.0))
+    parser.add_argument("--outdir", type=Path, default=cfg_path("outdir", Path("outputs/vqvae")))
+    parser.add_argument("--data-parallel", action="store_true", default=cfg("data_parallel", False))
     parser.add_argument("--pin-memory", dest="pin_memory", action="store_true")
     parser.add_argument("--no-pin-memory", dest="pin_memory", action="store_false")
-    parser.set_defaults(pin_memory=torch.cuda.is_available())
+    parser.set_defaults(pin_memory=cfg("pin_memory", torch.cuda.is_available()))
     parser.add_argument("--persistent-workers", dest="persistent_workers", action="store_true")
     parser.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false")
-    parser.set_defaults(persistent_workers=True)
-    return parser.parse_args()
+    parser.set_defaults(persistent_workers=cfg("persistent_workers", True))
+    return parser.parse_args(remaining)
+
+
+def set_seed(seed: int, deterministic: bool) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def dataloader_kwargs(args, shuffle: bool, pin_memory: bool) -> dict:
@@ -76,9 +117,11 @@ def dataloader_kwargs(args, shuffle: bool, pin_memory: bool) -> dict:
 def build_dataloaders(args, pin_memory: bool):
     dataset_kwargs = {
         "window_size": args.window_size,
-        "window_stride": args.window_stride,
         "database_path": args.database_path,
         "use_full_skeleton": args.use_full_skeleton,
+        "use_root_cond": args.use_root_cond,
+        "root_cond_dim": args.root_cond_dim,
+        "seed": args.seed,
     }
     train_dataset = MotionDataset(split=args.split_train, **dataset_kwargs)
     val_dataset = MotionDataset(split=args.split_val, **dataset_kwargs)
@@ -96,11 +139,27 @@ def build_model(args, motion_dim):
         codebook_size=args.codebook_size,
         num_heads=args.num_heads,
         down_t=args.down_t,
-        stride_t=args.stride_t,
         width=args.width,
         depth=args.depth,
         dilation_growth_rate=args.dilation_growth_rate,
     )
+
+
+def build_lr_scheduler(optimizer, args):
+    if args.lr <= 0.0:
+        raise ValueError(f"lr must be positive, got {args.lr}")
+    min_factor = args.min_lr / args.lr
+    warmup_epochs = max(0, int(args.warmup_epochs))
+    decay_epochs = max(1, int(args.epochs) - warmup_epochs)
+
+    def lr_lambda(epoch_index: int) -> float:
+        if warmup_epochs > 0 and epoch_index < warmup_epochs:
+            return max(min_factor, float(epoch_index + 1) / float(warmup_epochs))
+        progress = min(max(float(epoch_index - warmup_epochs) / float(decay_epochs), 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_factor + (1.0 - min_factor) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
 def compute_losses(batch_motion, output, feature_weights, delta_weight, commit_weight):
@@ -138,7 +197,9 @@ def finalize_metric_totals(totals, count):
 
 
 def move_motion_to_device(batch, device, non_blocking: bool):
-    return batch["motion"].to(device, non_blocking=non_blocking)
+    motion = batch["motion"].to(device, non_blocking=non_blocking)
+    root_cond = batch["root_cond"].to(device, non_blocking=non_blocking)
+    return motion, root_cond
 
 
 def evaluate(model, loader, feature_weights, device, delta_weight, commit_weight, non_blocking: bool):
@@ -147,8 +208,8 @@ def evaluate(model, loader, feature_weights, device, delta_weight, commit_weight
     count = 0
     with torch.no_grad():
         for batch in loader:
-            motion = move_motion_to_device(batch, device, non_blocking=non_blocking)
-            output = model(motion)
+            motion, root_cond = move_motion_to_device(batch, device, non_blocking=non_blocking)
+            output = model(motion, root_cond=root_cond)
             loss, recon_loss, delta_loss, commit_loss = compute_losses(
                 motion,
                 output,
@@ -178,6 +239,7 @@ def train_one_epoch(
     device,
     delta_weight,
     commit_weight,
+    grad_clip_norm,
     writer,
     global_step,
     log_every,
@@ -189,8 +251,8 @@ def train_one_epoch(
     start_time = time.perf_counter()
 
     for batch_idx, batch in enumerate(loader, start=1):
-        motion = move_motion_to_device(batch, device, non_blocking=non_blocking)
-        output = model(motion)
+        motion, root_cond = move_motion_to_device(batch, device, non_blocking=non_blocking)
+        output = model(motion, root_cond=root_cond)
         loss, recon_loss, delta_loss, commit_loss = compute_losses(
             motion,
             output,
@@ -200,6 +262,8 @@ def train_one_epoch(
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if grad_clip_norm is not None and grad_clip_norm > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
 
         batch_size = motion.shape[0]
@@ -242,23 +306,100 @@ def build_run_name(args) -> str:
 
 def serialize_args(args) -> dict[str, str | int | float | bool | None]:
     serialized = {}
-    for key, value in vars(args).items():
+    source = args if isinstance(args, dict) else vars(args)
+    for key, value in source.items():
         serialized[key] = str(value) if isinstance(value, Path) else value
     return serialized
+
+
+def build_run_config(args, run_name: str, train_dataset, val_dataset) -> dict:
+    return {
+        "run_name": run_name,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "argv": sys.argv,
+        "args": serialize_args(args),
+        "dataset": {
+            "database_path": str(train_dataset.database_path),
+            "joint_subset": train_dataset.joint_subset,
+            "motion_dim": train_dataset.motion_dim,
+            "full_motion_dim": train_dataset.full_motion_dim,
+            "use_root_cond": train_dataset.use_root_cond,
+            "root_cond_dim": train_dataset.root_cond_dim,
+            "num_joints": train_dataset.num_joints,
+            "train_summary": train_dataset.split_summary(),
+            "val_summary": val_dataset.split_summary(),
+        },
+    }
+
+
+def save_run_config(args, run_name: str, train_dataset, val_dataset) -> Path:
+    config = build_run_config(args, run_name, train_dataset, val_dataset)
+    config_path = args.outdir / f"{run_name}.yaml"
+    with config_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(config, f, sort_keys=False, allow_unicode=False)
+    return config_path
+
+
+def load_resume_checkpoint(resume_path: Path, model, optimizer, scheduler, device):
+    checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+    unwrap_model(model).load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    scheduler.load_state_dict(checkpoint["scheduler"])
+    return checkpoint
+
+
+def build_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    args,
+    run_name,
+    config_path,
+    train_dataset,
+    epoch,
+    global_step,
+    best_val,
+    train_stats,
+    val_stats,
+) -> dict:
+    return {
+        "model": unwrap_model(model).state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "args": serialize_args(args),
+        "run_name": run_name,
+        "config_path": str(config_path),
+        "motion_dim": train_dataset.motion_dim,
+        "full_motion_dim": train_dataset.full_motion_dim,
+        "use_root_cond": train_dataset.use_root_cond,
+        "root_cond_dim": train_dataset.root_cond_dim,
+        "stats": serialize_motion_feature_stats(
+            train_dataset.feature_stats(),
+            names=train_dataset.names,
+            parents=train_dataset.parents,
+            joint_subset=train_dataset.joint_subset,
+        ),
+        "epoch": epoch + 1,
+        "global_step": global_step,
+        "best_val": best_val,
+        "train_stats": train_stats,
+        "val_stats": val_stats,
+    }
 
 
 def main():
     args = parse_args()
     args.outdir.mkdir(parents=True, exist_ok=True)
+    set_seed(args.seed, args.deterministic)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_pin_memory = bool(args.pin_memory and device.type == "cuda")
     non_blocking = use_pin_memory
-    if device.type == "cuda":
+    if device.type == "cuda" and not args.deterministic:
         torch.backends.cudnn.benchmark = True
 
     train_dataset, val_dataset, train_loader, val_loader = build_dataloaders(args, pin_memory=use_pin_memory)
-    feature_weights = torch.from_numpy(train_dataset.feature_stats().weights.astype("float32"))
+    feature_weights = torch.from_numpy(train_dataset.model_feature_weights().astype("float32"))
 
     model = build_model(args, motion_dim=train_dataset.motion_dim)
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
@@ -266,8 +407,10 @@ def main():
     model = model.to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = build_lr_scheduler(optimizer, args)
 
     run_name = build_run_name(args)
+    config_path = save_run_config(args, run_name, train_dataset, val_dataset)
     log_dir = args.outdir / "tensorboard" / run_name
     writer = SummaryWriter(log_dir=log_dir.as_posix())
     writer.add_text("config/args", json.dumps(serialize_args(args), indent=2, ensure_ascii=False))
@@ -277,11 +420,20 @@ def main():
     print(f"device={device}")
     print(f"train_summary={train_dataset.split_summary()}")
     print(f"val_summary={val_dataset.split_summary()}")
+    print(f"config_yaml={config_path}")
     print(f"tensorboard_logdir={log_dir}")
 
     best_val = None
     global_step = 0
-    for epoch in range(args.epochs):
+    start_epoch = 0
+    if args.resume is not None:
+        checkpoint = load_resume_checkpoint(args.resume, model, optimizer, scheduler, device)
+        start_epoch = int(checkpoint["epoch"])
+        global_step = int(checkpoint["global_step"])
+        best_val = checkpoint["best_val"]
+        print(f"resumed_from={args.resume} start_epoch={start_epoch + 1} global_step={global_step} best_val={best_val}")
+
+    for epoch in range(start_epoch, args.epochs):
         train_stats, global_step = train_one_epoch(
             model,
             train_loader,
@@ -290,6 +442,7 @@ def main():
             device,
             delta_weight=args.delta_weight,
             commit_weight=args.commit_weight,
+            grad_clip_norm=args.grad_clip_norm,
             writer=writer,
             global_step=global_step,
             log_every=args.log_every,
@@ -334,6 +487,7 @@ def main():
             f"train_commit={train_stats['commit']:.6f} "
             f"train_perplexity={train_stats['mean_head_perplexity']:.6f} "
             f"train_samples_per_second={train_stats['samples_per_second']:.2f} "
+            f"lr={optimizer.param_groups[0]['lr']:.8f} "
             f"val_loss={val_stats['loss']:.6f} "
             f"val_recon={val_stats['recon']:.6f} "
             f"val_delta={val_stats['delta']:.6f} "
@@ -341,19 +495,32 @@ def main():
             f"val_perplexity={val_stats['mean_head_perplexity']:.6f}"
         )
 
-        checkpoint = {
-            "model": unwrap_model(model).state_dict(),
-            "args": serialize_args(args),
-            "motion_dim": train_dataset.motion_dim,
-            "epoch": epoch + 1,
-            "train_stats": train_stats,
-            "val_stats": val_stats,
-        }
-        torch.save(checkpoint, args.outdir / "last.pt")
-
+        is_best = best_val is None or val_stats["loss"] < best_val
         if best_val is None or val_stats["loss"] < best_val:
             best_val = val_stats["loss"]
+
+        scheduler.step()
+        checkpoint = build_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            args=args,
+            run_name=run_name,
+            config_path=config_path,
+            train_dataset=train_dataset,
+            epoch=epoch,
+            global_step=global_step,
+            best_val=best_val,
+            train_stats=train_stats,
+            val_stats=val_stats,
+        )
+        torch.save(checkpoint, args.outdir / "last.pt")
+
+        if is_best:
             torch.save(checkpoint, args.outdir / "best.pt")
+
+        if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
+            torch.save(checkpoint, args.outdir / f"epoch_{epoch + 1:04d}.pt")
 
     writer.close()
 

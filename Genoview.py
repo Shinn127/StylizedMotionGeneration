@@ -66,6 +66,112 @@ class GBuffer:
         self.depth = Texture()
 
 
+class PlaybackController:
+    def __init__(self, frame_count, frame_time, speeds=(0.25, 0.5, 1.0, 1.5, 2.0), default_speed_index=2, playing=True):
+        self.frame_count = max(1, int(frame_count))
+        self.frame_time = float(frame_time)
+        self.speeds = list(speeds)
+        self.speed_index = int(np.clip(default_speed_index, 0, len(self.speeds) - 1))
+        self.playing = bool(playing)
+        self.frame = 0.0
+        self.scrubbing = False
+
+    @staticmethod
+    def _key_pressed_or_repeat(key):
+        if IsKeyPressed(key):
+            return True
+        repeat_fn = globals().get("IsKeyPressedRepeat")
+        return bool(callable(repeat_fn) and repeat_fn(key))
+
+    @property
+    def current_frame(self):
+        return int(self.frame) % self.frame_count
+
+    @property
+    def current_speed(self):
+        return self.speeds[self.speed_index]
+
+    def _clamp_frame(self, frame):
+        return min(max(int(frame), 0), self.frame_count - 1)
+
+    def set_current_frame(self, frame):
+        self.frame = float(self._clamp_frame(frame))
+
+    def toggle_playing(self):
+        self.playing = not self.playing
+
+    def step_frames(self, delta):
+        self.playing = False
+        self.set_current_frame(self.current_frame + int(delta))
+
+    def nudge_speed(self, delta):
+        self.speed_index = int(np.clip(self.speed_index + int(delta), 0, len(self.speeds) - 1))
+
+    def handle_shortcuts(self):
+        shift_down = IsKeyDown(KEY_LEFT_SHIFT) or IsKeyDown(KEY_RIGHT_SHIFT)
+        step_size = 10 if shift_down else 1
+
+        if IsKeyPressed(KEY_SPACE):
+            self.toggle_playing()
+        if self._key_pressed_or_repeat(KEY_LEFT):
+            self.step_frames(-step_size)
+        if self._key_pressed_or_repeat(KEY_RIGHT):
+            self.step_frames(step_size)
+        if self._key_pressed_or_repeat(KEY_UP):
+            self.nudge_speed(1)
+        if self._key_pressed_or_repeat(KEY_DOWN):
+            self.nudge_speed(-1)
+        if IsKeyPressed(KEY_HOME):
+            self.playing = False
+            self.set_current_frame(0)
+        if IsKeyPressed(KEY_END):
+            self.playing = False
+            self.set_current_frame(self.frame_count - 1)
+
+    def update(self, dt):
+        if self.playing and not self.scrubbing:
+            self.frame = (self.frame + self.current_speed * dt / self.frame_time) % self.frame_count
+        return self.current_frame
+
+    def timeline_rect(self, screen_width, screen_height):
+        margin = 24
+        return Rectangle(margin, screen_height - 34, screen_width - 2 * margin, 10)
+
+    def _frame_from_mouse_x(self, rect, mouse_x):
+        alpha = (float(mouse_x) - float(rect.x)) / max(float(rect.width), 1.0)
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        return int(round(alpha * float(self.frame_count - 1)))
+
+    def handle_scrub(self, screen_width, screen_height):
+        rect = self.timeline_rect(screen_width, screen_height)
+        mouse = GetMousePosition()
+        hovered = CheckCollisionPointRec(mouse, rect)
+        left_button = globals().get("MOUSE_BUTTON_LEFT", 0)
+
+        if IsMouseButtonPressed(left_button) and hovered:
+            self.scrubbing = True
+            self.playing = False
+            self.set_current_frame(self._frame_from_mouse_x(rect, mouse.x))
+        elif self.scrubbing and IsMouseButtonDown(left_button):
+            self.set_current_frame(self._frame_from_mouse_x(rect, mouse.x))
+        elif self.scrubbing and IsMouseButtonReleased(left_button):
+            self.set_current_frame(self._frame_from_mouse_x(rect, mouse.x))
+            self.scrubbing = False
+
+    def draw_ui(self, screen_width, screen_height, label):
+        rect = self.timeline_rect(screen_width, screen_height)
+        progress = self.current_frame / max(self.frame_count - 1, 1)
+        fill_width = int(round(float(rect.width) * progress))
+        knob_x = int(round(float(rect.x) + float(rect.width) * progress))
+        readout = f"{label} | {self.current_frame + 1}/{self.frame_count} | {self.current_speed:.2f}x"
+
+        DrawRectangle(int(rect.x), int(rect.y), int(rect.width), int(rect.height), Color(30, 30, 30, 95))
+        DrawRectangle(int(rect.x), int(rect.y), fill_width, int(rect.height), Color(45, 132, 255, 220))
+        DrawRectangleLines(int(rect.x), int(rect.y), int(rect.width), int(rect.height), Color(20, 20, 20, 180))
+        DrawCircle(knob_x, int(rect.y + rect.height * 0.5), 7.0, Color(20, 82, 180, 245))
+        DrawText(readout.encode(), int(rect.x), int(rect.y - 24), 18, BLACK)
+
+
 def file_read(out, size, f):
     ffi.memmove(out, f.read(size), size)
 
@@ -372,9 +478,10 @@ class GenoView:
             self.sample_range_names = None
             self.sample_mirror = None
 
+        playback_count = len(self.indices) if self.indices is not None else len(self.positions)
+        self.playback = PlaybackController(playback_count, 1.0 / float(self.fps), playing=True)
         self.sample_index = 0
         self.frame_index = int(self.indices[0]) if self.indices is not None else 0
-        self.is_paused = False
 
         self.camera = Camera()
         self.light_dir = Vector3Normalize(Vector3(0.35, -1.0, -0.35))
@@ -559,19 +666,12 @@ class GenoView:
         update_model_pose_from_numpy_arrays(self.geno_model, self.bind_pos, self.bind_rot, global_pos[0, 1:], global_rot[0, 1:])
         return global_rot[0], global_pos[0]
 
-    def _advance(self):
+    def _sync_playback_frame(self):
         if self.indices is not None:
-            self.sample_index = (self.sample_index + 1) % len(self.indices)
+            self.sample_index = self.playback.current_frame
             self.frame_index = int(self.indices[self.sample_index])
         else:
-            self.frame_index = (self.frame_index + 1) % len(self.positions)
-
-    def _switch_sample(self, delta):
-        if self.indices is not None:
-            self.sample_index = (self.sample_index + delta) % len(self.indices)
-            self.frame_index = int(self.indices[self.sample_index])
-        else:
-            self.frame_index = (self.frame_index + delta) % len(self.positions)
+            self.frame_index = self.playback.current_frame
 
     def run(self):
         screen_width = 1280
@@ -584,14 +684,10 @@ class GenoView:
 
         try:
             while not WindowShouldClose():
-                if IsKeyPressed(KEY_SPACE):
-                    self.is_paused = not self.is_paused
-                if IsKeyPressed(KEY_RIGHT):
-                    self._switch_sample(1)
-                if IsKeyPressed(KEY_LEFT):
-                    self._switch_sample(-1)
-                if not self.is_paused:
-                    self._advance()
+                self.playback.handle_shortcuts()
+                self.playback.handle_scrub(screen_width, screen_height)
+                self.playback.update(GetFrameTime())
+                self._sync_playback_frame()
 
                 global_rot, global_pos = self._update_model_pose()
                 root = global_pos[0]
@@ -840,7 +936,7 @@ class GenoView:
 
                 rlEnableColorBlend()
                 DrawFPS(10, 10)
-                status = "Paused" if self.is_paused else f"Playing {self.fps} FPS"
+                status = "Paused" if not self.playback.playing else f"Playing {self.playback.current_speed:.2f}x"
                 DrawText(f"Frame: {self.frame_index}".encode(), 10, 34, 20, BLACK)
                 DrawText(f"Range: {self._frame_range_name()}".encode(), 10, 58, 20, DARKGRAY)
                 DrawText(status.encode(), 10, 82, 20, BLUE)
@@ -850,7 +946,8 @@ class GenoView:
                     DrawText(f"Sample: {self.sample_index}".encode(), 10, 130, 20, DARKGRAY)
                     DrawText(f"Mirror: {bool(self.sample_mirror[self.sample_index])}".encode(), 10, 154, 20, DARKGRAY)
                 DrawText(b"Ctrl+LMB/RMB+drag: camera | Wheel: zoom", 10, 184, 18, BLACK)
-                DrawText(b"Space: pause/resume | Left/Right: switch sample", 10, 208, 18, BLACK)
+                DrawText(b"Space: play/pause | Left/Right: step | Up/Down: speed | Home/End | Drag timeline", 10, 208, 18, BLACK)
+                self.playback.draw_ui(screen_width, screen_height, "Sample" if self.indices is not None else "Frame")
                 EndDrawing()
         finally:
             self._cleanup()

@@ -28,7 +28,6 @@ class CausalEncoder1D(nn.Module):
         input_dim,
         code_dim,
         down_t=2,
-        stride_t=2,
         width=512,
         depth=3,
         dilation_growth_rate=3,
@@ -36,6 +35,7 @@ class CausalEncoder1D(nn.Module):
         norm=None,
     ):
         super().__init__()
+        stride_t = 2
         blocks = [CausalConv1d(input_dim, width, 3, 1, 1), nn.ReLU()]
         filter_t = stride_t * 2
         for _ in range(down_t):

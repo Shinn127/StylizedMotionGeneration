@@ -8,8 +8,7 @@ from torch.utils.data import DataLoader
 
 from datasets.motion_dataset import MotionDataset
 from models.vqvae import CausalMotionVQVAE
-from motion_features import resolve_database_path
-from preprocess import quat
+from motion_features import deserialize_motion_feature_stats, reconstruct_motion_state_from_features, resolve_database_path
 
 
 def parse_args():
@@ -19,7 +18,6 @@ def parse_args():
     parser.add_argument('--database-path', type=Path, default=None)
     parser.add_argument('--use-full-skeleton', action='store_true')
     parser.add_argument('--window-size', type=int, default=64)
-    parser.add_argument('--window-stride', type=int, default=None)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--pin-memory', dest='pin_memory', action='store_true')
@@ -31,13 +29,15 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_dataset(args, database_path):
+def build_dataset(args, database_path, ckpt_args):
     return MotionDataset(
         split=args.split,
         window_size=args.window_size,
-        window_stride=args.window_stride,
         database_path=database_path,
         use_full_skeleton=args.use_full_skeleton,
+        use_root_cond=ckpt_args['use_root_cond'],
+        root_cond_dim=ckpt_args['root_cond_dim'],
+        seed=ckpt_args['seed'],
     )
 
 
@@ -63,7 +63,6 @@ def build_model_from_checkpoint(ckpt):
         codebook_size=args['codebook_size'],
         num_heads=args['num_heads'],
         down_t=args['down_t'],
-        stride_t=args['stride_t'],
         width=args['width'],
         depth=args['depth'],
         dilation_growth_rate=args['dilation_growth_rate'],
@@ -72,7 +71,14 @@ def build_model_from_checkpoint(ckpt):
     return model, args
 
 
-def export_trajectory(database, out_path):
+def load_stats_from_checkpoint(ckpt):
+    if 'stats' not in ckpt:
+        raise KeyError('Checkpoint does not contain motion feature stats')
+    stats, metadata = deserialize_motion_feature_stats(ckpt['stats'])
+    return stats, metadata
+
+
+def export_trajectory(database, out_path, split_name):
     from preprocess import quat as q
 
     positions = database['positions'].astype(np.float32)
@@ -130,7 +136,7 @@ def export_trajectory(database, out_path):
         Tpos=future_positions.astype(np.float32),
         Tdir=future_directions.astype(np.float32),
         future_frames=future_frames.astype(np.int32),
-        selected_tags=np.array([args.split], dtype=object),
+        selected_tags=np.array([split_name], dtype=object),
         sample_range_names=sample_range_names,
         sample_mirror=sample_mirror,
         database_path=np.array(str(out_path.parent / 'database.npz'), dtype=object),
@@ -139,10 +145,11 @@ def export_trajectory(database, out_path):
 
 def main():
     args = parse_args()
-    ckpt = torch.load(args.checkpoint, map_location='cpu')
+    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     model, ckpt_args = build_model_from_checkpoint(ckpt)
+    stats, stats_meta = load_stats_from_checkpoint(ckpt)
     database_path = resolve_database_path(use_full_skeleton=args.use_full_skeleton, database_path=args.database_path or ckpt_args.get('database_path'))
-    dataset = build_dataset(args, database_path)
+    dataset = build_dataset(args, database_path, ckpt_args)
     loader = build_loader(args, dataset)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
@@ -151,26 +158,20 @@ def main():
     outdir = args.outdir / args.tag
     outdir.mkdir(parents=True, exist_ok=True)
 
-    motion_dim = dataset.motion_dim
     num_ranges = len(dataset.range_names)
-    range_to_recon = {}
     range_to_window = defaultdict(list)
-    range_to_sample_meta = defaultdict(list)
-    range_to_range_name = {}
-    range_to_mirror = {}
 
     with torch.no_grad():
         for batch in loader:
             motion = batch['motion'].to(device, non_blocking=bool(args.pin_memory and device.type == 'cuda'))
-            output = model(motion)
+            root_cond = batch['root_cond'].to(device, non_blocking=bool(args.pin_memory and device.type == 'cuda'))
+            output = model(motion, root_cond=root_cond)
             recon = output['recon_state'].cpu().numpy().astype(np.float32)
-            batch_motion = batch['motion'].numpy().astype(np.float32)
+            root_cond_np = root_cond.cpu().numpy().astype(np.float32)
             for i in range(motion.shape[0]):
                 range_idx = int(batch['range_idx'][i])
-                range_to_recon.setdefault(range_idx, np.zeros((0, motion.shape[1], motion_dim), dtype=np.float32))
-                range_to_window[range_idx].append((int(batch['start_idx'][i]), int(batch['end_idx'][i]), batch_motion[i], recon[i]))
-                range_to_range_name[range_idx] = str(batch['range_name'][i])
-                range_to_mirror[range_idx] = bool(batch['mirror'][i])
+                full_recon = dataset.pack_full_motion(recon[i], root_cond_np[i])
+                range_to_window[range_idx].append((int(batch['start_idx'][i]), int(batch['end_idx'][i]), full_recon))
 
     positions = dataset.database['positions'].astype(np.float32).copy()
     rotations = dataset.database['rotations'].astype(np.float32).copy()
@@ -182,11 +183,19 @@ def main():
         windows = sorted(range_to_window.get(range_idx, []), key=lambda x: x[0])
         if not windows:
             continue
-        first_start, first_end, first_in, first_out = windows[0]
-        positions[first_start:first_end] = first_out[:, : positions.shape[1], :]
-        for start, end, in_motion, out_motion in windows[1:]:
-            positions[start:end] = out_motion[:, : positions.shape[1], :]
-        # Leave velocities/rotations/contact as the original database values for now.
+        for start, end, recon_motion in windows:
+            state = reconstruct_motion_state_from_features(
+                x=recon_motion,
+                stats=stats,
+                normalized=True,
+                root_position0=positions[start, 0].copy(),
+                root_rotation0=rotations[start, 0].copy(),
+            )
+            positions[start:end] = state.local_positions
+            rotations[start:end] = state.local_rotations
+            velocities[start:end] = state.local_velocities
+            angular_velocities[start:end] = state.local_angular_velocities
+            contacts[start:end] = np.asarray(state.contacts > 0.5, dtype=np.uint8)
 
     out_db = outdir / 'database.npz'
     np.savez(
@@ -207,7 +216,7 @@ def main():
         tag_range_names=dataset.database['tag_range_names'],
         tag_tags=dataset.database['tag_tags'],
         tag_mirror=dataset.database['tag_mirror'].astype(bool),
-        joint_subset=np.array(dataset.joint_subset, dtype=object),
+        joint_subset=np.array(str(stats_meta.get('joint_subset', dataset.joint_subset)), dtype=object),
     )
 
     np.savez(
@@ -218,8 +227,18 @@ def main():
     )
 
     if args.export_trajectory:
-        db = np.load(database_path, allow_pickle=True)
-        export_trajectory(db, outdir / 'trajectory.npz')
+        export_trajectory(
+            {
+                'positions': positions,
+                'rotations': rotations,
+                'range_starts': dataset.range_starts.astype(np.int32),
+                'range_stops': dataset.range_stops.astype(np.int32),
+                'range_names': dataset.database['range_names'],
+                'range_mirror': dataset.range_mirror.astype(bool),
+            },
+            outdir / 'trajectory.npz',
+            args.split,
+        )
 
     print(f'Exported database to {out_db}')
     print(f'Exported recon metadata to {outdir / "recon_windows.npz"}')

@@ -123,6 +123,14 @@ python tools/patch_glsl_version.py
 The encoder-decoder training dataset uses a `ControlOperators`-style motion representation:
 
 - `D_motion = 230` for the pruned skeleton
+- feature packing order:
+  - root local linear velocity: `3`
+  - root local angular velocity: `3`
+  - hips local position: `3`
+  - non-root joint rotations in 6D: `24 x 6 = 144`
+  - hips local velocity: `3`
+  - non-root joint angular velocities: `24 x 3 = 72`
+  - foot contacts: `2`
 - split by clip with a fixed `8/1/1` train/val/test ratio
 - mirror pairs stay in the same split
 
@@ -131,6 +139,45 @@ Example:
 ```bash
 python -c "from datasets.motion_dataset import MotionDataset; ds = MotionDataset(split='train'); print(ds.split_summary())"
 ```
+
+Feature utilities live in `motion_features.py`:
+
+- `build_motion_features(...)`: pack pruned database motion state into `230D`
+- `reconstruct_motion_state_from_features(...)`: recover a visualizable motion state from `230D`
+
+## 230D To Genoview
+
+To validate the `230D -> motion state -> Genoview` reconstruction path, first export a Genoview-compatible database from features:
+
+```bash
+cd /Users/shinn/Documents/Projects/StylizedMotionGeneration
+conda activate mcc
+python features_to_database.py \
+  --database data/processed/100style_test5_pruned/database.npz \
+  --output data/processed/100style_test5_pruned_roundtrip/database.npz \
+  --use-database-motion
+cp data/processed/100style_test5_pruned/trajectory.npz \
+  data/processed/100style_test5_pruned_roundtrip/trajectory.npz
+```
+
+Then visualize the reconstructed database with Geno:
+
+```bash
+python Genoview.py \
+  --database data/processed/100style_test5_pruned_roundtrip/database.npz \
+  --trajectory data/processed/100style_test5_pruned_roundtrip/trajectory.npz
+```
+
+To export your own model output features:
+
+```bash
+python features_to_database.py \
+  --features path/to/your_features.npy \
+  --database data/processed/100style_test5_pruned/database.npz \
+  --output data/processed/your_recon/database.npz
+```
+
+If the feature file stores normalized motion features, add `--normalized`.
 
 ## Git
 
