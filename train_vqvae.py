@@ -14,7 +14,7 @@ import yaml
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from datasets.motion_dataset import MotionDataset
+from datasets.motion_dataset import MotionDataset, build_motion_store
 from models.vqvae import CausalMotionVQVAE
 from motion_features import serialize_motion_feature_stats
 
@@ -115,6 +115,14 @@ def dataloader_kwargs(args, shuffle: bool, pin_memory: bool) -> dict:
 
 
 def build_dataloaders(args, pin_memory: bool):
+    store = build_motion_store(
+        window_size=args.window_size,
+        database_path=args.database_path,
+        use_full_skeleton=args.use_full_skeleton,
+        use_root_cond=args.use_root_cond,
+        root_cond_dim=args.root_cond_dim,
+        seed=args.seed,
+    )
     dataset_kwargs = {
         "window_size": args.window_size,
         "database_path": args.database_path,
@@ -122,6 +130,7 @@ def build_dataloaders(args, pin_memory: bool):
         "use_root_cond": args.use_root_cond,
         "root_cond_dim": args.root_cond_dim,
         "seed": args.seed,
+        "store": store,
     }
     train_dataset = MotionDataset(split=args.split_train, **dataset_kwargs)
     val_dataset = MotionDataset(split=args.split_val, **dataset_kwargs)

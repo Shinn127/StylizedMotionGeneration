@@ -24,6 +24,31 @@ class MotionWindow:
     range_idx: int
 
 
+@dataclass
+class MotionStore:
+    database_path: Path
+    database: dict[str, np.ndarray]
+    names: list[str]
+    parents: np.ndarray
+    range_starts: np.ndarray
+    range_stops: np.ndarray
+    range_names: np.ndarray
+    range_mirror: np.ndarray
+    joint_subset: str
+    clip_names: list[str]
+    split_windows: dict[str, list[MotionWindow]]
+    motion_features: np.ndarray
+    stats: MotionFeatureStats
+    window_size: int
+    seed: int
+    normalize: bool
+    use_root_cond: bool
+    root_cond_dim: int
+    full_motion_dim: int
+    motion_dim: int
+    num_joints: int
+
+
 def _build_windows_for_ranges(
     range_starts: np.ndarray,
     range_stops: np.ndarray,
@@ -172,6 +197,77 @@ def _unique_frame_indices(windows: list[MotionWindow]) -> np.ndarray:
     return np.unique(frame_indices)
 
 
+def build_motion_store(
+    window_size: int = 64,
+    database_path: str | Path | None = None,
+    use_full_skeleton: bool = False,
+    use_root_cond: bool = True,
+    root_cond_dim: int = 6,
+    seed: int = 3407,
+    normalize: bool = True,
+) -> MotionStore:
+    window_size = int(window_size)
+    seed = int(seed)
+    root_cond_dim = int(root_cond_dim)
+    use_root_cond = bool(use_root_cond)
+    normalize = bool(normalize)
+    resolved_database_path = resolve_database_path(use_full_skeleton=use_full_skeleton, database_path=database_path)
+
+    database = load_database(resolved_database_path)
+    names = database["names"].tolist()
+    parents = database["parents"].astype(np.int32)
+    range_starts = database["range_starts"].astype(np.int32)
+    range_stops = database["range_stops"].astype(np.int32)
+    range_names = database["range_names"]
+    range_mirror = database["range_mirror"].astype(bool)
+    joint_subset = str(database["joint_subset"].item())
+
+    clip_names = sorted(set(str(name) for name in range_names.tolist()))
+    split_windows = _build_windows_within_clip_split(
+        range_starts=range_starts,
+        range_stops=range_stops,
+        range_names=range_names,
+        window_size=window_size,
+        seed=seed,
+    )
+    train_frame_indices = _unique_frame_indices(split_windows["train"])
+
+    motion_features, stats = build_motion_features(
+        database,
+        stat_frame_indices=train_frame_indices,
+    )
+    if normalize:
+        motion_features = normalize_motion_features(motion_features, stats)
+
+    full_motion_dim = int(motion_features.shape[1])
+    motion_dim = full_motion_dim - root_cond_dim if use_root_cond else full_motion_dim
+    num_joints = int(len(names))
+
+    return MotionStore(
+        database_path=resolved_database_path,
+        database=database,
+        names=names,
+        parents=parents,
+        range_starts=range_starts,
+        range_stops=range_stops,
+        range_names=range_names,
+        range_mirror=range_mirror,
+        joint_subset=joint_subset,
+        clip_names=clip_names,
+        split_windows=split_windows,
+        motion_features=motion_features,
+        stats=stats,
+        window_size=window_size,
+        seed=seed,
+        normalize=normalize,
+        use_root_cond=use_root_cond,
+        root_cond_dim=root_cond_dim,
+        full_motion_dim=full_motion_dim,
+        motion_dim=motion_dim,
+        num_joints=num_joints,
+    )
+
+
 class MotionDataset(Dataset):
     def __init__(
         self,
@@ -183,48 +279,44 @@ class MotionDataset(Dataset):
         root_cond_dim: int = 6,
         seed: int = 3407,
         normalize: bool = True,
+        store: MotionStore | None = None,
     ) -> None:
         if split not in {"train", "val", "test"}:
             raise ValueError(f"Unsupported split: {split}")
 
         self.split = split
-        self.window_size = int(window_size)
-        self.seed = int(seed)
-        self.normalize = normalize
-        self.use_root_cond = bool(use_root_cond)
-        self.root_cond_dim = int(root_cond_dim)
-        self.database_path = resolve_database_path(use_full_skeleton=use_full_skeleton, database_path=database_path)
-
-        self.database = load_database(self.database_path)
-        self.names = self.database["names"].tolist()
-        self.parents = self.database["parents"].astype(np.int32)
-        self.range_starts = self.database["range_starts"].astype(np.int32)
-        self.range_stops = self.database["range_stops"].astype(np.int32)
-        self.range_names = self.database["range_names"]
-        self.range_mirror = self.database["range_mirror"].astype(bool)
-        self.joint_subset = str(self.database["joint_subset"].item())
-
-        self.clip_names = sorted(set(str(name) for name in self.range_names.tolist()))
-        self.split_windows = _build_windows_within_clip_split(
-            range_starts=self.range_starts,
-            range_stops=self.range_stops,
-            range_names=self.range_names,
-            window_size=self.window_size,
-            seed=self.seed,
+        self.store = store if store is not None else build_motion_store(
+            window_size=window_size,
+            database_path=database_path,
+            use_full_skeleton=use_full_skeleton,
+            use_root_cond=use_root_cond,
+            root_cond_dim=root_cond_dim,
+            seed=seed,
+            normalize=normalize,
         )
+
+        self.window_size = self.store.window_size
+        self.seed = self.store.seed
+        self.normalize = self.store.normalize
+        self.use_root_cond = self.store.use_root_cond
+        self.root_cond_dim = self.store.root_cond_dim
+        self.database_path = self.store.database_path
+        self.database = self.store.database
+        self.names = self.store.names
+        self.parents = self.store.parents
+        self.range_starts = self.store.range_starts
+        self.range_stops = self.store.range_stops
+        self.range_names = self.store.range_names
+        self.range_mirror = self.store.range_mirror
+        self.joint_subset = self.store.joint_subset
+        self.clip_names = self.store.clip_names
+        self.split_windows = self.store.split_windows
         self.windows = self.split_windows[self.split]
-        train_frame_indices = _unique_frame_indices(self.split_windows["train"])
-
-        self.motion_features, self.stats = build_motion_features(
-            self.database,
-            stat_frame_indices=train_frame_indices,
-        )
-        if self.normalize:
-            self.motion_features = normalize_motion_features(self.motion_features, self.stats)
-
-        self.full_motion_dim = int(self.motion_features.shape[1])
-        self.motion_dim = self.full_motion_dim - self.root_cond_dim if self.use_root_cond else self.full_motion_dim
-        self.num_joints = int(len(self.names))
+        self.motion_features = self.store.motion_features
+        self.stats = self.store.stats
+        self.full_motion_dim = self.store.full_motion_dim
+        self.motion_dim = self.store.motion_dim
+        self.num_joints = self.store.num_joints
 
     def __len__(self) -> int:
         return len(self.windows)
