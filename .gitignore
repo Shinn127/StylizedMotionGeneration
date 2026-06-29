@@ -52,7 +52,6 @@ coverage.xml
 
 # ---- Data / Models (大型产物，不入库) ----
 data/
-datasets/
 raw_data/
 outputs/
 output/
