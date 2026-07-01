@@ -35,8 +35,6 @@ def build_dataset(args, database_path, ckpt_args):
         window_size=args.window_size,
         database_path=database_path,
         use_full_skeleton=args.use_full_skeleton,
-        use_root_cond=ckpt_args['use_root_cond'],
-        root_cond_dim=ckpt_args['root_cond_dim'],
         seed=ckpt_args['seed'],
     )
 
@@ -57,8 +55,6 @@ def build_model_from_checkpoint(ckpt):
     args = ckpt['args']
     model = CausalMotionVQVAE(
         motion_dim=ckpt['motion_dim'],
-        root_cond_dim=args['root_cond_dim'],
-        use_root_cond=args['use_root_cond'],
         code_dim=args['code_dim'],
         codebook_size=args['codebook_size'],
         num_heads=args['num_heads'],
@@ -164,14 +160,11 @@ def main():
     with torch.no_grad():
         for batch in loader:
             motion = batch['motion'].to(device, non_blocking=bool(args.pin_memory and device.type == 'cuda'))
-            root_cond = batch['root_cond'].to(device, non_blocking=bool(args.pin_memory and device.type == 'cuda'))
-            output = model(motion, root_cond=root_cond)
+            output = model(motion)
             recon = output['recon_state'].cpu().numpy().astype(np.float32)
-            root_cond_np = root_cond.cpu().numpy().astype(np.float32)
             for i in range(motion.shape[0]):
                 range_idx = int(batch['range_idx'][i])
-                full_recon = dataset.pack_full_motion(recon[i], root_cond_np[i])
-                range_to_window[range_idx].append((int(batch['start_idx'][i]), int(batch['end_idx'][i]), full_recon))
+                range_to_window[range_idx].append((int(batch['start_idx'][i]), int(batch['end_idx'][i]), recon[i]))
 
     positions = dataset.database['positions'].astype(np.float32).copy()
     rotations = dataset.database['rotations'].astype(np.float32).copy()

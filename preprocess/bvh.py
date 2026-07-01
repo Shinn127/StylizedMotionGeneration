@@ -133,3 +133,12 @@ def load(filename, order=None):
         "names": names,
         "order": order,
     }
+
+
+def read_frame_count(filename):
+    with open(filename, "r") as f:
+        for line in f:
+            fmatch = re.match(r"\s*Frames:\s+(\d+)", line)
+            if fmatch:
+                return int(fmatch.group(1))
+    raise ValueError(f"Missing Frames header in BVH file: {filename}")

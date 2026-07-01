@@ -42,9 +42,6 @@ class MotionStore:
     window_size: int
     seed: int
     normalize: bool
-    use_root_cond: bool
-    root_cond_dim: int
-    full_motion_dim: int
     motion_dim: int
     num_joints: int
 
@@ -201,15 +198,11 @@ def build_motion_store(
     window_size: int = 64,
     database_path: str | Path | None = None,
     use_full_skeleton: bool = False,
-    use_root_cond: bool = True,
-    root_cond_dim: int = 6,
     seed: int = 3407,
     normalize: bool = True,
 ) -> MotionStore:
     window_size = int(window_size)
     seed = int(seed)
-    root_cond_dim = int(root_cond_dim)
-    use_root_cond = bool(use_root_cond)
     normalize = bool(normalize)
     resolved_database_path = resolve_database_path(use_full_skeleton=use_full_skeleton, database_path=database_path)
 
@@ -239,8 +232,7 @@ def build_motion_store(
     if normalize:
         motion_features = normalize_motion_features(motion_features, stats)
 
-    full_motion_dim = int(motion_features.shape[1])
-    motion_dim = full_motion_dim - root_cond_dim if use_root_cond else full_motion_dim
+    motion_dim = int(motion_features.shape[1])
     num_joints = int(len(names))
 
     return MotionStore(
@@ -260,9 +252,6 @@ def build_motion_store(
         window_size=window_size,
         seed=seed,
         normalize=normalize,
-        use_root_cond=use_root_cond,
-        root_cond_dim=root_cond_dim,
-        full_motion_dim=full_motion_dim,
         motion_dim=motion_dim,
         num_joints=num_joints,
     )
@@ -275,8 +264,6 @@ class MotionDataset(Dataset):
         window_size: int = 64,
         database_path: str | Path | None = None,
         use_full_skeleton: bool = False,
-        use_root_cond: bool = True,
-        root_cond_dim: int = 6,
         seed: int = 3407,
         normalize: bool = True,
         store: MotionStore | None = None,
@@ -289,8 +276,6 @@ class MotionDataset(Dataset):
             window_size=window_size,
             database_path=database_path,
             use_full_skeleton=use_full_skeleton,
-            use_root_cond=use_root_cond,
-            root_cond_dim=root_cond_dim,
             seed=seed,
             normalize=normalize,
         )
@@ -298,8 +283,6 @@ class MotionDataset(Dataset):
         self.window_size = self.store.window_size
         self.seed = self.store.seed
         self.normalize = self.store.normalize
-        self.use_root_cond = self.store.use_root_cond
-        self.root_cond_dim = self.store.root_cond_dim
         self.database_path = self.store.database_path
         self.database = self.store.database
         self.names = self.store.names
@@ -314,7 +297,6 @@ class MotionDataset(Dataset):
         self.windows = self.split_windows[self.split]
         self.motion_features = self.store.motion_features
         self.stats = self.store.stats
-        self.full_motion_dim = self.store.full_motion_dim
         self.motion_dim = self.store.motion_dim
         self.num_joints = self.store.num_joints
 
@@ -323,19 +305,12 @@ class MotionDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | int | str | bool]:
         window = self.windows[index]
-        full_motion = self.motion_features[window.start_idx : window.end_idx]
-        if self.use_root_cond:
-            root_cond = full_motion[:, : self.root_cond_dim]
-            motion = full_motion[:, self.root_cond_dim :]
-        else:
-            root_cond = np.zeros((len(full_motion), 0), dtype=np.float32)
-            motion = full_motion
+        motion = self.motion_features[window.start_idx : window.end_idx]
         range_name = str(self.range_names[window.range_idx])
         mirror = bool(self.range_mirror[window.range_idx])
 
         return {
             "motion": torch.from_numpy(motion.astype(np.float32)),
-            "root_cond": torch.from_numpy(root_cond.astype(np.float32)),
             "start_idx": window.start_idx,
             "end_idx": window.end_idx,
             "range_idx": window.range_idx,
@@ -347,16 +322,7 @@ class MotionDataset(Dataset):
         return self.stats
 
     def model_feature_weights(self) -> np.ndarray:
-        if self.use_root_cond:
-            return self.stats.weights[self.root_cond_dim :].astype(np.float32)
         return self.stats.weights.astype(np.float32)
-
-    def pack_full_motion(self, motion: np.ndarray, root_cond: np.ndarray) -> np.ndarray:
-        motion = np.asarray(motion, dtype=np.float32)
-        if not self.use_root_cond:
-            return motion
-        root_cond = np.asarray(root_cond, dtype=np.float32)
-        return np.concatenate([root_cond, motion], axis=-1).astype(np.float32)
 
     def split_summary(self) -> dict[str, int]:
         return {
@@ -365,8 +331,5 @@ class MotionDataset(Dataset):
             "num_clip_groups": int(len(self.clip_names)),
             "window_size": self.window_size,
             "motion_dim": self.motion_dim,
-            "full_motion_dim": self.full_motion_dim,
-            "use_root_cond": self.use_root_cond,
-            "root_cond_dim": self.root_cond_dim,
             "num_joints": self.num_joints,
         }

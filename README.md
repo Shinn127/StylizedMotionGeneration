@@ -214,40 +214,54 @@ outputs/vqvae/
 ```bash
 python preprocess/build_feature_database.py \
   --dataset 100style \
+  --max-styles 5 \
+  --prune-ends-and-fingers \
+  --window-size 64 \
+  --seed 3407 \
+  --workers 8 \
   --output data/processed/100style_test5_pruned/feature_database
 ```
 
 输出 `feature_database/` 包含：
 
-- `motion`：归一化后的 `224D` body/style motion
-- `root_cond`：归一化后的 `6D` root condition
+- `motion`：归一化后的 `230D` full motion feature
 - `train_windows` / `val_windows` / `test_windows`：固定 split 的窗口索引表
 - `offset` / `scale` / `dist` / `weights` / `ref_pos`：train split 统计得到的 feature stats
 - `names` / `parents` / `joint_subset` / `range_names` / `range_mirror`
 
 ### Root Condition 机制
 
-当前训练默认将 root condition 从完整 `230D` 特征中拆分出来，模型不会直接重建完整 `230D` 向量。
+`feature_database` 只保存完整 `230D` 特征，不再单独落盘 root condition。是否将前 `6D` 作为 root condition 拆给 decoder，是训练/模型层的选择，不属于 feature database schema。
+
+参数说明：
+
+- `--dataset 100style`：使用 100style 数据集
+- `--max-styles 5`：只取前 5 个 style 做测试
+- `--prune-ends-and-fingers`：使用 pruned skeleton
+- `--window-size 64`：固定窗口长度
+- `--seed 3407`：窗口划分随机种子
+- `--workers 8`：并行 worker 数
+- `--output ...`：feature database 输出目录
 
 ```text
 完整 motion state: 230D
-root condition:    6D   = root local linear velocity + root local angular velocity
-模型重建目标:       224D = 剩余 body/style features
+前 6D:             root local linear velocity + root local angular velocity
+剩余 224D:         body/style features
 ```
 
-训练链路：
+当前无 root condition 的训练链路：
 
 ```text
-encoder input: 224D body/style motion
-decoder input: quantized latent + 6D root_cond
-decoder output: 224D body/style reconstruction
-loss target: 224D body/style motion
+encoder input: 230D full motion feature
+decoder input: quantized latent
+decoder output: 230D full motion reconstruction
+loss target: 230D full motion feature
 ```
 
 推理/导出链路：
 
 ```text
-recon_224D + root_cond_6D -> pack 回 230D -> reconstructed database.npz
+recon_230D -> reconstructed database.npz
 ```
 
 ## VQ-VAE 推理与导出

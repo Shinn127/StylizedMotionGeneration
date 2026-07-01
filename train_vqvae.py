@@ -45,7 +45,7 @@ def parse_args(argv=None):
         return None if value is None else Path(value)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--config", type=Path, default=pre_args.config)
     parser.add_argument("--split-train", default=cfg("split_train", "train"))
     parser.add_argument("--split-val", default=cfg("split_val", "val"))
     parser.add_argument("--feature-database", type=Path, default=cfg_path("feature_database", None))
@@ -120,8 +120,6 @@ def build_dataloaders(args, pin_memory: bool):
 def build_model(args, motion_dim):
     return CausalMotionVQVAE(
         motion_dim=motion_dim,
-        root_cond_dim=args.root_cond_dim,
-        use_root_cond=True,
         code_dim=args.code_dim,
         codebook_size=args.codebook_size,
         num_heads=args.num_heads,
@@ -185,8 +183,7 @@ def finalize_metric_totals(totals, count):
 
 def move_motion_to_device(batch, device, non_blocking: bool):
     motion = batch["motion"].to(device, non_blocking=non_blocking)
-    root_cond = batch["root_cond"].to(device, non_blocking=non_blocking)
-    return motion, root_cond
+    return motion
 
 
 def evaluate(model, loader, feature_weights, device, delta_weight, commit_weight, non_blocking: bool):
@@ -195,8 +192,8 @@ def evaluate(model, loader, feature_weights, device, delta_weight, commit_weight
     count = 0
     with torch.no_grad():
         for batch in loader:
-            motion, root_cond = move_motion_to_device(batch, device, non_blocking=non_blocking)
-            output = model(motion, root_cond=root_cond)
+            motion = move_motion_to_device(batch, device, non_blocking=non_blocking)
+            output = model(motion)
             loss, recon_loss, delta_loss, commit_loss = compute_losses(
                 motion,
                 output,
@@ -238,8 +235,8 @@ def train_one_epoch(
     start_time = time.perf_counter()
 
     for batch_idx, batch in enumerate(loader, start=1):
-        motion, root_cond = move_motion_to_device(batch, device, non_blocking=non_blocking)
-        output = model(motion, root_cond=root_cond)
+        motion = move_motion_to_device(batch, device, non_blocking=non_blocking)
+        output = model(motion)
         loss, recon_loss, delta_loss, commit_loss = compute_losses(
             motion,
             output,
@@ -309,9 +306,6 @@ def build_run_config(args, run_name: str, train_dataset, val_dataset) -> dict:
             "feature_database": str(train_dataset.feature_database),
             "joint_subset": train_dataset.joint_subset,
             "motion_dim": train_dataset.motion_dim,
-            "full_motion_dim": train_dataset.full_motion_dim,
-            "use_root_cond": train_dataset.use_root_cond,
-            "root_cond_dim": train_dataset.root_cond_dim,
             "num_joints": train_dataset.num_joints,
             "train_summary": train_dataset.split_summary(),
             "val_summary": val_dataset.split_summary(),
@@ -357,9 +351,6 @@ def build_checkpoint(
         "run_name": run_name,
         "config_path": str(config_path),
         "motion_dim": train_dataset.motion_dim,
-        "full_motion_dim": train_dataset.full_motion_dim,
-        "use_root_cond": True,
-        "root_cond_dim": train_dataset.root_cond_dim,
         "stats": serialize_motion_feature_stats(
             train_dataset.feature_stats(),
             names=train_dataset.names,
@@ -387,7 +378,6 @@ def main():
 
     train_dataset, val_dataset, train_loader, val_loader = build_dataloaders(args, pin_memory=use_pin_memory)
     feature_weights = torch.from_numpy(train_dataset.model_feature_weights().astype("float32"))
-    args.root_cond_dim = train_dataset.root_cond_dim
 
     model = build_model(args, motion_dim=train_dataset.motion_dim)
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
