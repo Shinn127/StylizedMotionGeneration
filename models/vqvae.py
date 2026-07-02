@@ -1,7 +1,6 @@
-import torch
 import torch.nn as nn
 
-from models.causal_cnn import CausalDecoder1D, CausalEncoder1D
+from models.causal_cnn import CausalDecoder1D, CausalEncoder1D, FrameCausalDecoder1D, FrameCausalEncoder1D
 from models.quantizer import MultiHeadEMAVQ
 
 
@@ -19,37 +18,65 @@ class CausalMotionVQVAE(nn.Module):
         dilation_growth_rate=3,
         activation="relu",
         norm=None,
+        model_type="causal_cnn",
     ):
         super().__init__()
-        self.motion_dim = motion_dim
-        self.upsample_factor = 2 ** down_t
+        if model_type not in {"causal_cnn", "frame_causal_cnn"}:
+            raise ValueError(f"Unsupported model_type: {model_type}")
 
-        self.encoder = CausalEncoder1D(
-            input_dim=motion_dim,
-            code_dim=code_dim,
-            down_t=down_t,
-            width=width,
-            depth=depth,
-            dilation_growth_rate=dilation_growth_rate,
-            activation=activation,
-            norm=norm,
-        )
+        self.model_type = model_type
+        self.motion_dim = motion_dim
+        self.upsample_factor = 1 if model_type == "frame_causal_cnn" else 2 ** down_t
+
+        if model_type == "frame_causal_cnn":
+            self.encoder = FrameCausalEncoder1D(
+                input_dim=motion_dim,
+                code_dim=code_dim,
+                width=width,
+                depth=depth,
+                dilation_growth_rate=dilation_growth_rate,
+                activation=activation,
+                norm=norm,
+            )
+        else:
+            self.encoder = CausalEncoder1D(
+                input_dim=motion_dim,
+                code_dim=code_dim,
+                down_t=down_t,
+                width=width,
+                depth=depth,
+                dilation_growth_rate=dilation_growth_rate,
+                activation=activation,
+                norm=norm,
+            )
+
         self.quantizer = MultiHeadEMAVQ(
             code_dim=code_dim,
             num_heads=num_heads,
             codebook_size=codebook_size,
             decay=decay,
         )
-        self.decoder = CausalDecoder1D(
-            output_dim=motion_dim,
-            code_dim=code_dim,
-            down_t=down_t,
-            width=width,
-            depth=depth,
-            dilation_growth_rate=dilation_growth_rate,
-            activation=activation,
-            norm=norm,
-        )
+        if model_type == "frame_causal_cnn":
+            self.decoder = FrameCausalDecoder1D(
+                output_dim=motion_dim,
+                code_dim=code_dim,
+                width=width,
+                depth=depth,
+                dilation_growth_rate=dilation_growth_rate,
+                activation=activation,
+                norm=norm,
+            )
+        else:
+            self.decoder = CausalDecoder1D(
+                output_dim=motion_dim,
+                code_dim=code_dim,
+                down_t=down_t,
+                width=width,
+                depth=depth,
+                dilation_growth_rate=dilation_growth_rate,
+                activation=activation,
+                norm=norm,
+            )
 
     def _encode_input(self, x):
         return x.permute(0, 2, 1).float()

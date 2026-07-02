@@ -58,6 +58,35 @@ class CausalEncoder1D(nn.Module):
         return self.model(x)
 
 
+class FrameCausalEncoder1D(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        code_dim,
+        width=512,
+        depth=6,
+        dilation_growth_rate=2,
+        activation="relu",
+        norm=None,
+    ):
+        super().__init__()
+        self.model = nn.Sequential(
+            CausalConv1d(input_dim, width, 3, 1, 1),
+            nn.ReLU(),
+            CausalResnet1D(
+                channels=width,
+                depth=depth,
+                dilation_growth_rate=dilation_growth_rate,
+                activation=activation,
+                norm=norm,
+            ),
+            CausalConv1d(width, code_dim, 3, 1, 1),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
 class CausalDecoder1D(nn.Module):
     def __init__(
         self,
@@ -89,6 +118,38 @@ class CausalDecoder1D(nn.Module):
             )
         blocks.extend([CausalConv1d(width, width, 3, 1, 1), nn.ReLU(), CausalConv1d(width, output_dim, 3, 1, 1)])
         self.model = nn.Sequential(*blocks)
+
+    def forward(self, z):
+        return self.model(z)
+
+
+class FrameCausalDecoder1D(nn.Module):
+    def __init__(
+        self,
+        output_dim,
+        code_dim,
+        width=512,
+        depth=6,
+        dilation_growth_rate=2,
+        activation="relu",
+        norm=None,
+    ):
+        super().__init__()
+        self.model = nn.Sequential(
+            CausalConv1d(code_dim, width, 3, 1, 1),
+            nn.ReLU(),
+            CausalResnet1D(
+                channels=width,
+                depth=depth,
+                dilation_growth_rate=dilation_growth_rate,
+                reverse_dilation=True,
+                activation=activation,
+                norm=norm,
+            ),
+            CausalConv1d(width, width, 3, 1, 1),
+            nn.ReLU(),
+            CausalConv1d(width, output_dim, 3, 1, 1),
+        )
 
     def forward(self, z):
         return self.model(z)

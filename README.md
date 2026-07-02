@@ -261,37 +261,42 @@ loss target: 230D full motion feature
 推理/导出链路：
 
 ```text
-recon_230D -> reconstructed database.npz
+feature_database normalized 230D -> recon_230D -> clip_features/*.npy
 ```
 
 ## VQ-VAE 推理与导出
 
-从 checkpoint 导出重建后的 database：
+从 checkpoint 导出重建后的 `230D` feature clips：
 
 ```bash
 python infer_vqvae.py \
-  --checkpoint outputs/vqvae_pruned/best.pt \
+  --checkpoint outputs/vqvae_pruned_test5/best.pt \
+  --feature-database data/processed/100style_test5_pruned/feature_database \
   --split test \
-  --outdir outputs/vqvae_pruned/infer \
-  --tag test_recon \
-  --export-trajectory
+  --batch-size 64 \
+  --num-workers 4 \
+  --outdir outputs/vqvae_pruned_test5/infer \
+  --tag test_recon
 ```
 
 输出目录：
 
 ```text
-outputs/vqvae_pruned/infer/test_recon/
-├── database.npz
-├── trajectory.npz
-└── recon_windows.npz
+outputs/vqvae_pruned_test5/infer/test_recon/
+├── recon_windows.npz
+└── clip_features/
+    ├── index.npz
+    └── 00000_Aeroplane_BR_orig/segment_000064_000192/features.npy
 ```
 
-可视化重建结果：
+直接可视化单段 `230D` feature 序列：
 
 ```bash
 python Genoview.py \
-  --database outputs/vqvae_pruned/infer/test_recon/database.npz \
-  --trajectory outputs/vqvae_pruned/infer/test_recon/trajectory.npz
+  --features outputs/vqvae_pruned_test5/infer/test_recon/clip_features/00000_Aeroplane_BR_orig/segment_000064_000192/features.npy \
+  --stats-source outputs/vqvae_pruned_test5/best.pt \
+  --normalized \
+  --range-name Aeroplane_BR_recon
 ```
 
 ## Feature Roundtrip 工具

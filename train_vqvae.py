@@ -63,6 +63,7 @@ def parse_args(argv=None):
     parser.add_argument("--prefetch-factor", type=int, default=cfg("prefetch_factor", 4))
     parser.add_argument("--log-every", type=int, default=cfg("log_every", 50))
     parser.add_argument("--run-name", type=str, default=cfg("run_name", None))
+    parser.add_argument("--model-type", choices=["causal_cnn", "frame_causal_cnn"], default=cfg("model_type", "causal_cnn"))
     parser.add_argument("--code-dim", type=int, default=cfg("code_dim", 256))
     parser.add_argument("--codebook-size", type=int, default=cfg("codebook_size", 128))
     parser.add_argument("--num-heads", type=int, default=cfg("num_heads", 8))
@@ -127,6 +128,7 @@ def build_model(args, motion_dim):
         width=args.width,
         depth=args.depth,
         dilation_growth_rate=args.dilation_growth_rate,
+        model_type=args.model_type,
     )
 
 

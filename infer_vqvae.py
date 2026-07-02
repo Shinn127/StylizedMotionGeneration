@@ -1,23 +1,21 @@
 import argparse
 from collections import defaultdict
 from pathlib import Path
+import re
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from datasets.motion_dataset import MotionDataset
+from datasets.feature_dataset import FeatureDataset, build_feature_store
 from models.vqvae import CausalMotionVQVAE
-from motion_features import deserialize_motion_feature_stats, reconstruct_motion_state_from_features, resolve_database_path
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Run VQ-VAE inference on a dataset split and export a Genoview-compatible database.')
+    parser = argparse.ArgumentParser(description='Run VQ-VAE inference on 230D feature_database input and export reconstructed feature clips.')
     parser.add_argument('--checkpoint', type=Path, required=True, help='Path to best.pt or last.pt.')
+    parser.add_argument('--feature-database', type=Path, default=None, help='Path to feature_database containing normalized 230D motion shards.')
     parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'])
-    parser.add_argument('--database-path', type=Path, default=None)
-    parser.add_argument('--use-full-skeleton', action='store_true')
-    parser.add_argument('--window-size', type=int, default=64)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--pin-memory', dest='pin_memory', action='store_true')
@@ -25,18 +23,19 @@ def parse_args():
     parser.set_defaults(pin_memory=torch.cuda.is_available())
     parser.add_argument('--outdir', type=Path, default=Path('outputs/vqvae/infer'))
     parser.add_argument('--tag', type=str, default='recon')
-    parser.add_argument('--export-trajectory', action='store_true', help='Also export a trajectory.npz for Genoview from the dataset database.')
     return parser.parse_args()
 
 
-def build_dataset(args, database_path, ckpt_args):
-    return MotionDataset(
-        split=args.split,
-        window_size=args.window_size,
-        database_path=database_path,
-        use_full_skeleton=args.use_full_skeleton,
-        seed=ckpt_args['seed'],
-    )
+def resolve_feature_database(args, ckpt_args):
+    feature_database = args.feature_database or ckpt_args.get('feature_database')
+    if feature_database is None:
+        raise ValueError('--feature-database is required because the checkpoint args do not contain feature_database')
+    return Path(feature_database)
+
+
+def build_dataset(args, feature_database):
+    store = build_feature_store(feature_database)
+    return FeatureDataset(split=args.split, store=store)
 
 
 def build_loader(args, dataset):
@@ -62,90 +61,128 @@ def build_model_from_checkpoint(ckpt):
         width=args['width'],
         depth=args['depth'],
         dilation_growth_rate=args['dilation_growth_rate'],
+        model_type=args.get('model_type', 'causal_cnn'),
     )
     model.load_state_dict(ckpt['model'])
     return model, args
 
 
-def load_stats_from_checkpoint(ckpt):
-    if 'stats' not in ckpt:
-        raise KeyError('Checkpoint does not contain motion feature stats')
-    stats, metadata = deserialize_motion_feature_stats(ckpt['stats'])
-    return stats, metadata
+def validate_export_inputs(dataset, ckpt):
+    if int(ckpt['motion_dim']) != int(dataset.motion_dim):
+        raise ValueError(f"Checkpoint motion_dim={ckpt['motion_dim']} does not match feature database motion_dim={dataset.motion_dim}")
 
 
-def export_trajectory(database, out_path, split_name):
-    from preprocess import quat as q
+def safe_path_part(value):
+    value = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(value)).strip('._')
+    return value or 'clip'
 
-    positions = database['positions'].astype(np.float32)
-    rotations = database['rotations'].astype(np.float32)
-    range_starts = database['range_starts'].astype(np.int32)
-    range_stops = database['range_stops'].astype(np.int32)
-    range_names = database['range_names']
-    range_mirror = database['range_mirror'].astype(bool)
 
-    xroot_pos = positions[:, 0]
-    xroot_rot = rotations[:, 0]
-    xroot_dir = q.mul_vec(xroot_rot, np.array([0.0, 0.0, 1.0], dtype=np.float32))
+def export_clip_features(range_to_window, dataset, outdir):
+    feature_root = outdir / 'clip_features'
+    feature_root.mkdir(parents=True, exist_ok=True)
 
-    future_frames = np.array([20, 40, 60], dtype=np.int32)
-    max_future = int(future_frames.max())
+    rel_paths = []
+    range_indices = []
+    range_names = []
+    range_mirror = []
+    starts = []
+    stops = []
+    source_window_counts = []
+    covered_frame_counts = []
+    coverage_ratios = []
 
-    indices = []
-    future_positions = []
-    future_directions = []
-    sample_range_names = []
-    sample_mirror = []
+    def flush_segment(range_idx, clip_dir, segment_windows):
+        segment_start = min(int(start) for start, _end, _motion in segment_windows)
+        segment_stop = max(int(end) for _start, end, _motion in segment_windows)
+        if segment_stop <= segment_start:
+            raise ValueError(f"Invalid feature segment [{segment_start}, {segment_stop}) for range {range_idx}")
 
-    for range_idx, (rs, re) in enumerate(zip(range_starts, range_stops)):
-        pose_indices = np.arange(int(rs) + 1, int(re) - max_future, dtype=np.int32)
-        if len(pose_indices) == 0:
+        merged = np.zeros((segment_stop - segment_start, dataset.motion_dim), dtype=np.float32)
+        counts = np.zeros((segment_stop - segment_start, 1), dtype=np.float32)
+        for local_start, local_end, recon_motion in segment_windows:
+            local_start = int(local_start)
+            local_end = int(local_end)
+            if local_end <= local_start:
+                raise ValueError(f"Invalid window [{local_start}, {local_end}) for range {range_idx}")
+            start = local_start - segment_start
+            end = local_end - segment_start
+            merged[start:end] += np.asarray(recon_motion, dtype=np.float32)
+            counts[start:end] += 1.0
+
+        covered = counts[:, 0] > 0.0
+        if not np.all(covered):
+            missing = np.nonzero(~covered)[0]
+            raise ValueError(
+                f"Range {range_idx} has gaps inside merged feature segment [{segment_start}, {segment_stop}); "
+                f"first missing local frame {int(missing[0]) + segment_start}"
+            )
+        merged = merged / counts
+
+        segment_dir = clip_dir / f'segment_{segment_start:06d}_{segment_stop:06d}'
+        segment_dir.mkdir(parents=True, exist_ok=True)
+        feature_path = segment_dir / 'features.npy'
+        np.save(feature_path, merged.astype(np.float32))
+
+        rel_paths.append(feature_path.relative_to(outdir).as_posix())
+        range_indices.append(range_idx)
+        range_names.append(str(dataset.range_names[range_idx]))
+        range_mirror.append(bool(dataset.range_mirror[range_idx]))
+        starts.append(segment_start)
+        stops.append(segment_stop)
+        source_window_counts.append(len(segment_windows))
+        covered_frame_counts.append(int(np.sum(covered)))
+        coverage_ratios.append(float(np.sum(covered)) / float(segment_stop - segment_start))
+
+    for range_idx in range(len(dataset.range_names)):
+        windows = sorted(range_to_window.get(range_idx, []), key=lambda x: (x[0], x[1]))
+        if not windows:
             continue
-        cpos = q.inv_mul_vec(
-            xroot_rot[pose_indices][:, None],
-            xroot_pos[pose_indices[:, None] + future_frames] - xroot_pos[pose_indices][:, None],
-        ).astype(np.float32)
-        cdir = q.inv_mul_vec(
-            xroot_rot[pose_indices][:, None],
-            xroot_dir[pose_indices[:, None] + future_frames],
-        ).astype(np.float32)
-        indices.append(pose_indices)
-        future_positions.append(cpos)
-        future_directions.append(cdir)
-        sample_range_names.append(np.full(len(pose_indices), str(range_names[range_idx]), dtype=object))
-        sample_mirror.append(np.full(len(pose_indices), bool(range_mirror[range_idx]), dtype=bool))
 
-    if not indices:
-        raise ValueError('No trajectory samples can be formed from the database.')
+        clip_name = safe_path_part(dataset.range_names[range_idx])
+        mirror_suffix = 'mirror' if bool(dataset.range_mirror[range_idx]) else 'orig'
+        clip_dir = feature_root / f'{range_idx:05d}_{clip_name}_{mirror_suffix}'
+        clip_dir.mkdir(parents=True, exist_ok=True)
 
-    indices = np.concatenate(indices, axis=0)
-    future_positions = np.concatenate(future_positions, axis=0)
-    future_directions = np.concatenate(future_directions, axis=0)
-    sample_range_names = np.concatenate(sample_range_names, axis=0)
-    sample_mirror = np.concatenate(sample_mirror, axis=0)
+        segment_windows = []
+        segment_stop = None
+        for window in windows:
+            local_start = int(window[0])
+            local_end = int(window[1])
+            if segment_stop is None or local_start > segment_stop:
+                if segment_windows:
+                    flush_segment(range_idx, clip_dir, segment_windows)
+                segment_windows = [window]
+                segment_stop = local_end
+            else:
+                segment_windows.append(window)
+                segment_stop = max(segment_stop, local_end)
+        if segment_windows:
+            flush_segment(range_idx, clip_dir, segment_windows)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path = feature_root / 'index.npz'
     np.savez(
-        out_path,
-        indices=indices.astype(np.int32),
-        T=np.concatenate([future_positions, future_directions], axis=-1).reshape(len(indices), -1).astype(np.float32),
-        Tpos=future_positions.astype(np.float32),
-        Tdir=future_directions.astype(np.float32),
-        future_frames=future_frames.astype(np.int32),
-        selected_tags=np.array([split_name], dtype=object),
-        sample_range_names=sample_range_names,
-        sample_mirror=sample_mirror,
-        database_path=np.array(str(out_path.parent / 'database.npz'), dtype=object),
+        index_path,
+        feature_files=np.asarray(rel_paths, dtype=object),
+        range_indices=np.asarray(range_indices, dtype=np.int32),
+        range_names=np.asarray(range_names, dtype=object),
+        range_mirror=np.asarray(range_mirror, dtype=bool),
+        window_starts=np.asarray(starts, dtype=np.int32),
+        window_stops=np.asarray(stops, dtype=np.int32),
+        source_window_counts=np.asarray(source_window_counts, dtype=np.int32),
+        covered_frame_counts=np.asarray(covered_frame_counts, dtype=np.int32),
+        coverage_ratios=np.asarray(coverage_ratios, dtype=np.float32),
+        normalized=np.asarray(True, dtype=bool),
     )
+    return feature_root, index_path
 
 
 def main():
     args = parse_args()
     ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     model, ckpt_args = build_model_from_checkpoint(ckpt)
-    stats, stats_meta = load_stats_from_checkpoint(ckpt)
-    database_path = resolve_database_path(use_full_skeleton=args.use_full_skeleton, database_path=args.database_path or ckpt_args.get('database_path'))
-    dataset = build_dataset(args, database_path, ckpt_args)
+    feature_database = resolve_feature_database(args, ckpt_args)
+    dataset = build_dataset(args, feature_database)
+    validate_export_inputs(dataset, ckpt)
     loader = build_loader(args, dataset)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
@@ -154,7 +191,6 @@ def main():
     outdir = args.outdir / args.tag
     outdir.mkdir(parents=True, exist_ok=True)
 
-    num_ranges = len(dataset.range_names)
     range_to_window = defaultdict(list)
 
     with torch.no_grad():
@@ -166,77 +202,20 @@ def main():
                 range_idx = int(batch['range_idx'][i])
                 range_to_window[range_idx].append((int(batch['start_idx'][i]), int(batch['end_idx'][i]), recon[i]))
 
-    positions = dataset.database['positions'].astype(np.float32).copy()
-    rotations = dataset.database['rotations'].astype(np.float32).copy()
-    contacts = dataset.database['contacts'].astype(np.uint8).copy()
-    velocities = dataset.database['velocities'].astype(np.float32).copy()
-    angular_velocities = dataset.database['angular_velocities'].astype(np.float32).copy()
-
-    for range_idx in range(num_ranges):
-        windows = sorted(range_to_window.get(range_idx, []), key=lambda x: x[0])
-        if not windows:
-            continue
-        for start, end, recon_motion in windows:
-            state = reconstruct_motion_state_from_features(
-                x=recon_motion,
-                stats=stats,
-                normalized=True,
-                root_position0=positions[start, 0].copy(),
-                root_rotation0=rotations[start, 0].copy(),
-            )
-            positions[start:end] = state.local_positions
-            rotations[start:end] = state.local_rotations
-            velocities[start:end] = state.local_velocities
-            angular_velocities[start:end] = state.local_angular_velocities
-            contacts[start:end] = np.asarray(state.contacts > 0.5, dtype=np.uint8)
-
-    out_db = outdir / 'database.npz'
-    np.savez(
-        out_db,
-        positions=positions,
-        velocities=velocities,
-        rotations=rotations,
-        angular_velocities=angular_velocities,
-        parents=dataset.database['parents'].astype(np.int32),
-        names=dataset.database['names'],
-        range_starts=dataset.range_starts.astype(np.int32),
-        range_stops=dataset.range_stops.astype(np.int32),
-        range_mirror=dataset.range_mirror.astype(bool),
-        range_names=dataset.database['range_names'],
-        contacts=contacts,
-        tag_range_starts=dataset.database['tag_range_starts'].astype(np.int32),
-        tag_range_stops=dataset.database['tag_range_stops'].astype(np.int32),
-        tag_range_names=dataset.database['tag_range_names'],
-        tag_tags=dataset.database['tag_tags'],
-        tag_mirror=dataset.database['tag_mirror'].astype(bool),
-        joint_subset=np.array(str(stats_meta.get('joint_subset', dataset.joint_subset)), dtype=object),
-    )
+    clip_features_dir, clip_features_index = export_clip_features(range_to_window, dataset, outdir)
 
     np.savez(
         outdir / 'recon_windows.npz',
         split=np.array(args.split, dtype=object),
-        database_path=np.array(str(database_path), dtype=object),
+        feature_database=np.array(str(feature_database), dtype=object),
         checkpoint=np.array(str(args.checkpoint), dtype=object),
+        clip_features_dir=np.array(str(clip_features_dir), dtype=object),
+        clip_features_index=np.array(str(clip_features_index), dtype=object),
     )
 
-    if args.export_trajectory:
-        export_trajectory(
-            {
-                'positions': positions,
-                'rotations': rotations,
-                'range_starts': dataset.range_starts.astype(np.int32),
-                'range_stops': dataset.range_stops.astype(np.int32),
-                'range_names': dataset.database['range_names'],
-                'range_mirror': dataset.range_mirror.astype(bool),
-            },
-            outdir / 'trajectory.npz',
-            args.split,
-        )
-
-    print(f'Exported database to {out_db}')
+    print(f'Exported clip features to {clip_features_dir}')
+    print(f'Exported clip feature index to {clip_features_index}')
     print(f'Exported recon metadata to {outdir / "recon_windows.npz"}')
-    if args.export_trajectory:
-        print(f'Exported trajectory to {outdir / "trajectory.npz"}')
 
 
 if __name__ == '__main__':

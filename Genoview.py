@@ -4,10 +4,12 @@ from pathlib import Path
 
 import cffi
 import numpy as np
+import torch
 from pyray import BoneInfo, Camera3D, Color, Matrix, Mesh, Model, Rectangle, RenderTexture, Texture, Transform, Vector2, Vector3
 from raylib import *
 from raylib.defines import *
 
+from motion_features import deserialize_motion_feature_stats, reconstruct_motion_state_from_features
 from preprocess import quat
 
 
@@ -434,6 +436,92 @@ def load_bvh_data(path: Path):
     return bvh.load(str(path))
 
 
+def load_feature_array(path: Path, key: str) -> np.ndarray:
+    if path.suffix == ".npy":
+        features = np.load(path)
+    else:
+        data = np.load(path, allow_pickle=True)
+        if key in data.files:
+            features = data[key]
+        elif len(data.files) == 1:
+            features = data[data.files[0]]
+        else:
+            raise KeyError(f"Could not find key {key!r} in {path}. Available keys: {list(data.files)}")
+
+    features = np.asarray(features, dtype=np.float32)
+    if features.ndim == 3:
+        if features.shape[0] != 1:
+            raise ValueError(f"Expected feature shape [T, D] or [1, T, D], got {features.shape}")
+        features = features[0]
+    if features.ndim != 2:
+        raise ValueError(f"Expected feature shape [T, D], got {features.shape}")
+    return features
+
+
+def load_feature_stats(stats_source: Path):
+    if stats_source.is_dir():
+        stats_source = stats_source / "metadata.npz"
+
+    if stats_source.suffix == ".npz":
+        payload_npz = np.load(stats_source, allow_pickle=True)
+        payload = {key: payload_npz[key] for key in payload_npz.files}
+    else:
+        checkpoint = torch.load(stats_source, map_location="cpu", weights_only=False)
+        if "stats" not in checkpoint:
+            raise KeyError(f"Checkpoint {stats_source} does not contain stats")
+        payload = checkpoint["stats"]
+
+    stats, metadata = deserialize_motion_feature_stats(payload)
+    for key in ("names", "parents", "joint_subset"):
+        if key not in metadata:
+            raise KeyError(f"Stats source {stats_source} does not contain {key}")
+    return stats, metadata
+
+
+def build_database_from_features(
+    features_path: Path,
+    stats_source: Path,
+    feature_key: str,
+    normalized: bool,
+    range_name: str,
+    root_position0: list[float] | None,
+    root_rotation0: list[float] | None,
+) -> dict[str, np.ndarray]:
+    features = load_feature_array(features_path, feature_key)
+    stats, metadata = load_feature_stats(stats_source)
+    if features.shape[1] != stats.offset.shape[0]:
+        raise ValueError(f"Feature dim {features.shape[1]} does not match stats dim {stats.offset.shape[0]}")
+
+    state = reconstruct_motion_state_from_features(
+        x=features,
+        stats=stats,
+        parents=np.asarray(metadata["parents"], dtype=np.int32),
+        normalized=normalized,
+        root_position0=None if root_position0 is None else np.asarray(root_position0, dtype=np.float32),
+        root_rotation0=None if root_rotation0 is None else np.asarray(root_rotation0, dtype=np.float32),
+    )
+    nframes = int(len(state.local_positions))
+    return {
+        "positions": state.local_positions.astype(np.float32),
+        "rotations": state.local_rotations.astype(np.float32),
+        "velocities": state.local_velocities.astype(np.float32),
+        "angular_velocities": state.local_angular_velocities.astype(np.float32),
+        "contacts": np.asarray(state.contacts > 0.5, dtype=np.uint8),
+        "parents": np.asarray(metadata["parents"], dtype=np.int32),
+        "names": np.asarray(metadata["names"], dtype=object),
+        "range_starts": np.asarray([0], dtype=np.int32),
+        "range_stops": np.asarray([nframes], dtype=np.int32),
+        "range_names": np.asarray([range_name], dtype=object),
+        "range_mirror": np.asarray([False], dtype=bool),
+        "joint_subset": np.asarray(str(metadata["joint_subset"]), dtype=object),
+    }
+
+
+def load_database_dict(path: Path) -> dict[str, np.ndarray]:
+    data = np.load(path, allow_pickle=True)
+    return {key: data[key] for key in data.files}
+
+
 def draw_trajectory(root_pos, root_rot, tpos, tdir):
     if tpos is None or tdir is None:
         return
@@ -450,13 +538,13 @@ def draw_trajectory(root_pos, root_rot, tpos, tdir):
 
 
 class GenoView:
-    def __init__(self, database_path: Path, trajectory_path: Path | None, resources_root: Path, fps: int = 60):
-        self.database = np.load(database_path, allow_pickle=True)
+    def __init__(self, database: dict[str, np.ndarray], trajectory_path: Path | None, resources_root: Path, fps: int = 60):
+        self.database = database
         self.positions = self.database["positions"].astype(np.float32)
         self.rotations = self.database["rotations"].astype(np.float32)
         self.parents = self.database["parents"].astype(np.int32)
         self.names = self.database["names"]
-        self.joint_subset = self.database["joint_subset"].item() if "joint_subset" in self.database.files else "full"
+        self.joint_subset = self.database["joint_subset"].item() if "joint_subset" in self.database else "full"
         self.range_names = self.database["range_names"]
         self.range_starts = self.database["range_starts"].astype(np.int32)
         self.range_stops = self.database["range_stops"].astype(np.int32)
@@ -955,8 +1043,15 @@ class GenoView:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="High-quality Geno viewer driven by database.npz motion data.")
-    parser.add_argument("--database", type=Path, required=True, help="Path to full database.npz")
+    parser = argparse.ArgumentParser(description="High-quality Geno viewer driven by database.npz or 230D motion features.")
+    parser.add_argument("--database", type=Path, default=None, help="Path to database.npz")
+    parser.add_argument("--features", type=Path, default=None, help="Path to .npy or .npz containing 230D features with shape [T, D].")
+    parser.add_argument("--feature-key", type=str, default="motion", help="Array key for .npz feature input.")
+    parser.add_argument("--stats-source", type=Path, default=None, help="Checkpoint .pt, metadata.npz, or feature_database directory containing feature stats.")
+    parser.add_argument("--normalized", action="store_true", help="Treat --features as normalized feature values.")
+    parser.add_argument("--range-name", type=str, default="features", help="Range name used in feature visualization mode.")
+    parser.add_argument("--root-position0", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"))
+    parser.add_argument("--root-rotation0", type=float, nargs=4, default=None, metavar=("W", "X", "Y", "Z"))
     parser.add_argument("--trajectory", type=Path, default=None, help="Optional path to trajectory.npz")
     parser.add_argument(
         "--resources-root",
@@ -967,8 +1062,27 @@ def main():
     parser.add_argument("--fps", type=int, default=60, help="Playback FPS")
     args = parser.parse_args()
 
+    if (args.database is None) == (args.features is None):
+        raise ValueError("Exactly one of --database or --features is required")
+    if args.features is not None and args.stats_source is None:
+        raise ValueError("--stats-source is required when using --features")
+
+    database = (
+        load_database_dict(args.database)
+        if args.database is not None
+        else build_database_from_features(
+            features_path=args.features,
+            stats_source=args.stats_source,
+            feature_key=args.feature_key,
+            normalized=args.normalized,
+            range_name=args.range_name,
+            root_position0=args.root_position0,
+            root_rotation0=args.root_rotation0,
+        )
+    )
+
     viewer = GenoView(
-        database_path=args.database,
+        database=database,
         trajectory_path=args.trajectory,
         resources_root=args.resources_root,
         fps=args.fps,
