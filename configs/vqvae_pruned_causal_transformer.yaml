@@ -16,20 +16,31 @@ prefetch_factor: 4
 pin_memory: true
 persistent_workers: true
 
-model_type: frame_causal_cnn
-code_dim: 256
+model_type: causal_transformer
+code_dim: 64
 codebook_size: 128
 num_heads: 8
 width: 512
-depth: 6
+depth: 3
 down_t: 0
-dilation_growth_rate: 2
+dilation_growth_rate: 3
+
+transformer_heads: 4
+transformer_layers: 3
+transformer_ff_dim: 1024
+transformer_dropout: 0.1
+context_len: 32
+pos_encoding: learned
+max_seq_len: 64
 
 commit_weight: 0.25
-delta_weight: 1.0
+delta_weight: 3.0
+root_pos_weight: 1.0
+root_rot_weight: 0.5
+root_dt: 0.0166666667
 
-outdir: outputs/vqvae_pruned_frame_causal_cnn
-run_name: vqvae_pruned_frame_causal_cnn_test5
+outdir: outputs/vqvae_pruned_causal_transformer
+run_name: vqvae_pruned_causal_transformer_test5
 resume:
 save_every: 0
 log_every: 50

@@ -1,6 +1,7 @@
 import torch.nn as nn
 
 from models.causal_cnn import CausalDecoder1D, CausalEncoder1D, FrameCausalDecoder1D, FrameCausalEncoder1D
+from models.causal_transformer import CausalTransformerDecoder, CausalTransformerEncoder
 from models.quantizer import MultiHeadEMAVQ
 
 
@@ -19,16 +20,35 @@ class CausalMotionVQVAE(nn.Module):
         activation="relu",
         norm=None,
         model_type="causal_cnn",
+        transformer_heads=4,
+        transformer_layers=3,
+        transformer_ff_dim=1024,
+        transformer_dropout=0.1,
+        context_len=32,
+        pos_encoding="learned",
+        max_seq_len=64,
     ):
         super().__init__()
-        if model_type not in {"causal_cnn", "frame_causal_cnn"}:
+        if model_type not in {"causal_cnn", "frame_causal_cnn", "causal_transformer"}:
             raise ValueError(f"Unsupported model_type: {model_type}")
 
         self.model_type = model_type
         self.motion_dim = motion_dim
-        self.upsample_factor = 1 if model_type == "frame_causal_cnn" else 2 ** down_t
+        self.upsample_factor = 1 if model_type in {"frame_causal_cnn", "causal_transformer"} else 2 ** down_t
 
-        if model_type == "frame_causal_cnn":
+        if model_type == "causal_transformer":
+            self.encoder = CausalTransformerEncoder(
+                input_dim=motion_dim,
+                code_dim=code_dim,
+                num_layers=transformer_layers,
+                num_heads=transformer_heads,
+                ff_dim=transformer_ff_dim,
+                dropout=transformer_dropout,
+                context_len=context_len,
+                max_seq_len=max_seq_len,
+                pos_encoding=pos_encoding,
+            )
+        elif model_type == "frame_causal_cnn":
             self.encoder = FrameCausalEncoder1D(
                 input_dim=motion_dim,
                 code_dim=code_dim,
@@ -56,7 +76,20 @@ class CausalMotionVQVAE(nn.Module):
             codebook_size=codebook_size,
             decay=decay,
         )
-        if model_type == "frame_causal_cnn":
+        if model_type == "causal_transformer":
+            self.decoder = CausalTransformerDecoder(
+                output_dim=motion_dim,
+                code_dim=code_dim,
+                num_layers=transformer_layers,
+                num_heads=transformer_heads,
+                ff_dim=transformer_ff_dim,
+                dropout=transformer_dropout,
+                # Encoder is bidirectional; runtime should pass only the rolling history window.
+                context_len=context_len,
+                max_seq_len=max_seq_len,
+                pos_encoding=pos_encoding,
+            )
+        elif model_type == "frame_causal_cnn":
             self.decoder = FrameCausalDecoder1D(
                 output_dim=motion_dim,
                 code_dim=code_dim,

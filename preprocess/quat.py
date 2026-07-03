@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 
 
 def _fast_cross(a, b):
@@ -308,3 +309,71 @@ def nlerp_shortest(x, y, a):
         normalize((1.0 - a) * x + a * y),
         normalize((1.0 - a) * x - a * y),
     )
+
+
+def torch_fast_cross(a, b):
+    return torch.cat(
+        [
+            a[..., 1:2] * b[..., 2:3] - a[..., 2:3] * b[..., 1:2],
+            a[..., 2:3] * b[..., 0:1] - a[..., 0:1] * b[..., 2:3],
+            a[..., 0:1] * b[..., 1:2] - a[..., 1:2] * b[..., 0:1],
+        ],
+        dim=-1,
+    )
+
+
+def torch_length(x):
+    return torch.sqrt(torch.sum(x * x, dim=-1))
+
+
+def torch_normalize(x, eps=1e-8):
+    return x / (torch_length(x).unsqueeze(-1) + eps)
+
+
+def torch_inv(q):
+    sign = q.new_tensor([1.0, -1.0, -1.0, -1.0])
+    return sign * q
+
+
+def torch_mul(x, y):
+    x0, x1, x2, x3 = x[..., 0:1], x[..., 1:2], x[..., 2:3], x[..., 3:4]
+    y0, y1, y2, y3 = y[..., 0:1], y[..., 1:2], y[..., 2:3], y[..., 3:4]
+
+    return torch.cat(
+        [
+            y0 * x0 - y1 * x1 - y2 * x2 - y3 * x3,
+            y0 * x1 + y1 * x0 - y2 * x3 + y3 * x2,
+            y0 * x2 + y1 * x3 + y2 * x0 - y3 * x1,
+            y0 * x3 - y1 * x2 + y2 * x1 + y3 * x0,
+        ],
+        dim=-1,
+    )
+
+
+def torch_mul_vec(q, x):
+    t = 2.0 * torch_fast_cross(q[..., 1:], x)
+    return x + q[..., 0].unsqueeze(-1) * t + torch_fast_cross(q[..., 1:], t)
+
+
+def torch_inv_mul_vec(q, x):
+    return torch_mul_vec(torch_inv(q), x)
+
+
+def torch_exp(x, eps=1e-5):
+    halfangle = torch.sqrt(torch.sum(x * x, dim=-1, keepdim=True))
+    c = torch.where(halfangle < eps, torch.ones_like(halfangle), torch.cos(halfangle))
+    sinc = torch.sinc(halfangle / torch.pi)
+    s = torch.where(halfangle < eps, torch.ones_like(halfangle), sinc)
+    return torch.cat([c, s * x], dim=-1)
+
+
+def torch_from_scaled_angle_axis(x, eps=1e-5):
+    return torch_exp(x / 2.0, eps)
+
+
+def torch_quat_angle(x, y, eps=1e-8):
+    q_err = torch_mul(x, torch_inv(y))
+    q_err = torch_normalize(q_err, eps=eps)
+    xyz_norm = torch.linalg.vector_norm(q_err[..., 1:], dim=-1)
+    w_abs = torch.abs(q_err[..., 0])
+    return 2.0 * torch.atan2(xyz_norm, w_abs.clamp_min(eps))

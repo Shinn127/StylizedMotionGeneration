@@ -62,6 +62,13 @@ def build_model_from_checkpoint(ckpt):
         depth=args['depth'],
         dilation_growth_rate=args['dilation_growth_rate'],
         model_type=args.get('model_type', 'causal_cnn'),
+        transformer_heads=args.get('transformer_heads', 4),
+        transformer_layers=args.get('transformer_layers', 3),
+        transformer_ff_dim=args.get('transformer_ff_dim', 1024),
+        transformer_dropout=args.get('transformer_dropout', 0.1),
+        context_len=args.get('context_len', 32),
+        pos_encoding=args.get('pos_encoding', 'learned'),
+        max_seq_len=args.get('max_seq_len', 64),
     )
     model.load_state_dict(ckpt['model'])
     return model, args

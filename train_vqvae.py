@@ -9,12 +9,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from datasets.feature_dataset import FeatureDataset, build_feature_store
+from models.losses import compute_vqvae_losses
 from models.vqvae import CausalMotionVQVAE
 from motion_features import serialize_motion_feature_stats
 
@@ -63,7 +63,11 @@ def parse_args(argv=None):
     parser.add_argument("--prefetch-factor", type=int, default=cfg("prefetch_factor", 4))
     parser.add_argument("--log-every", type=int, default=cfg("log_every", 50))
     parser.add_argument("--run-name", type=str, default=cfg("run_name", None))
-    parser.add_argument("--model-type", choices=["causal_cnn", "frame_causal_cnn"], default=cfg("model_type", "causal_cnn"))
+    parser.add_argument(
+        "--model-type",
+        choices=["causal_cnn", "frame_causal_cnn", "causal_transformer"],
+        default=cfg("model_type", "causal_cnn"),
+    )
     parser.add_argument("--code-dim", type=int, default=cfg("code_dim", 256))
     parser.add_argument("--codebook-size", type=int, default=cfg("codebook_size", 128))
     parser.add_argument("--num-heads", type=int, default=cfg("num_heads", 8))
@@ -71,8 +75,18 @@ def parse_args(argv=None):
     parser.add_argument("--depth", type=int, default=cfg("depth", 3))
     parser.add_argument("--down-t", type=int, default=cfg("down_t", 2))
     parser.add_argument("--dilation-growth-rate", type=int, default=cfg("dilation_growth_rate", 3))
+    parser.add_argument("--transformer-heads", type=int, default=cfg("transformer_heads", 4))
+    parser.add_argument("--transformer-layers", type=int, default=cfg("transformer_layers", 3))
+    parser.add_argument("--transformer-ff-dim", type=int, default=cfg("transformer_ff_dim", 1024))
+    parser.add_argument("--transformer-dropout", type=float, default=cfg("transformer_dropout", 0.1))
+    parser.add_argument("--context-len", type=int, default=cfg("context_len", 32))
+    parser.add_argument("--pos-encoding", choices=["learned"], default=cfg("pos_encoding", "learned"))
+    parser.add_argument("--max-seq-len", type=int, default=cfg("max_seq_len", 64))
     parser.add_argument("--commit-weight", type=float, default=cfg("commit_weight", 0.25))
     parser.add_argument("--delta-weight", type=float, default=cfg("delta_weight", 1.0))
+    parser.add_argument("--root-pos-weight", type=float, default=cfg("root_pos_weight", 0.0))
+    parser.add_argument("--root-rot-weight", type=float, default=cfg("root_rot_weight", 0.0))
+    parser.add_argument("--root-dt", type=float, default=cfg("root_dt", 1.0 / 60.0))
     parser.add_argument("--outdir", type=Path, default=cfg_path("outdir", Path("outputs/vqvae")))
     parser.add_argument("--data-parallel", action="store_true", default=cfg("data_parallel", False))
     parser.add_argument("--pin-memory", dest="pin_memory", action="store_true")
@@ -129,6 +143,13 @@ def build_model(args, motion_dim):
         depth=args.depth,
         dilation_growth_rate=args.dilation_growth_rate,
         model_type=args.model_type,
+        transformer_heads=args.transformer_heads,
+        transformer_layers=args.transformer_layers,
+        transformer_ff_dim=args.transformer_ff_dim,
+        transformer_dropout=args.transformer_dropout,
+        context_len=args.context_len,
+        pos_encoding=args.pos_encoding,
+        max_seq_len=args.max_seq_len,
     )
 
 
@@ -149,31 +170,25 @@ def build_lr_scheduler(optimizer, args):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
-def compute_losses(batch_motion, output, feature_weights, delta_weight, commit_weight):
-    recon = output["recon_state"]
-    feature_weights = feature_weights.view(1, 1, -1).to(batch_motion.device)
-    recon_loss = torch.mean(feature_weights * torch.abs(recon - batch_motion))
-    delta_loss = F.l1_loss(recon[:, 1:] - recon[:, :-1], batch_motion[:, 1:] - batch_motion[:, :-1])
-    commit_loss = output["commit_loss"]
-    loss = recon_loss + delta_weight * delta_loss + commit_weight * commit_loss
-    return loss, recon_loss, delta_loss, commit_loss
-
-
 def init_metric_totals() -> dict[str, float]:
     return {
         "loss": 0.0,
         "recon": 0.0,
         "delta": 0.0,
         "commit": 0.0,
+        "root_pos": 0.0,
+        "root_rot": 0.0,
         "mean_head_perplexity": 0.0,
     }
 
 
-def update_metric_totals(totals, loss, recon_loss, delta_loss, commit_loss, perplexity, batch_size):
-    totals["loss"] += loss.item() * batch_size
-    totals["recon"] += recon_loss.item() * batch_size
-    totals["delta"] += delta_loss.item() * batch_size
-    totals["commit"] += commit_loss.item() * batch_size
+def update_metric_totals(totals, losses, perplexity, batch_size):
+    totals["loss"] += losses.loss.item() * batch_size
+    totals["recon"] += losses.recon.item() * batch_size
+    totals["delta"] += losses.delta.item() * batch_size
+    totals["commit"] += losses.commit.item() * batch_size
+    totals["root_pos"] += losses.root_pos.item() * batch_size
+    totals["root_rot"] += losses.root_rot.item() * batch_size
     totals["mean_head_perplexity"] += perplexity.item() * batch_size
 
 
@@ -188,7 +203,16 @@ def move_motion_to_device(batch, device, non_blocking: bool):
     return motion
 
 
-def evaluate(model, loader, feature_weights, device, delta_weight, commit_weight, non_blocking: bool):
+def evaluate(
+    model,
+    loader,
+    feature_weights,
+    feature_offset,
+    feature_scale,
+    device,
+    args,
+    non_blocking: bool,
+):
     model.eval()
     totals = init_metric_totals()
     count = 0
@@ -196,20 +220,22 @@ def evaluate(model, loader, feature_weights, device, delta_weight, commit_weight
         for batch in loader:
             motion = move_motion_to_device(batch, device, non_blocking=non_blocking)
             output = model(motion)
-            loss, recon_loss, delta_loss, commit_loss = compute_losses(
-                motion,
-                output,
-                feature_weights,
-                delta_weight=delta_weight,
-                commit_weight=commit_weight,
+            losses = compute_vqvae_losses(
+                batch_motion=motion,
+                output=output,
+                feature_weights=feature_weights,
+                feature_offset=feature_offset,
+                feature_scale=feature_scale,
+                delta_weight=args.delta_weight,
+                commit_weight=args.commit_weight,
+                root_pos_weight=args.root_pos_weight,
+                root_rot_weight=args.root_rot_weight,
+                root_dt=args.root_dt,
             )
             batch_size = motion.shape[0]
             update_metric_totals(
                 totals,
-                loss,
-                recon_loss,
-                delta_loss,
-                commit_loss,
+                losses,
                 output["mean_head_perplexity"],
                 batch_size,
             )
@@ -222,9 +248,10 @@ def train_one_epoch(
     loader,
     optimizer,
     feature_weights,
+    feature_offset,
+    feature_scale,
     device,
-    delta_weight,
-    commit_weight,
+    args,
     grad_clip_norm,
     writer,
     global_step,
@@ -239,15 +266,20 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(loader, start=1):
         motion = move_motion_to_device(batch, device, non_blocking=non_blocking)
         output = model(motion)
-        loss, recon_loss, delta_loss, commit_loss = compute_losses(
-            motion,
-            output,
-            feature_weights,
-            delta_weight=delta_weight,
-            commit_weight=commit_weight,
+        losses = compute_vqvae_losses(
+            batch_motion=motion,
+            output=output,
+            feature_weights=feature_weights,
+            feature_offset=feature_offset,
+            feature_scale=feature_scale,
+            delta_weight=args.delta_weight,
+            commit_weight=args.commit_weight,
+            root_pos_weight=args.root_pos_weight,
+            root_rot_weight=args.root_rot_weight,
+            root_dt=args.root_dt,
         )
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        losses.loss.backward()
         if grad_clip_norm is not None and grad_clip_norm > 0.0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
@@ -255,10 +287,7 @@ def train_one_epoch(
         batch_size = motion.shape[0]
         update_metric_totals(
             totals,
-            loss,
-            recon_loss,
-            delta_loss,
-            commit_loss,
+            losses,
             output["mean_head_perplexity"],
             batch_size,
         )
@@ -266,10 +295,12 @@ def train_one_epoch(
         global_step += 1
 
         if writer is not None and (global_step == 1 or global_step % log_every == 0):
-            writer.add_scalar("train_step/loss", loss.item(), global_step)
-            writer.add_scalar("train_step/recon", recon_loss.item(), global_step)
-            writer.add_scalar("train_step/delta", delta_loss.item(), global_step)
-            writer.add_scalar("train_step/commit", commit_loss.item(), global_step)
+            writer.add_scalar("train_step/loss", losses.loss.item(), global_step)
+            writer.add_scalar("train_step/recon", losses.recon.item(), global_step)
+            writer.add_scalar("train_step/delta", losses.delta.item(), global_step)
+            writer.add_scalar("train_step/commit", losses.commit.item(), global_step)
+            writer.add_scalar("train_step/root_pos", losses.root_pos.item(), global_step)
+            writer.add_scalar("train_step/root_rot", losses.root_rot.item(), global_step)
             writer.add_scalar("train_step/mean_head_perplexity", output["mean_head_perplexity"].item(), global_step)
             writer.add_scalar("train_step/lr", optimizer.param_groups[0]["lr"], global_step)
 
@@ -380,6 +411,9 @@ def main():
 
     train_dataset, val_dataset, train_loader, val_loader = build_dataloaders(args, pin_memory=use_pin_memory)
     feature_weights = torch.from_numpy(train_dataset.model_feature_weights().astype("float32"))
+    feature_stats = train_dataset.feature_stats()
+    feature_offset = torch.from_numpy(feature_stats.offset.astype("float32"))
+    feature_scale = torch.from_numpy(feature_stats.scale.astype("float32"))
 
     model = build_model(args, motion_dim=train_dataset.motion_dim)
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
@@ -419,9 +453,10 @@ def main():
             train_loader,
             optimizer,
             feature_weights,
+            feature_offset,
+            feature_scale,
             device,
-            delta_weight=args.delta_weight,
-            commit_weight=args.commit_weight,
+            args=args,
             grad_clip_norm=args.grad_clip_norm,
             writer=writer,
             global_step=global_step,
@@ -433,9 +468,10 @@ def main():
             model,
             val_loader,
             feature_weights,
+            feature_offset,
+            feature_scale,
             device,
-            delta_weight=args.delta_weight,
-            commit_weight=args.commit_weight,
+            args=args,
             non_blocking=non_blocking,
         )
 
@@ -443,6 +479,8 @@ def main():
         writer.add_scalar("train_epoch/recon", train_stats["recon"], epoch + 1)
         writer.add_scalar("train_epoch/delta", train_stats["delta"], epoch + 1)
         writer.add_scalar("train_epoch/commit", train_stats["commit"], epoch + 1)
+        writer.add_scalar("train_epoch/root_pos", train_stats["root_pos"], epoch + 1)
+        writer.add_scalar("train_epoch/root_rot", train_stats["root_rot"], epoch + 1)
         writer.add_scalar("train_epoch/mean_head_perplexity", train_stats["mean_head_perplexity"], epoch + 1)
         writer.add_scalar("train_epoch/samples_per_second", train_stats["samples_per_second"], epoch + 1)
         writer.add_scalar("train_epoch/epoch_seconds", train_stats["epoch_seconds"], epoch + 1)
@@ -450,6 +488,8 @@ def main():
         writer.add_scalar("val/recon", val_stats["recon"], epoch + 1)
         writer.add_scalar("val/delta", val_stats["delta"], epoch + 1)
         writer.add_scalar("val/commit", val_stats["commit"], epoch + 1)
+        writer.add_scalar("val/root_pos", val_stats["root_pos"], epoch + 1)
+        writer.add_scalar("val/root_rot", val_stats["root_rot"], epoch + 1)
         writer.add_scalar("val/mean_head_perplexity", val_stats["mean_head_perplexity"], epoch + 1)
         writer.add_scalar("optimizer/lr", optimizer.param_groups[0]["lr"], epoch + 1)
         if device.type == "cuda":
@@ -465,6 +505,8 @@ def main():
             f"train_recon={train_stats['recon']:.6f} "
             f"train_delta={train_stats['delta']:.6f} "
             f"train_commit={train_stats['commit']:.6f} "
+            f"train_root_pos={train_stats['root_pos']:.6f} "
+            f"train_root_rot={train_stats['root_rot']:.6f} "
             f"train_perplexity={train_stats['mean_head_perplexity']:.6f} "
             f"train_samples_per_second={train_stats['samples_per_second']:.2f} "
             f"lr={optimizer.param_groups[0]['lr']:.8f} "
@@ -472,6 +514,8 @@ def main():
             f"val_recon={val_stats['recon']:.6f} "
             f"val_delta={val_stats['delta']:.6f} "
             f"val_commit={val_stats['commit']:.6f} "
+            f"val_root_pos={val_stats['root_pos']:.6f} "
+            f"val_root_rot={val_stats['root_rot']:.6f} "
             f"val_perplexity={val_stats['mean_head_perplexity']:.6f}"
         )
 
