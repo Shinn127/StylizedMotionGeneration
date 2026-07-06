@@ -29,8 +29,8 @@ fsq_preserve_symmetry: false
 fsq_noise_dropout: 0.0
 
 delta_weight: 1.0
-root_pos_weight: 0.0
-root_rot_weight: 0.0
+root_pos_weight: 0.5
+root_rot_weight: 0.5
 root_dt: 0.016666666666666666
 
 outdir: outputs/fsq_pruned_frame_causal_cnn

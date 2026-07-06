@@ -24,7 +24,8 @@ StylizedMotionGeneration/
 ├── models/                       # causal CNN、VQ-VAE、quantizer
 ├── motion_features.py            # 230D motion feature 打包与重建
 ├── train_vqvae.py                # VQ-VAE 训练入口
-├── infer_vqvae.py                # checkpoint 推理与 database 导出入口
+├── train_fsq.py                  # FSQ 训练入口
+├── view_motion_sequence.py       # checkpoint 连续片段直接 Genoview 可视化入口
 ├── Visualization.py              # 轻量骨架/trajectory 可视化
 ├── Genoview.py                   # Geno 高质量渲染可视化
 └── features_to_database.py       # 230D feature 到 database 的 roundtrip/export 工具
@@ -258,46 +259,41 @@ decoder output: 230D full motion reconstruction
 loss target: 230D full motion feature
 ```
 
-推理/导出链路：
+连续片段可视化链路：
 
 ```text
-feature_database normalized 230D -> recon_230D -> clip_features/*.npy
+feature_database normalized 230D -> source/recon_230D -> Genoview side-by-side
 ```
 
-## VQ-VAE 推理与导出
+## 连续片段推理与 Genoview 可视化
 
-从 checkpoint 导出重建后的 `230D` feature clips：
+从 `feature_database` 中取连续 `L` 帧，用 FSQ 或 VQ-VAE checkpoint 重建，并直接启动 Genoview 横向对照。该入口不会默认导出 `.npy` 或 `clip_features`：
 
 ```bash
-python infer_vqvae.py \
-  --checkpoint outputs/vqvae_pruned_test5/best.pt \
+python view_motion_sequence.py \
+  --checkpoint outputs/fsq_pruned_frame_causal_cnn/best.pt \
   --feature-database data/processed/100style_test5_pruned/feature_database \
-  --split test \
-  --batch-size 64 \
-  --num-workers 4 \
-  --outdir outputs/vqvae_pruned_test5/infer \
-  --tag test_recon
+  --range-idx 0 \
+  --start 128 \
+  --length 256 \
+  --context-left 63 \
+  --view compare
 ```
 
-输出目录：
-
-```text
-outputs/vqvae_pruned_test5/infer/test_recon/
-├── recon_windows.npz
-└── clip_features/
-    ├── index.npz
-    └── 00000_Aeroplane_BR_orig/segment_000064_000192/features.npy
-```
-
-直接可视化单段 `230D` feature 序列：
+同一个入口也适配 VQ-VAE checkpoint：
 
 ```bash
-python Genoview.py \
-  --features outputs/vqvae_pruned_test5/infer/test_recon/clip_features/00000_Aeroplane_BR_orig/segment_000064_000192/features.npy \
-  --stats-source outputs/vqvae_pruned_test5/best.pt \
-  --normalized \
-  --range-name Aeroplane_BR_recon
+python view_motion_sequence.py \
+  --checkpoint outputs/vqvae_pruned_frame_causal_cnn/best.pt \
+  --feature-database data/processed/100style_test5_pruned/feature_database \
+  --range-idx 0 \
+  --start 128 \
+  --length 256 \
+  --context-left 63 \
+  --view compare
 ```
+
+`--view` 支持 `source`、`recon`、`compare`。`compare` 模式左侧显示 database 原始片段，右侧显示模型重建片段；`--save-debug` 才会额外保存 source/recon features 和 token 文件。
 
 ## Feature Roundtrip 工具
 

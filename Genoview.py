@@ -488,6 +488,32 @@ def build_database_from_features(
     root_rotation0: list[float] | None,
 ) -> dict[str, np.ndarray]:
     features = load_feature_array(features_path, feature_key)
+    return build_database_from_feature_array(
+        features=features,
+        stats_source=stats_source,
+        normalized=normalized,
+        range_name=range_name,
+        root_position0=root_position0,
+        root_rotation0=root_rotation0,
+    )
+
+
+def build_database_from_feature_array(
+    features: np.ndarray,
+    stats_source: Path,
+    normalized: bool,
+    range_name: str,
+    root_position0: list[float] | np.ndarray | None = None,
+    root_rotation0: list[float] | np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    features = np.asarray(features, dtype=np.float32)
+    if features.ndim == 3:
+        if features.shape[0] != 1:
+            raise ValueError(f"Expected feature shape [T, D] or [1, T, D], got {features.shape}")
+        features = features[0]
+    if features.ndim != 2:
+        raise ValueError(f"Expected feature shape [T, D], got {features.shape}")
+
     stats, metadata = load_feature_stats(stats_source)
     if features.shape[1] != stats.offset.shape[0]:
         raise ValueError(f"Feature dim {features.shape[1]} does not match stats dim {stats.offset.shape[0]}")
@@ -538,7 +564,17 @@ def draw_trajectory(root_pos, root_rot, tpos, tdir):
 
 
 class GenoView:
-    def __init__(self, database: dict[str, np.ndarray], trajectory_path: Path | None, resources_root: Path, fps: int = 60):
+    def __init__(
+        self,
+        database: dict[str, np.ndarray],
+        trajectory_path: Path | None,
+        resources_root: Path,
+        fps: int = 60,
+        compare_database: dict[str, np.ndarray] | None = None,
+        left_label: str = "Source",
+        right_label: str = "Recon",
+        compare_spacing: float = 2.0,
+    ):
         self.database = database
         self.positions = self.database["positions"].astype(np.float32)
         self.rotations = self.database["rotations"].astype(np.float32)
@@ -550,9 +586,43 @@ class GenoView:
         self.range_stops = self.database["range_stops"].astype(np.int32)
         self.fps = fps
         self.resources_root = resources_root
+        self.compare_database = compare_database
+        self.compare_mode = compare_database is not None
+        self.left_label = left_label
+        self.right_label = right_label
+        self.compare_spacing = float(compare_spacing)
+        self.left_model_offset = Vector3(-0.5 * self.compare_spacing, 0.0, 0.0) if self.compare_mode else Vector3(0.0, 0.0, 0.0)
+        self.right_model_offset = Vector3(0.5 * self.compare_spacing, 0.0, 0.0)
+
+        if self.compare_mode:
+            self.compare_positions = self.compare_database["positions"].astype(np.float32)
+            self.compare_rotations = self.compare_database["rotations"].astype(np.float32)
+            self.compare_parents = self.compare_database["parents"].astype(np.int32)
+            self.compare_names = self.compare_database["names"]
+            self.compare_joint_subset = (
+                self.compare_database["joint_subset"].item() if "joint_subset" in self.compare_database else "full"
+            )
+            self.compare_range_names = self.compare_database["range_names"]
+            if len(self.compare_positions) != len(self.positions):
+                raise ValueError(f"Compare databases must have the same frame count, got {len(self.positions)} and {len(self.compare_positions)}")
+            if self.compare_joint_subset != self.joint_subset:
+                raise ValueError(f"Compare joint_subset mismatch: {self.joint_subset} vs {self.compare_joint_subset}")
+            if self.compare_parents.shape != self.parents.shape or not np.array_equal(self.compare_parents, self.parents):
+                raise ValueError("Compare database parents do not match")
+            if self.compare_names.shape != self.names.shape or any(str(a) != str(b) for a, b in zip(self.compare_names, self.names)):
+                raise ValueError("Compare database joint names do not match")
+        else:
+            self.compare_positions = None
+            self.compare_rotations = None
+            self.compare_parents = None
+            self.compare_names = None
+            self.compare_joint_subset = None
+            self.compare_range_names = None
 
         self.trajectory = None
         if trajectory_path is not None:
+            if self.compare_mode:
+                raise ValueError("Trajectory overlay is not supported in compare mode yet")
             self.trajectory = np.load(trajectory_path, allow_pickle=True)
             self.indices = self.trajectory["indices"].astype(np.int32)
             self.tpos = self.trajectory["Tpos"].astype(np.float32)
@@ -589,8 +659,11 @@ class GenoView:
         self.ssao_back = None
         self.ground_model = None
         self.geno_model = None
+        self.compare_model = None
         self.bind_pos = None
         self.bind_rot = None
+        self.compare_bind_pos = None
+        self.compare_bind_rot = None
         self.shaders = {}
         self.full_names = None
         self.full_parents = None
@@ -686,6 +759,9 @@ class GenoView:
 
         self.geno_model = load_geno_model(self.resources_root / "Geno.bin")
         self.bind_pos, self.bind_rot = get_model_bind_pose_as_numpy_arrays(self.geno_model)
+        if self.compare_mode:
+            self.compare_model = load_geno_model(self.resources_root / "Geno.bin")
+            self.compare_bind_pos, self.compare_bind_rot = get_model_bind_pose_as_numpy_arrays(self.compare_model)
         (
             self.full_names,
             self.full_parents,
@@ -699,6 +775,8 @@ class GenoView:
                 f"Bind skeleton count ({len(self.full_names)} incl. Simulation) does not match Geno model bone count "
                 f"({self.geno_model.boneCount})."
             )
+        if self.compare_mode and self.compare_model.boneCount != self.geno_model.boneCount:
+            raise ValueError("Compare model bone count does not match primary model bone count")
 
         unknown_names = [str(name) for name in self.names.tolist() if str(name) not in self.full_name_to_index]
         if unknown_names:
@@ -719,6 +797,8 @@ class GenoView:
             unload_shadow_map(self.shadow_map)
         if self.geno_model is not None:
             UnloadModel(self.geno_model)
+        if self.compare_model is not None:
+            UnloadModel(self.compare_model)
         if self.ground_model is not None:
             UnloadModel(self.ground_model)
         for shader in self.shaders.values():
@@ -730,11 +810,11 @@ class GenoView:
                 return str(name)
         return "unknown"
 
-    def _reconstruct_full_local_pose(self):
+    def _reconstruct_full_local_pose_for(self, positions, rotations, frame_index):
         full_positions = self.full_bind_local_positions.copy()
         full_rotations = self.full_bind_local_rotations.copy()
-        db_positions = self.positions[self.frame_index]
-        db_rotations = self.rotations[self.frame_index]
+        db_positions = positions[frame_index]
+        db_rotations = rotations[frame_index]
 
         for db_index, name in enumerate(self.names.tolist()):
             full_index = self.full_name_to_index[str(name)]
@@ -743,16 +823,44 @@ class GenoView:
 
         return full_rotations, full_positions
 
-    def _current_globals(self):
+    def _reconstruct_full_local_pose(self):
+        return self._reconstruct_full_local_pose_for(self.positions, self.rotations, self.frame_index)
+
+    def _current_globals_for(self, positions, rotations, parents, frame_index):
         if self.use_pruned_reconstruction:
-            local_rotations, local_positions = self._reconstruct_full_local_pose()
+            local_rotations, local_positions = self._reconstruct_full_local_pose_for(positions, rotations, frame_index)
             return quat.fk(local_rotations[None], local_positions[None], self.full_parents)
-        return quat.fk(self.rotations[self.frame_index][None], self.positions[self.frame_index][None], self.parents)
+        return quat.fk(rotations[frame_index][None], positions[frame_index][None], parents)
+
+    def _current_globals(self):
+        return self._current_globals_for(self.positions, self.rotations, self.parents, self.frame_index)
+
+    def _update_model_pose_for(self, model, bind_pos, bind_rot, positions, rotations, parents, frame_index):
+        global_rot, global_pos = self._current_globals_for(positions, rotations, parents, frame_index)
+        update_model_pose_from_numpy_arrays(model, bind_pos, bind_rot, global_pos[0, 1:], global_rot[0, 1:])
+        return global_rot[0], global_pos[0]
 
     def _update_model_pose(self):
-        global_rot, global_pos = self._current_globals()
-        update_model_pose_from_numpy_arrays(self.geno_model, self.bind_pos, self.bind_rot, global_pos[0, 1:], global_rot[0, 1:])
-        return global_rot[0], global_pos[0]
+        return self._update_model_pose_for(
+            self.geno_model,
+            self.bind_pos,
+            self.bind_rot,
+            self.positions,
+            self.rotations,
+            self.parents,
+            self.frame_index,
+        )
+
+    def _update_compare_model_pose(self):
+        return self._update_model_pose_for(
+            self.compare_model,
+            self.compare_bind_pos,
+            self.compare_bind_rot,
+            self.compare_positions,
+            self.compare_rotations,
+            self.compare_parents,
+            self.frame_index,
+        )
 
     def _sync_playback_frame(self):
         if self.indices is not None:
@@ -778,12 +886,24 @@ class GenoView:
                 self._sync_playback_frame()
 
                 global_rot, global_pos = self._update_model_pose()
+                if self.compare_mode:
+                    compare_global_rot, compare_global_pos = self._update_compare_model_pose()
+                else:
+                    compare_global_rot = None
+                    compare_global_pos = None
+
                 root = global_pos[0]
-                self.shadow_light.target = Vector3(root[0], 0.0, root[2])
+                target_x = root[0] + self.left_model_offset.x
+                target_z = root[2] + self.left_model_offset.z
+                if self.compare_mode:
+                    compare_root = compare_global_pos[0]
+                    target_x = 0.5 * (target_x + compare_root[0] + self.right_model_offset.x)
+                    target_z = 0.5 * (target_z + compare_root[2] + self.right_model_offset.z)
+                self.shadow_light.target = Vector3(target_x, 0.0, target_z)
                 self.shadow_light.position = Vector3Add(self.shadow_light.target, Vector3Scale(self.light_dir, -5.0))
 
                 self.camera.update(
-                    Vector3(root[0], 0.75, root[2]),
+                    Vector3(target_x, 0.75, target_z),
                     GetMouseDelta().x if IsKeyDown(KEY_LEFT_CONTROL) and IsMouseButtonDown(0) else 0.0,
                     GetMouseDelta().y if IsKeyDown(KEY_LEFT_CONTROL) and IsMouseButtonDown(0) else 0.0,
                     GetMouseDelta().x if IsKeyDown(KEY_LEFT_CONTROL) and IsMouseButtonDown(1) else 0.0,
@@ -822,7 +942,10 @@ class GenoView:
                 self.ground_model.materials[0].shader = self.shaders["shadow"]
                 DrawModel(self.ground_model, self.ground_position, 1.0, WHITE)
                 self.geno_model.materials[0].shader = self.shaders["skinned_shadow"]
-                DrawModel(self.geno_model, Vector3(0.0, 0.0, 0.0), 1.0, WHITE)
+                DrawModel(self.geno_model, self.left_model_offset, 1.0, WHITE)
+                if self.compare_mode:
+                    self.compare_model.materials[0].shader = self.shaders["skinned_shadow"]
+                    DrawModel(self.compare_model, self.right_model_offset, 1.0, WHITE)
                 end_shadow_map()
 
                 begin_gbuffer(self.gbuffer, self.camera.cam3d)
@@ -873,7 +996,10 @@ class GenoView:
                 self.ground_model.materials[0].shader = self.shaders["basic"]
                 DrawModel(self.ground_model, self.ground_position, 1.0, Color(190, 190, 190, 255))
                 self.geno_model.materials[0].shader = self.shaders["skinned_basic"]
-                DrawModel(self.geno_model, Vector3(0.0, 0.0, 0.0), 1.0, ORANGE)
+                DrawModel(self.geno_model, self.left_model_offset, 1.0, Color(70, 125, 255, 255) if self.compare_mode else ORANGE)
+                if self.compare_mode:
+                    self.compare_model.materials[0].shader = self.shaders["skinned_basic"]
+                    DrawModel(self.compare_model, self.right_model_offset, 1.0, ORANGE)
                 end_gbuffer(screen_width, screen_height)
 
                 BeginTextureMode(self.ssao_front)
@@ -1030,6 +1156,9 @@ class GenoView:
                 DrawText(status.encode(), 10, 82, 20, BLUE)
                 mode_label = f"Skeleton: {'pruned->full reconstruction' if self.use_pruned_reconstruction else 'full direct'}"
                 DrawText(mode_label.encode(), 10, 106, 20, DARKGRAY)
+                if self.compare_mode:
+                    DrawText(f"Left: {self.left_label}".encode(), 10, 130, 20, Color(40, 90, 220, 255))
+                    DrawText(f"Right: {self.right_label}".encode(), 10, 154, 20, ORANGE)
                 if self.indices is not None:
                     DrawText(f"Sample: {self.sample_index}".encode(), 10, 130, 20, DARKGRAY)
                     DrawText(f"Mirror: {bool(self.sample_mirror[self.sample_index])}".encode(), 10, 154, 20, DARKGRAY)
@@ -1040,6 +1169,29 @@ class GenoView:
         finally:
             self._cleanup()
             CloseWindow()
+
+
+class GenoViewCompare(GenoView):
+    def __init__(
+        self,
+        left_database: dict[str, np.ndarray],
+        right_database: dict[str, np.ndarray],
+        resources_root: Path,
+        fps: int = 60,
+        left_label: str = "Source",
+        right_label: str = "Recon",
+        compare_spacing: float = 2.0,
+    ):
+        super().__init__(
+            database=left_database,
+            trajectory_path=None,
+            resources_root=resources_root,
+            fps=fps,
+            compare_database=right_database,
+            left_label=left_label,
+            right_label=right_label,
+            compare_spacing=compare_spacing,
+        )
 
 
 def main():

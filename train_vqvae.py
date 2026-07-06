@@ -335,6 +335,7 @@ def build_run_config(args, run_name: str, train_dataset, val_dataset) -> dict:
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "argv": sys.argv,
         "args": serialize_args(args),
+        "model_family": "vqvae",
         "dataset": {
             "feature_database": str(train_dataset.feature_database),
             "joint_subset": train_dataset.joint_subset,
@@ -383,6 +384,7 @@ def build_checkpoint(
         "args": serialize_args(args),
         "run_name": run_name,
         "config_path": str(config_path),
+        "model_family": "vqvae",
         "motion_dim": train_dataset.motion_dim,
         "stats": serialize_motion_feature_stats(
             train_dataset.feature_stats(),
