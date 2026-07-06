@@ -1,0 +1,41 @@
+feature_database: data/processed/100style_test5_pruned/feature_database
+split_train: train
+split_val: val
+
+batch_size: 256
+epochs: 100
+lr: 0.0002
+min_lr: 0.00001
+warmup_epochs: 2
+seed: 3407
+deterministic: false
+grad_clip_norm: 1.0
+
+num_workers: 8
+prefetch_factor: 4
+pin_memory: true
+persistent_workers: true
+
+model_type: frame_causal_cnn
+code_dim: 256
+width: 512
+depth: 6
+dilation_growth_rate: 2
+
+fsq_num_latent_tokens: 40
+fsq_num_levels: 9
+fsq_scale:
+fsq_preserve_symmetry: false
+fsq_noise_dropout: 0.0
+
+delta_weight: 1.0
+root_pos_weight: 0.0
+root_rot_weight: 0.0
+root_dt: 0.016666666666666666
+
+outdir: outputs/fsq_pruned_frame_causal_cnn
+run_name: fsq_pruned_frame_causal_cnn_test5
+resume:
+save_every: 0
+log_every: 50
+data_parallel: false

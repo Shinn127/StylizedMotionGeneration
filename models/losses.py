@@ -9,13 +9,16 @@ from preprocess import quat
 
 
 @dataclass
-class VQVAELosses:
+class MotionReconstructionLosses:
     loss: torch.Tensor
     recon: torch.Tensor
     delta: torch.Tensor
     commit: torch.Tensor
     root_pos: torch.Tensor
     root_rot: torch.Tensor
+
+
+VQVAELosses = MotionReconstructionLosses
 
 
 def integrate_root_trajectory(
@@ -62,7 +65,7 @@ def root_trajectory_losses(
     return root_pos_loss, root_rot_loss
 
 
-def compute_vqvae_losses(
+def compute_motion_reconstruction_losses(
     batch_motion: torch.Tensor,
     output: dict[str, torch.Tensor],
     feature_weights: torch.Tensor,
@@ -73,7 +76,7 @@ def compute_vqvae_losses(
     root_pos_weight: float,
     root_rot_weight: float,
     root_dt: float,
-) -> VQVAELosses:
+) -> MotionReconstructionLosses:
     recon = output["recon_state"]
     feature_weights = feature_weights.view(1, 1, -1).to(batch_motion.device)
     feature_offset = feature_offset.to(batch_motion.device)
@@ -102,7 +105,7 @@ def compute_vqvae_losses(
         + float(root_rot_weight) * root_rot_loss
         + float(commit_weight) * commit_loss
     )
-    return VQVAELosses(
+    return MotionReconstructionLosses(
         loss=loss,
         recon=recon_loss,
         delta=delta_loss,
@@ -110,3 +113,7 @@ def compute_vqvae_losses(
         root_pos=root_pos_loss,
         root_rot=root_rot_loss,
     )
+
+
+def compute_vqvae_losses(*args, **kwargs) -> MotionReconstructionLosses:
+    return compute_motion_reconstruction_losses(*args, **kwargs)
