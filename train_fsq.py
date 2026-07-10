@@ -373,10 +373,10 @@ def main():
         torch.backends.cudnn.benchmark = True
 
     train_dataset, val_dataset, train_loader, val_loader = build_dataloaders(args, pin_memory=use_pin_memory)
-    feature_weights = torch.from_numpy(train_dataset.model_feature_weights().astype("float32"))
+    feature_weights = torch.from_numpy(train_dataset.model_feature_weights().astype("float32")).to(device)
     feature_stats = train_dataset.feature_stats()
-    feature_offset = torch.from_numpy(feature_stats.offset.astype("float32"))
-    feature_scale = torch.from_numpy(feature_stats.scale.astype("float32"))
+    feature_offset = torch.from_numpy(feature_stats.offset.astype("float32")).to(device)
+    feature_scale = torch.from_numpy(feature_stats.scale.astype("float32")).to(device)
 
     model = build_model(args, motion_dim=train_dataset.motion_dim)
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:

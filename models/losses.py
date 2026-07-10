@@ -26,29 +26,43 @@ def integrate_root_trajectory(
     feature_offset: torch.Tensor,
     feature_scale: torch.Tensor,
     dt: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    lin_local = motion[..., 0:3] * feature_scale[0:3] + feature_offset[0:3]
+    return_positions: bool = True,
+    return_rotations: bool = True,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if not return_positions and not return_rotations:
+        raise ValueError("At least one of return_positions or return_rotations must be True")
+
+    lin_local = None
+    if return_positions:
+        lin_local = motion[..., 0:3] * feature_scale[0:3] + feature_offset[0:3]
     ang_local = motion[..., 3:6] * feature_scale[3:6] + feature_offset[3:6]
-    batch_size, seq_len, _ = lin_local.shape
+    batch_size, seq_len, _ = ang_local.shape
 
     positions = []
     rotations = []
-    pos = lin_local.new_zeros((batch_size, 3))
-    rot = lin_local.new_zeros((batch_size, 4))
+    pos = ang_local.new_zeros((batch_size, 3))
+    rot = ang_local.new_zeros((batch_size, 4))
     rot[:, 0] = 1.0
 
-    positions.append(pos)
-    rotations.append(rot)
+    if return_positions:
+        positions.append(pos)
+    if return_rotations:
+        rotations.append(rot)
     for frame in range(1, seq_len):
-        world_lin = quat.torch_mul_vec(rot, lin_local[:, frame])
         world_ang = quat.torch_mul_vec(rot, ang_local[:, frame])
-        pos = pos + float(dt) * world_lin
+        if return_positions:
+            world_lin = quat.torch_mul_vec(rot, lin_local[:, frame])
+            pos = pos + float(dt) * world_lin
         rot_delta = quat.torch_from_scaled_angle_axis(float(dt) * world_ang)
         rot = quat.torch_normalize(quat.torch_mul(rot_delta, rot))
-        positions.append(pos)
-        rotations.append(rot)
+        if return_positions:
+            positions.append(pos)
+        if return_rotations:
+            rotations.append(rot)
 
-    return torch.stack(positions, dim=1), torch.stack(rotations, dim=1)
+    positions_out = torch.stack(positions, dim=1) if return_positions else None
+    rotations_out = torch.stack(rotations, dim=1) if return_rotations else None
+    return positions_out, rotations_out
 
 
 def root_trajectory_losses(
@@ -57,11 +71,29 @@ def root_trajectory_losses(
     feature_offset: torch.Tensor,
     feature_scale: torch.Tensor,
     dt: float,
+    compute_pos: bool,
+    compute_rot: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    pred_pos, pred_rot = integrate_root_trajectory(pred, feature_offset, feature_scale, dt)
-    target_pos, target_rot = integrate_root_trajectory(target, feature_offset, feature_scale, dt)
-    root_pos_loss = F.l1_loss(pred_pos[:, 1:], target_pos[:, 1:])
-    root_rot_loss = quat.torch_quat_angle(pred_rot[:, 1:], target_rot[:, 1:]).mean()
+    pred_pos, pred_rot = integrate_root_trajectory(
+        pred,
+        feature_offset,
+        feature_scale,
+        dt,
+        return_positions=compute_pos,
+        return_rotations=compute_rot,
+    )
+    with torch.no_grad():
+        target_pos, target_rot = integrate_root_trajectory(
+            target,
+            feature_offset,
+            feature_scale,
+            dt,
+            return_positions=compute_pos,
+            return_rotations=compute_rot,
+        )
+
+    root_pos_loss = F.l1_loss(pred_pos[:, 1:], target_pos[:, 1:]) if compute_pos else pred.new_zeros(())
+    root_rot_loss = quat.torch_quat_angle(pred_rot[:, 1:], target_rot[:, 1:]).mean() if compute_rot else pred.new_zeros(())
     return root_pos_loss, root_rot_loss
 
 
@@ -86,13 +118,17 @@ def compute_motion_reconstruction_losses(
     delta_loss = F.l1_loss(recon[:, 1:] - recon[:, :-1], batch_motion[:, 1:] - batch_motion[:, :-1])
     commit_loss = output["commit_loss"]
 
-    if root_pos_weight > 0.0 or root_rot_weight > 0.0:
+    compute_root_pos = root_pos_weight > 0.0
+    compute_root_rot = root_rot_weight > 0.0
+    if compute_root_pos or compute_root_rot:
         root_pos_loss, root_rot_loss = root_trajectory_losses(
             pred=recon,
             target=batch_motion,
             feature_offset=feature_offset,
             feature_scale=feature_scale,
             dt=root_dt,
+            compute_pos=compute_root_pos,
+            compute_rot=compute_root_rot,
         )
     else:
         root_pos_loss = recon.new_zeros(())
