@@ -27,9 +27,9 @@ fsq_preserve_symmetry: false
 fsq_noise_dropout: 0.0
 
 delta_weight: 3.0
-root_pos_weight: 0.2
-root_rot_weight: 0.2
-joint_weight: 1.0
+root_pos_weight: 0.1
+root_rot_weight: 0.1
+joint_weight: 0.5
 contact_weight: 0.1
 foot_slide_weight: 0.1
 foot_height_weight: 0.1
