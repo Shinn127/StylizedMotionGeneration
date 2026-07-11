@@ -4,6 +4,9 @@ import torch.nn.functional as F
 
 from models.resnet import CausalResnet1D
 
+CAUSAL_DILATIONS = (1,)
+FRAME_DILATIONS = (1, 3, 9)
+
 
 class CausalConv1d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, dilation=1):
@@ -27,10 +30,7 @@ class CausalEncoder1D(nn.Module):
         self,
         input_dim,
         code_dim,
-        down_t=2,
         width=512,
-        depth=3,
-        dilation_growth_rate=3,
         activation="relu",
         norm=None,
     ):
@@ -38,14 +38,13 @@ class CausalEncoder1D(nn.Module):
         stride_t = 2
         blocks = [CausalConv1d(input_dim, width, 3, 1, 1), nn.ReLU()]
         filter_t = stride_t * 2
-        for _ in range(down_t):
+        for _ in range(2):
             blocks.append(
                 nn.Sequential(
                     CausalConv1d(width, width, filter_t, stride_t, 1),
                     CausalResnet1D(
                         channels=width,
-                        depth=depth,
-                        dilation_growth_rate=dilation_growth_rate,
+                        dilations=CAUSAL_DILATIONS,
                         activation=activation,
                         norm=norm,
                     ),
@@ -64,8 +63,6 @@ class FrameCausalEncoder1D(nn.Module):
         input_dim,
         code_dim,
         width=512,
-        depth=6,
-        dilation_growth_rate=2,
         activation="relu",
         norm=None,
     ):
@@ -75,8 +72,7 @@ class FrameCausalEncoder1D(nn.Module):
             nn.ReLU(),
             CausalResnet1D(
                 channels=width,
-                depth=depth,
-                dilation_growth_rate=dilation_growth_rate,
+                dilations=FRAME_DILATIONS,
                 activation=activation,
                 norm=norm,
             ),
@@ -92,22 +88,18 @@ class CausalDecoder1D(nn.Module):
         self,
         output_dim,
         code_dim,
-        down_t=2,
         width=512,
-        depth=3,
-        dilation_growth_rate=3,
         activation="relu",
         norm=None,
     ):
         super().__init__()
         blocks = [CausalConv1d(code_dim, width, 3, 1, 1), nn.ReLU()]
-        for _ in range(down_t):
+        for _ in range(2):
             blocks.append(
                 nn.Sequential(
                     CausalResnet1D(
                         channels=width,
-                        depth=depth,
-                        dilation_growth_rate=dilation_growth_rate,
+                        dilations=CAUSAL_DILATIONS,
                         reverse_dilation=True,
                         activation=activation,
                         norm=norm,
@@ -116,7 +108,13 @@ class CausalDecoder1D(nn.Module):
                     CausalConv1d(width, width, 3, 1, 1),
                 )
             )
-        blocks.extend([CausalConv1d(width, width, 3, 1, 1), nn.ReLU(), CausalConv1d(width, output_dim, 3, 1, 1)])
+        blocks.extend(
+            [
+                CausalConv1d(width, width, 3, 1, 1),
+                nn.ReLU(),
+                CausalConv1d(width, output_dim, 5, 1, 1),
+            ]
+        )
         self.model = nn.Sequential(*blocks)
 
     def forward(self, z):
@@ -129,8 +127,6 @@ class FrameCausalDecoder1D(nn.Module):
         output_dim,
         code_dim,
         width=512,
-        depth=6,
-        dilation_growth_rate=2,
         activation="relu",
         norm=None,
     ):
@@ -140,15 +136,14 @@ class FrameCausalDecoder1D(nn.Module):
             nn.ReLU(),
             CausalResnet1D(
                 channels=width,
-                depth=depth,
-                dilation_growth_rate=dilation_growth_rate,
+                dilations=FRAME_DILATIONS,
                 reverse_dilation=True,
                 activation=activation,
                 norm=norm,
             ),
             CausalConv1d(width, width, 3, 1, 1),
             nn.ReLU(),
-            CausalConv1d(width, output_dim, 3, 1, 1),
+            CausalConv1d(width, output_dim, 4, 1, 1),
         )
 
     def forward(self, z):

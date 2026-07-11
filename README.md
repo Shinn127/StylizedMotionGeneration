@@ -276,7 +276,6 @@ python view_motion_sequence.py \
   --range-idx 0 \
   --start 128 \
   --length 256 \
-  --context-left 63 \
   --view compare
 ```
 
@@ -289,11 +288,12 @@ python view_motion_sequence.py \
   --range-idx 0 \
   --start 128 \
   --length 256 \
-  --context-left 63 \
   --view compare
 ```
 
-`--view` 支持 `source`、`recon`、`compare`。`compare` 模式左侧显示 database 原始片段，右侧显示模型重建片段；`--save-debug` 才会额外保存 source/recon features 和 token 文件。
+`--view` 支持 `source`、`recon`、`compare`。`compare` 模式左侧显示 database 原始片段，右侧显示模型重建片段；`--save-debug` 才会额外保存 source/recon features 和 token 文件。`--context-left` 默认从 checkpoint 对应模型的感受野自动推导，64 帧模型会使用 63 帧左上下文。
+
+模型加载直接使用 checkpoint 中的 `model_family` 和 `model_config`，不再推断或兼容旧 checkpoint 格式。
 
 ## Feature Roundtrip 工具
 

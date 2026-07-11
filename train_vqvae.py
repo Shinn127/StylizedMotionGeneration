@@ -72,9 +72,6 @@ def parse_args(argv=None):
     parser.add_argument("--codebook-size", type=int, default=cfg("codebook_size", 128))
     parser.add_argument("--num-heads", type=int, default=cfg("num_heads", 8))
     parser.add_argument("--width", type=int, default=cfg("width", 512))
-    parser.add_argument("--depth", type=int, default=cfg("depth", 3))
-    parser.add_argument("--down-t", type=int, default=cfg("down_t", 2))
-    parser.add_argument("--dilation-growth-rate", type=int, default=cfg("dilation_growth_rate", 3))
     parser.add_argument("--transformer-heads", type=int, default=cfg("transformer_heads", 4))
     parser.add_argument("--transformer-layers", type=int, default=cfg("transformer_layers", 3))
     parser.add_argument("--transformer-ff-dim", type=int, default=cfg("transformer_ff_dim", 1024))
@@ -138,10 +135,7 @@ def build_model(args, motion_dim):
         code_dim=args.code_dim,
         codebook_size=args.codebook_size,
         num_heads=args.num_heads,
-        down_t=args.down_t,
         width=args.width,
-        depth=args.depth,
-        dilation_growth_rate=args.dilation_growth_rate,
         model_type=args.model_type,
         transformer_heads=args.transformer_heads,
         transformer_layers=args.transformer_layers,
@@ -357,6 +351,8 @@ def save_run_config(args, run_name: str, train_dataset, val_dataset) -> Path:
 
 def load_resume_checkpoint(resume_path: Path, model, optimizer, scheduler, device):
     checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+    if checkpoint["model_config"] != unwrap_model(model).config:
+        raise ValueError("Resume checkpoint model_config does not match the current model")
     unwrap_model(model).load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
@@ -378,6 +374,7 @@ def build_checkpoint(
     val_stats,
 ) -> dict:
     return {
+        "model_config": unwrap_model(model).config,
         "model": unwrap_model(model).state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
@@ -385,7 +382,6 @@ def build_checkpoint(
         "run_name": run_name,
         "config_path": str(config_path),
         "model_family": "vqvae",
-        "motion_dim": train_dataset.motion_dim,
         "stats": serialize_motion_feature_stats(
             train_dataset.feature_stats(),
             names=train_dataset.names,
@@ -418,6 +414,8 @@ def main():
     feature_scale = torch.from_numpy(feature_stats.scale.astype("float32")).to(device)
 
     model = build_model(args, motion_dim=train_dataset.motion_dim)
+    if model.receptive_field is not None and train_dataset.window_size != model.receptive_field:
+        raise ValueError(f"Dataset window_size={train_dataset.window_size}, model receptive_field={model.receptive_field}")
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
     model = model.to(device)

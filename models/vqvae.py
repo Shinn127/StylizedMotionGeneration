@@ -13,10 +13,7 @@ class CausalMotionVQVAE(nn.Module):
         codebook_size=512,
         num_heads=8,
         decay=0.99,
-        down_t=2,
         width=512,
-        depth=3,
-        dilation_growth_rate=3,
         activation="relu",
         norm=None,
         model_type="causal_cnn",
@@ -29,12 +26,13 @@ class CausalMotionVQVAE(nn.Module):
         max_seq_len=64,
     ):
         super().__init__()
+        self.config = {key: value for key, value in locals().items() if key not in {"self", "__class__"}}
         if model_type not in {"causal_cnn", "frame_causal_cnn", "causal_transformer"}:
             raise ValueError(f"Unsupported model_type: {model_type}")
 
         self.model_type = model_type
         self.motion_dim = motion_dim
-        self.upsample_factor = 1 if model_type in {"frame_causal_cnn", "causal_transformer"} else 2 ** down_t
+        self.upsample_factor = 4 if model_type == "causal_cnn" else 1
 
         if model_type == "causal_transformer":
             self.encoder = CausalTransformerEncoder(
@@ -53,8 +51,6 @@ class CausalMotionVQVAE(nn.Module):
                 input_dim=motion_dim,
                 code_dim=code_dim,
                 width=width,
-                depth=depth,
-                dilation_growth_rate=dilation_growth_rate,
                 activation=activation,
                 norm=norm,
             )
@@ -62,10 +58,7 @@ class CausalMotionVQVAE(nn.Module):
             self.encoder = CausalEncoder1D(
                 input_dim=motion_dim,
                 code_dim=code_dim,
-                down_t=down_t,
                 width=width,
-                depth=depth,
-                dilation_growth_rate=dilation_growth_rate,
                 activation=activation,
                 norm=norm,
             )
@@ -94,8 +87,6 @@ class CausalMotionVQVAE(nn.Module):
                 output_dim=motion_dim,
                 code_dim=code_dim,
                 width=width,
-                depth=depth,
-                dilation_growth_rate=dilation_growth_rate,
                 activation=activation,
                 norm=norm,
             )
@@ -103,13 +94,19 @@ class CausalMotionVQVAE(nn.Module):
             self.decoder = CausalDecoder1D(
                 output_dim=motion_dim,
                 code_dim=code_dim,
-                down_t=down_t,
                 width=width,
-                depth=depth,
-                dilation_growth_rate=dilation_growth_rate,
                 activation=activation,
                 norm=norm,
             )
+
+        if model_type == "frame_causal_cnn":
+            self.receptive_field, self.context_left, self.lookahead_frames = 64, 63, 0
+        elif model_type == "causal_cnn":
+            self.receptive_field, self.context_left, self.lookahead_frames = 64, 63, 3
+        else:
+            self.receptive_field = None
+            self.context_left = context_len - 1
+            self.lookahead_frames = None
 
     def _encode_input(self, x):
         return x.permute(0, 2, 1).float()

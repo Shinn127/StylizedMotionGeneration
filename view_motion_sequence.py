@@ -18,7 +18,12 @@ def parse_args():
     parser.add_argument("--range-idx", type=int, required=True, help="Motion shard / range index in feature_database metadata.")
     parser.add_argument("--start", type=int, required=True, help="Target segment start frame.")
     parser.add_argument("--length", type=int, required=True, help="Target segment length in frames.")
-    parser.add_argument("--context-left", type=int, default=63, help="Left context frames used for causal reconstruction warmup.")
+    parser.add_argument(
+        "--context-left",
+        type=int,
+        default=None,
+        help="Left context frames used for reconstruction warmup. Defaults to the model requirement.",
+    )
     parser.add_argument("--view", choices=["source", "recon", "compare"], default="compare")
     parser.add_argument("--compare-spacing", type=float, default=2.0)
     parser.add_argument("--fps", type=int, default=60)
@@ -46,55 +51,25 @@ def choose_device(name: str) -> torch.device:
     return device
 
 
-def checkpoint_family(ckpt: dict) -> str:
-    family = ckpt.get("model_family")
-    if family in {"fsq", "vqvae"}:
-        return family
-    args = ckpt.get("args", {})
-    if "fsq_num_latent_tokens" in args or "fsq_num_levels" in args:
-        return "fsq"
-    if "codebook_size" in args or "num_heads" in args:
-        return "vqvae"
-    raise ValueError("Could not infer checkpoint family; expected model_family or recognizable args")
-
-
 def build_model_from_checkpoint(ckpt: dict):
-    args = ckpt["args"]
-    family = checkpoint_family(ckpt)
-    if family == "fsq":
-        model = FSQMotionAutoencoder(
-            motion_dim=ckpt["motion_dim"],
-            code_dim=args["code_dim"],
-            width=args["width"],
-            depth=args["depth"],
-            dilation_growth_rate=args["dilation_growth_rate"],
-            num_latent_tokens=args["fsq_num_latent_tokens"],
-            num_levels=args["fsq_num_levels"],
-            fsq_scale=args.get("fsq_scale"),
-            fsq_preserve_symmetry=args.get("fsq_preserve_symmetry", False),
-            fsq_noise_dropout=args.get("fsq_noise_dropout", 0.0),
-        )
-    else:
-        model = CausalMotionVQVAE(
-            motion_dim=ckpt["motion_dim"],
-            code_dim=args["code_dim"],
-            codebook_size=args["codebook_size"],
-            num_heads=args["num_heads"],
-            down_t=args.get("down_t", 2),
-            width=args["width"],
-            depth=args["depth"],
-            dilation_growth_rate=args["dilation_growth_rate"],
-            model_type=args.get("model_type", "causal_cnn"),
-            transformer_heads=args.get("transformer_heads", 4),
-            transformer_layers=args.get("transformer_layers", 3),
-            transformer_ff_dim=args.get("transformer_ff_dim", 1024),
-            transformer_dropout=args.get("transformer_dropout", 0.1),
-            context_len=args.get("context_len", 32),
-            pos_encoding=args.get("pos_encoding", "learned"),
-            max_seq_len=args.get("max_seq_len", 64),
-        )
+    family = ckpt["model_family"]
+    if family not in {"fsq", "vqvae"}:
+        raise ValueError(f"Unsupported model_family: {family}")
+    model_class = FSQMotionAutoencoder if family == "fsq" else CausalMotionVQVAE
+    model = model_class(**ckpt["model_config"])
     model.load_state_dict(ckpt["model"])
-    return model, family, args
+    return model, family
+
+
+def resolve_context_left(cli_context_left: int | None, model) -> int:
+    required = int(model.context_left)
+    if cli_context_left is None:
+        return required
+    if cli_context_left < required:
+        raise ValueError(
+            f"--context-left={cli_context_left} is smaller than the model requirement {required}"
+        )
+    return cli_context_left
 
 
 def resolve_feature_database(cli_feature_database: Path | None, ckpt_args: dict) -> Path:
@@ -119,18 +94,10 @@ def validate_slice(range_idx: int, start: int, length: int, context_left: int, m
         raise ValueError(f"Requested [{start}, {start + length}) exceeds motion length {motion.shape[0]}")
 
 
-def infer_right_pad(args_for_model: dict, family: str, infer_len: int) -> int:
-    if family == "vqvae" and args_for_model.get("model_type", "causal_cnn") == "causal_cnn":
-        factor = 2 ** int(args_for_model.get("down_t", 2))
-        return (-infer_len) % factor
-    return 0
-
-
-def validate_model_sequence_length(args_for_model: dict, family: str, infer_len: int) -> None:
-    if family == "vqvae" and args_for_model.get("model_type", "causal_cnn") == "causal_transformer":
-        max_seq_len = int(args_for_model.get("max_seq_len", 64))
-        if infer_len > max_seq_len:
-            raise ValueError(f"causal_transformer infer length {infer_len} exceeds max_seq_len {max_seq_len}")
+def inference_factor(model_config: dict, family: str) -> int:
+    if family == "vqvae" and model_config["model_type"] == "causal_cnn":
+        return 4
+    return 1
 
 
 def slice_with_edge_pad(motion: np.ndarray, start: int, end: int) -> np.ndarray:
@@ -145,13 +112,16 @@ def slice_with_edge_pad(motion: np.ndarray, start: int, end: int) -> np.ndarray:
     return sliced
 
 
-def reconstruct_segment(model, model_args: dict, family: str, motion: np.ndarray, start: int, length: int, context_left: int, device):
+def reconstruct_segment(model, family: str, motion: np.ndarray, start: int, length: int, context_left: int, device):
     target_end = start + length
     infer_start = max(0, start - context_left)
+    alignment_factor = inference_factor(model.config, family)
+    infer_start -= infer_start % alignment_factor
     infer_end = target_end
     infer_len = infer_end - infer_start
-    validate_model_sequence_length(model_args, family, infer_len)
-    pad_right = infer_right_pad(model_args, family, infer_len)
+    if family == "vqvae" and model.model_type == "causal_transformer" and infer_len > model.config["max_seq_len"]:
+        raise ValueError(f"causal_transformer infer length {infer_len} exceeds max_seq_len {model.config['max_seq_len']}")
+    pad_right = (-infer_len) % alignment_factor
     infer_features = slice_with_edge_pad(motion, infer_start, infer_end + pad_right)
 
     x = torch.from_numpy(np.asarray(infer_features, dtype=np.float32)).unsqueeze(0).to(device)
@@ -173,6 +143,7 @@ def reconstruct_segment(model, model_args: dict, family: str, motion: np.ndarray
     return recon_features, indices, {
         "infer_start": infer_start,
         "infer_end": infer_end,
+        "alignment_factor": alignment_factor,
         "pad_right": pad_right,
         "infer_frames": int(infer_features.shape[0]),
     }
@@ -193,17 +164,18 @@ def save_debug(args, source_features, recon_features, indices, meta):
 def main():
     args = parse_args()
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model, family, model_args = build_model_from_checkpoint(ckpt)
-    feature_database = resolve_feature_database(args.feature_database, model_args)
+    model, family = build_model_from_checkpoint(ckpt)
+    args.context_left = resolve_context_left(args.context_left, model)
+    feature_database = resolve_feature_database(args.feature_database, ckpt["args"])
     store = build_feature_store(feature_database)
-    if int(ckpt["motion_dim"]) != int(store.motion_dim):
-        raise ValueError(f"Checkpoint motion_dim={ckpt['motion_dim']} does not match feature database motion_dim={store.motion_dim}")
+    if model.motion_dim != store.motion_dim:
+        raise ValueError(f"Model motion_dim={model.motion_dim} does not match feature database motion_dim={store.motion_dim}")
     if args.range_idx >= len(store.motion_files):
         raise ValueError(f"--range-idx {args.range_idx} exceeds range count {len(store.motion_files)}")
 
     motion_path = store.motion_files[args.range_idx]
     motion = np.load(motion_path, mmap_mode="r")
-    validate_slice(args.range_idx, args.start, args.length, args.context_left, motion, int(ckpt["motion_dim"]))
+    validate_slice(args.range_idx, args.start, args.length, args.context_left, motion, model.motion_dim)
     source_features = np.asarray(motion[args.start : args.start + args.length], dtype=np.float32).copy()
 
     device = choose_device(args.device)
@@ -211,7 +183,6 @@ def main():
     model.eval()
     recon_features, indices, infer_meta = reconstruct_segment(
         model=model,
-        model_args=model_args,
         family=family,
         motion=motion,
         start=args.start,

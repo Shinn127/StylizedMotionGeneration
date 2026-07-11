@@ -21,9 +21,6 @@ code_dim: 64
 codebook_size: 128
 num_heads: 8
 width: 512
-depth: 3
-down_t: 0
-dilation_growth_rate: 3
 
 transformer_heads: 4
 transformer_layers: 3

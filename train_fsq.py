@@ -66,9 +66,12 @@ def parse_args(argv=None):
     parser.add_argument("--model-type", choices=["frame_causal_cnn"], default=cfg("model_type", "frame_causal_cnn"))
     parser.add_argument("--code-dim", type=int, default=cfg("code_dim", 256))
     parser.add_argument("--width", type=int, default=cfg("width", 512))
-    parser.add_argument("--depth", type=int, default=cfg("depth", 6))
-    parser.add_argument("--dilation-growth-rate", type=int, default=cfg("dilation_growth_rate", 2))
-    parser.add_argument("--fsq-num-latent-tokens", type=int, default=cfg("fsq_num_latent_tokens", 40))
+    parser.add_argument(
+        "--fsq-num-coordinates",
+        type=int,
+        default=cfg("fsq_num_coordinates", cfg("fsq_num_latent_tokens", 20)),
+    )
+    parser.add_argument("--fsq-num-latent-tokens", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--fsq-num-levels", type=int, default=cfg("fsq_num_levels", 9))
     parser.add_argument("--fsq-scale", type=float, default=cfg("fsq_scale", None))
     parser.add_argument("--fsq-preserve-symmetry", action="store_true", default=cfg("fsq_preserve_symmetry", False))
@@ -76,6 +79,11 @@ def parse_args(argv=None):
     parser.add_argument("--delta-weight", type=float, default=cfg("delta_weight", 1.0))
     parser.add_argument("--root-pos-weight", type=float, default=cfg("root_pos_weight", 0.0))
     parser.add_argument("--root-rot-weight", type=float, default=cfg("root_rot_weight", 0.0))
+    parser.add_argument("--joint-weight", type=float, default=cfg("joint_weight", 0.0))
+    parser.add_argument("--contact-weight", type=float, default=cfg("contact_weight", 0.0))
+    parser.add_argument("--foot-slide-weight", type=float, default=cfg("foot_slide_weight", 0.0))
+    parser.add_argument("--foot-height-weight", type=float, default=cfg("foot_height_weight", 0.0))
+    parser.add_argument("--contact-temperature", type=float, default=cfg("contact_temperature", 10.0))
     parser.add_argument("--root-dt", type=float, default=cfg("root_dt", 1.0 / 60.0))
     parser.add_argument("--outdir", type=Path, default=cfg_path("outdir", Path("outputs/fsq")))
     parser.add_argument("--data-parallel", action="store_true", default=cfg("data_parallel", False))
@@ -86,6 +94,8 @@ def parse_args(argv=None):
     parser.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false")
     parser.set_defaults(persistent_workers=cfg("persistent_workers", True))
     args = parser.parse_args(remaining)
+    if args.fsq_num_latent_tokens is not None:
+        args.fsq_num_coordinates = args.fsq_num_latent_tokens
     args.config = pre_args.config
     return args
 
@@ -129,9 +139,7 @@ def build_model(args, motion_dim):
         motion_dim=motion_dim,
         code_dim=args.code_dim,
         width=args.width,
-        depth=args.depth,
-        dilation_growth_rate=args.dilation_growth_rate,
-        num_latent_tokens=args.fsq_num_latent_tokens,
+        num_coordinates=args.fsq_num_coordinates,
         num_levels=args.fsq_num_levels,
         fsq_scale=args.fsq_scale,
         fsq_preserve_symmetry=args.fsq_preserve_symmetry,
@@ -163,8 +171,19 @@ def init_metric_totals() -> dict[str, float]:
         "delta": 0.0,
         "root_pos": 0.0,
         "root_rot": 0.0,
+        "joint": 0.0,
+        "contact": 0.0,
+        "foot_slide": 0.0,
+        "foot_height": 0.0,
         "level_perplexity": 0.0,
         "level_usage": 0.0,
+        "level_perplexity_min": 0.0,
+        "level_perplexity_max": 0.0,
+        "level_usage_min": 0.0,
+        "level_usage_max": 0.0,
+        "tuple_unique_ratio": 0.0,
+        "tuple_change_rate": 0.0,
+        "coordinate_change_rate": 0.0,
     }
 
 
@@ -174,8 +193,19 @@ def update_metric_totals(totals, losses, output, batch_size):
     totals["delta"] += losses.delta.item() * batch_size
     totals["root_pos"] += losses.root_pos.item() * batch_size
     totals["root_rot"] += losses.root_rot.item() * batch_size
+    totals["joint"] += losses.joint.item() * batch_size
+    totals["contact"] += losses.contact.item() * batch_size
+    totals["foot_slide"] += losses.foot_slide.item() * batch_size
+    totals["foot_height"] += losses.foot_height.item() * batch_size
     totals["level_perplexity"] += output["level_perplexity"].item() * batch_size
     totals["level_usage"] += output["level_usage"].item() * batch_size
+    totals["level_perplexity_min"] += output["level_perplexity_min"].item() * batch_size
+    totals["level_perplexity_max"] += output["level_perplexity_max"].item() * batch_size
+    totals["level_usage_min"] += output["level_usage_min"].item() * batch_size
+    totals["level_usage_max"] += output["level_usage_max"].item() * batch_size
+    totals["tuple_unique_ratio"] += output["tuple_unique_ratio"].item() * batch_size
+    totals["tuple_change_rate"] += output["tuple_change_rate"].item() * batch_size
+    totals["coordinate_change_rate"] += output["coordinate_change_rate"].item() * batch_size
 
 
 def finalize_metric_totals(totals, count):
@@ -188,7 +218,7 @@ def move_motion_to_device(batch, device, non_blocking: bool):
     return batch["motion"].to(device, non_blocking=non_blocking)
 
 
-def compute_losses(motion, output, feature_weights, feature_offset, feature_scale, args):
+def compute_losses(motion, output, feature_weights, feature_offset, feature_scale, loss_metadata, args):
     return compute_motion_reconstruction_losses(
         batch_motion=motion,
         output=output,
@@ -200,10 +230,19 @@ def compute_losses(motion, output, feature_weights, feature_offset, feature_scal
         root_pos_weight=args.root_pos_weight,
         root_rot_weight=args.root_rot_weight,
         root_dt=args.root_dt,
+        joint_weight=args.joint_weight,
+        contact_weight=args.contact_weight,
+        foot_slide_weight=args.foot_slide_weight,
+        foot_height_weight=args.foot_height_weight,
+        contact_temperature=args.contact_temperature,
+        ref_pos=loss_metadata["ref_pos"],
+        parents=loss_metadata["parents"],
+        joint_weights=loss_metadata["joint_weights"],
+        foot_indices=loss_metadata["foot_indices"],
     )
 
 
-def evaluate(model, loader, feature_weights, feature_offset, feature_scale, device, args, non_blocking: bool):
+def evaluate(model, loader, feature_weights, feature_offset, feature_scale, loss_metadata, device, args, non_blocking: bool):
     model.eval()
     totals = init_metric_totals()
     count = 0
@@ -211,7 +250,7 @@ def evaluate(model, loader, feature_weights, feature_offset, feature_scale, devi
         for batch in loader:
             motion = move_motion_to_device(batch, device, non_blocking=non_blocking)
             output = model(motion)
-            losses = compute_losses(motion, output, feature_weights, feature_offset, feature_scale, args)
+            losses = compute_losses(motion, output, feature_weights, feature_offset, feature_scale, loss_metadata, args)
             batch_size = motion.shape[0]
             update_metric_totals(totals, losses, output, batch_size)
             count += batch_size
@@ -225,6 +264,7 @@ def train_one_epoch(
     feature_weights,
     feature_offset,
     feature_scale,
+    loss_metadata,
     device,
     args,
     grad_clip_norm,
@@ -241,7 +281,7 @@ def train_one_epoch(
     for batch in loader:
         motion = move_motion_to_device(batch, device, non_blocking=non_blocking)
         output = model(motion)
-        losses = compute_losses(motion, output, feature_weights, feature_offset, feature_scale, args)
+        losses = compute_losses(motion, output, feature_weights, feature_offset, feature_scale, loss_metadata, args)
         optimizer.zero_grad(set_to_none=True)
         losses.loss.backward()
         if grad_clip_norm is not None and grad_clip_norm > 0.0:
@@ -259,8 +299,19 @@ def train_one_epoch(
             writer.add_scalar("train_step/delta", losses.delta.item(), global_step)
             writer.add_scalar("train_step/root_pos", losses.root_pos.item(), global_step)
             writer.add_scalar("train_step/root_rot", losses.root_rot.item(), global_step)
+            writer.add_scalar("train_step/joint", losses.joint.item(), global_step)
+            writer.add_scalar("train_step/contact", losses.contact.item(), global_step)
+            writer.add_scalar("train_step/foot_slide", losses.foot_slide.item(), global_step)
+            writer.add_scalar("train_step/foot_height", losses.foot_height.item(), global_step)
             writer.add_scalar("train_step/level_perplexity", output["level_perplexity"].item(), global_step)
             writer.add_scalar("train_step/level_usage", output["level_usage"].item(), global_step)
+            writer.add_scalar("train_step/level_perplexity_min", output["level_perplexity_min"].item(), global_step)
+            writer.add_scalar("train_step/level_perplexity_max", output["level_perplexity_max"].item(), global_step)
+            writer.add_scalar("train_step/level_usage_min", output["level_usage_min"].item(), global_step)
+            writer.add_scalar("train_step/level_usage_max", output["level_usage_max"].item(), global_step)
+            writer.add_scalar("train_step/tuple_unique_ratio", output["tuple_unique_ratio"].item(), global_step)
+            writer.add_scalar("train_step/tuple_change_rate", output["tuple_change_rate"].item(), global_step)
+            writer.add_scalar("train_step/coordinate_change_rate", output["coordinate_change_rate"].item(), global_step)
             writer.add_scalar("train_step/lr", optimizer.param_groups[0]["lr"], global_step)
 
     epoch_time = time.perf_counter() - start_time
@@ -295,6 +346,13 @@ def build_run_config(args, run_name: str, train_dataset, val_dataset) -> dict:
         "argv": sys.argv,
         "args": serialize_args(args),
         "model_family": "fsq",
+        "representation": {
+            "temporal_downsample": 1,
+            "frame_rate": 60,
+            "num_coordinates": args.fsq_num_coordinates,
+            "num_levels": args.fsq_num_levels,
+            "theoretical_bits_per_frame": args.fsq_num_coordinates * math.log2(args.fsq_num_levels),
+        },
         "dataset": {
             "feature_database": str(train_dataset.feature_database),
             "joint_subset": train_dataset.joint_subset,
@@ -303,6 +361,26 @@ def build_run_config(args, run_name: str, train_dataset, val_dataset) -> dict:
             "train_summary": train_dataset.split_summary(),
             "val_summary": val_dataset.split_summary(),
         },
+    }
+
+
+def build_loss_metadata(dataset, device: torch.device) -> dict[str, object]:
+    names = dataset.names
+    try:
+        foot_indices = (names.index("LeftToeBase"), names.index("RightToeBase"))
+    except ValueError as exc:
+        raise ValueError("Joint and foot losses require LeftToeBase and RightToeBase joints") from exc
+
+    joint_weights = np.ones(len(names), dtype=np.float32)
+    for joint_index, name in enumerate(names):
+        if any(token in name for token in ("Head", "Hand", "Foot", "Toe")):
+            joint_weights[joint_index] = 2.0
+    joint_weights[0] = 0.0
+    return {
+        "ref_pos": torch.from_numpy(dataset.feature_stats().ref_pos.astype("float32")).to(device),
+        "parents": torch.from_numpy(dataset.parents.astype("int64")).to(device),
+        "joint_weights": torch.from_numpy(joint_weights).to(device),
+        "foot_indices": foot_indices,
     }
 
 
@@ -316,8 +394,8 @@ def save_run_config(args, run_name: str, train_dataset, val_dataset) -> Path:
 
 def load_resume_checkpoint(resume_path: Path, model, optimizer, scheduler, device):
     checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
-    if checkpoint.get("model_family") != "fsq":
-        raise ValueError(f"Expected an FSQ checkpoint, got model_family={checkpoint.get('model_family')}")
+    if checkpoint["model_config"] != unwrap_model(model).config:
+        raise ValueError("Resume checkpoint model_config does not match the current model")
     unwrap_model(model).load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
@@ -339,6 +417,7 @@ def build_checkpoint(
     val_stats,
 ) -> dict:
     return {
+        "model_config": unwrap_model(model).config,
         "model": unwrap_model(model).state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
@@ -346,7 +425,6 @@ def build_checkpoint(
         "run_name": run_name,
         "config_path": str(config_path),
         "model_family": "fsq",
-        "motion_dim": train_dataset.motion_dim,
         "stats": serialize_motion_feature_stats(
             train_dataset.feature_stats(),
             names=train_dataset.names,
@@ -377,8 +455,11 @@ def main():
     feature_stats = train_dataset.feature_stats()
     feature_offset = torch.from_numpy(feature_stats.offset.astype("float32")).to(device)
     feature_scale = torch.from_numpy(feature_stats.scale.astype("float32")).to(device)
+    loss_metadata = build_loss_metadata(train_dataset, device)
 
     model = build_model(args, motion_dim=train_dataset.motion_dim)
+    if train_dataset.window_size != model.receptive_field:
+        raise ValueError(f"Dataset window_size={train_dataset.window_size}, model receptive_field={model.receptive_field}")
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
     model = model.to(device)
@@ -418,6 +499,7 @@ def main():
             feature_weights,
             feature_offset,
             feature_scale,
+            loss_metadata,
             device,
             args=args,
             grad_clip_norm=args.grad_clip_norm,
@@ -432,12 +514,17 @@ def main():
             feature_weights,
             feature_offset,
             feature_scale,
+            loss_metadata,
             device,
             args=args,
             non_blocking=non_blocking,
         )
 
-        for name in ["loss", "recon", "delta", "root_pos", "root_rot", "level_perplexity", "level_usage"]:
+        for name in [
+            "loss", "recon", "delta", "root_pos", "root_rot", "joint", "contact", "foot_slide",
+            "foot_height", "level_perplexity", "level_usage", "level_perplexity_min", "level_perplexity_max",
+            "level_usage_min", "level_usage_max", "tuple_unique_ratio", "tuple_change_rate", "coordinate_change_rate",
+        ]:
             writer.add_scalar(f"train_epoch/{name}", train_stats[name], epoch + 1)
             writer.add_scalar(f"val/{name}", val_stats[name], epoch + 1)
         writer.add_scalar("train_epoch/samples_per_second", train_stats["samples_per_second"], epoch + 1)
@@ -457,8 +544,14 @@ def main():
             f"train_delta={train_stats['delta']:.6f} "
             f"train_root_pos={train_stats['root_pos']:.6f} "
             f"train_root_rot={train_stats['root_rot']:.6f} "
+            f"train_joint={train_stats['joint']:.6f} "
+            f"train_contact={train_stats['contact']:.6f} "
+            f"train_foot_slide={train_stats['foot_slide']:.6f} "
+            f"train_foot_height={train_stats['foot_height']:.6f} "
             f"train_level_perplexity={train_stats['level_perplexity']:.6f} "
             f"train_level_usage={train_stats['level_usage']:.6f} "
+            f"train_tuple_unique_ratio={train_stats['tuple_unique_ratio']:.6f} "
+            f"train_tuple_change_rate={train_stats['tuple_change_rate']:.6f} "
             f"train_samples_per_second={train_stats['samples_per_second']:.2f} "
             f"lr={optimizer.param_groups[0]['lr']:.8f} "
             f"val_loss={val_stats['loss']:.6f} "
@@ -466,8 +559,14 @@ def main():
             f"val_delta={val_stats['delta']:.6f} "
             f"val_root_pos={val_stats['root_pos']:.6f} "
             f"val_root_rot={val_stats['root_rot']:.6f} "
+            f"val_joint={val_stats['joint']:.6f} "
+            f"val_contact={val_stats['contact']:.6f} "
+            f"val_foot_slide={val_stats['foot_slide']:.6f} "
+            f"val_foot_height={val_stats['foot_height']:.6f} "
             f"val_level_perplexity={val_stats['level_perplexity']:.6f} "
             f"val_level_usage={val_stats['level_usage']:.6f}"
+            f" val_tuple_unique_ratio={val_stats['tuple_unique_ratio']:.6f}"
+            f" val_tuple_change_rate={val_stats['tuple_change_rate']:.6f}"
         )
 
         is_best = best_val is None or val_stats["loss"] < best_val

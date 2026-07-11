@@ -52,16 +52,16 @@ class CausalResConv1DBlock(nn.Module):
 
 
 class CausalResnet1D(nn.Module):
-    def __init__(self, channels, depth, dilation_growth_rate=1, reverse_dilation=False, activation="relu", norm=None):
+    def __init__(self, channels, dilations, reverse_dilation=False, activation="relu", norm=None):
         super().__init__()
         blocks = [
             CausalResConv1DBlock(
                 channels=channels,
-                dilation=dilation_growth_rate ** i,
+                dilation=dilation,
                 activation=activation,
                 norm=norm,
             )
-            for i in range(depth)
+            for dilation in dilations
         ]
         if reverse_dilation:
             blocks = blocks[::-1]
