@@ -255,6 +255,29 @@ python evaluate_fsq.py \
 
 重复传入 `--checkpoint` 可比较多个模型。评估报告包含 feature/delta error、MPJPE、root drift、contact precision/recall/F1、foot slide/height，以及 FSQ usage 和 temporal code statistics。评估器会先恢复物理 features，再使用各 checkpoint 自己的 normalization stats，因此可以比较训练统计不同但 skeleton 相同的模型。
 
+## Dynamic FSQ Style Gate
+
+冻结 FSQ token database，只训练 clip-dynamic coordinate-level mask 和 style classifier：
+
+```bash
+conda run -n mcc python train_fsq_style_gate.py \
+  --config configs/fsq_style_gate.yaml
+```
+
+Gate 读取 `indices [B,T,20]`，输出 `mask [B,20,9]`。Mask 使用 Hard Concrete 自动学习激活数量，不使用预设 Top-K；训练沿用 token database 的 window splits，并同时训练 full-token 与 matched-random 性能基线。
+
+评估并导出每个 window 的二值 mask、mask probability 和聚合结果：
+
+```bash
+conda run -n mcc python evaluate_fsq_style_gate.py \
+  --checkpoint outputs/fsq_style_gate/best.pt \
+  --token-database data/processed/100style_test5_pruned/fsq_20x9_full_loss \
+  --split test \
+  --output outputs/evaluations/fsq_style_gate_test5.json
+```
+
+Gate checkpoint 会记录冻结 tokenizer 的 SHA256；评估时若 token database 来自不同 checkpoint，会直接拒绝运行。
+
 ## 可视化
 
 ### 原始数据库

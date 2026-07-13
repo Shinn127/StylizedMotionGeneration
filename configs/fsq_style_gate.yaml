@@ -1,0 +1,34 @@
+token_database: data/processed/100style_test5_pruned/fsq_20x9_full_loss
+
+batch_size: 128
+epochs: 100
+lr: 0.0003
+min_lr: 0.00001
+weight_decay: 0.0001
+grad_clip_norm: 1.0
+
+hidden_dim: 128
+num_heads: 4
+num_layers: 2
+ff_dim: 256
+dropout: 0.1
+max_seq_len: 64
+
+gate_temperature_start: 1.5
+gate_temperature_end: 0.2
+l0_weight: 0.001
+binary_weight: 0.001
+consistency_weight: 0.1
+consistency_crop_length: 48
+baseline_weight: 1.0
+
+num_workers: 8
+prefetch_factor: 2
+persistent_workers: true
+seed: 3407
+deterministic: false
+early_stop_patience: 15
+device: auto
+
+outdir: outputs/fsq_style_gate
+run_name: fsq_style_gate_test5
