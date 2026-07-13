@@ -98,3 +98,6 @@ desktop.ini
 # ---- Project-specific ----
 !requirements.txt
 !environment.yml
+
+
+ideaspark_run/

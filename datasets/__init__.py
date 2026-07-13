@@ -1,3 +1,3 @@
-from .motion_dataset import MotionDataset
+from .feature_dataset import FeatureDataset, FeatureStore, build_feature_store
 
-__all__ = ["MotionDataset"]
+__all__ = ["FeatureDataset", "FeatureStore", "build_feature_store"]

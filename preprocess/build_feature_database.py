@@ -1,37 +1,23 @@
-import argparse
-import os
-import multiprocessing as mp
 from pathlib import Path
-import sys
-from concurrent.futures import ProcessPoolExecutor
 import zlib
 
 import numpy as np
 from tqdm import tqdm
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if PROJECT_ROOT.as_posix() not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT.as_posix())
-PREPROCESS_DIR = PROJECT_ROOT / "preprocess"
-if PREPROCESS_DIR.as_posix() not in sys.path:
-    sys.path.insert(0, PREPROCESS_DIR.as_posix())
-
-from motion_features import MotionFeatureStats, build_motion_feature_components, default_joint_weights, serialize_motion_feature_stats
+from motion_features import (
+    MotionFeatureStats,
+    build_motion_feature_components,
+    default_joint_weights,
+    serialize_motion_feature_stats,
+)
 from preprocess import bvh
-from preprocess.build_database import _process_motion, build_100style_tags, build_lafan_tags, source_path_for
-
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["lafan", "100style"], required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--styles", type=str, default=None)
-    parser.add_argument("--max-styles", type=int, default=None)
-    parser.add_argument("--prune-ends-and-fingers", action="store_true")
-    parser.add_argument("--window-size", type=int, default=64)
-    parser.add_argument("--seed", type=int, default=3407)
-    parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 1) - 1))
-    return parser.parse_args()
+from preprocess.build_database import (
+    MotionDatabaseWriter,
+    build_100style_tags,
+    build_lafan_tags,
+    iter_motion_pairs,
+    source_path_for,
+)
 
 
 def _parse_style_filter(styles_arg):
@@ -82,20 +68,6 @@ class FeatureStatsAccumulator:
         self.count = 0
         self.x_sum = None
         self.x_sumsq = None
-        self.x_rvel_sum = None
-        self.x_rvel_sumsq = None
-        self.x_rang_sum = None
-        self.x_rang_sumsq = None
-        self.x_hip_pos_sum = None
-        self.x_hip_pos_sumsq = None
-        self.x_rot_6d_sum = None
-        self.x_rot_6d_sumsq = None
-        self.x_hip_vel_sum = None
-        self.x_hip_vel_sumsq = None
-        self.x_ang_sum = None
-        self.x_ang_sumsq = None
-        self.x_contacts_sum = None
-        self.x_contacts_sumsq = None
         self.ref_pos_sum = None
 
     @staticmethod
@@ -117,52 +89,11 @@ class FeatureStatsAccumulator:
 
         x = components.x[mask]
         self.x_sum, self.x_sumsq = self._update_moments(self.x_sum, self.x_sumsq, x)
-        self.x_rvel_sum, self.x_rvel_sumsq = self._update_moments(self.x_rvel_sum, self.x_rvel_sumsq, components.x_rvel[mask])
-        self.x_rang_sum, self.x_rang_sumsq = self._update_moments(self.x_rang_sum, self.x_rang_sumsq, components.x_rang[mask])
-        self.x_hip_pos_sum, self.x_hip_pos_sumsq = self._update_moments(self.x_hip_pos_sum, self.x_hip_pos_sumsq, components.x_hip_pos[mask])
-        self.x_rot_6d_sum, self.x_rot_6d_sumsq = self._update_moments(self.x_rot_6d_sum, self.x_rot_6d_sumsq, components.x_rot_6d[mask])
-        self.x_hip_vel_sum, self.x_hip_vel_sumsq = self._update_moments(self.x_hip_vel_sum, self.x_hip_vel_sumsq, components.x_hip_vel[mask])
-        self.x_ang_sum, self.x_ang_sumsq = self._update_moments(self.x_ang_sum, self.x_ang_sumsq, components.x_ang_local[mask])
-        self.x_contacts_sum, self.x_contacts_sumsq = self._update_moments(self.x_contacts_sum, self.x_contacts_sumsq, components.x_contacts[mask])
         if self.ref_pos_sum is None:
             self.ref_pos_sum = components.positions[mask].sum(axis=0, dtype=np.float64)
         else:
             self.ref_pos_sum += components.positions[mask].sum(axis=0, dtype=np.float64)
         self.count += int(mask.sum())
-
-    def merge(self, other):
-        if other.count <= 0:
-            return
-
-        fields = [
-            "x_sum",
-            "x_sumsq",
-            "x_rvel_sum",
-            "x_rvel_sumsq",
-            "x_rang_sum",
-            "x_rang_sumsq",
-            "x_hip_pos_sum",
-            "x_hip_pos_sumsq",
-            "x_rot_6d_sum",
-            "x_rot_6d_sumsq",
-            "x_hip_vel_sum",
-            "x_hip_vel_sumsq",
-            "x_ang_sum",
-            "x_ang_sumsq",
-            "x_contacts_sum",
-            "x_contacts_sumsq",
-            "ref_pos_sum",
-        ]
-        for field in fields:
-            current = getattr(self, field)
-            incoming = getattr(other, field)
-            if incoming is None:
-                continue
-            if current is None:
-                setattr(self, field, incoming.copy())
-            else:
-                current += incoming
-        self.count += other.count
 
     def finalize(self, names):
         if self.count <= 0:
@@ -175,30 +106,26 @@ class FeatureStatsAccumulator:
             return mean, std
 
         x_mean, x_std = mean_and_std(self.x_sum, self.x_sumsq)
-        x_rvel_mean, x_rvel_std = mean_and_std(self.x_rvel_sum, self.x_rvel_sumsq)
-        x_rang_mean, x_rang_std = mean_and_std(self.x_rang_sum, self.x_rang_sumsq)
-        x_hip_pos_mean, x_hip_pos_std = mean_and_std(self.x_hip_pos_sum, self.x_hip_pos_sumsq)
-        x_rot_6d_mean, x_rot_6d_std = mean_and_std(self.x_rot_6d_sum, self.x_rot_6d_sumsq)
-        x_hip_vel_mean, x_hip_vel_std = mean_and_std(self.x_hip_vel_sum, self.x_hip_vel_sumsq)
-        x_ang_mean, x_ang_std = mean_and_std(self.x_ang_sum, self.x_ang_sumsq)
-        x_contacts_mean, x_contacts_std = mean_and_std(self.x_contacts_sum, self.x_contacts_sumsq)
+        nbones = len(names)
+        rot_stop = 9 + (nbones - 1) * 6
+        hip_vel_stop = rot_stop + 3
+        angular_stop = hip_vel_stop + (nbones - 1) * 3
 
         scale = np.concatenate(
             [
-                np.full(3, x_rvel_std.mean(), dtype=np.float32),
-                np.full(3, x_rang_std.mean(), dtype=np.float32),
-                np.full(3, x_hip_pos_std.mean(), dtype=np.float32),
-                np.full(x_rot_6d_mean.shape[0], x_rot_6d_std.mean(), dtype=np.float32),
-                np.full(3, x_hip_vel_std.mean(), dtype=np.float32),
-                np.full(x_ang_mean.shape[0], x_ang_std.mean(), dtype=np.float32),
-                np.full(2, x_contacts_std.mean(), dtype=np.float32),
+                np.full(3, x_std[0:3].mean(), dtype=np.float32),
+                np.full(3, x_std[3:6].mean(), dtype=np.float32),
+                np.full(3, x_std[6:9].mean(), dtype=np.float32),
+                np.full(rot_stop - 9, x_std[9:rot_stop].mean(), dtype=np.float32),
+                np.full(3, x_std[rot_stop:hip_vel_stop].mean(), dtype=np.float32),
+                np.full(angular_stop - hip_vel_stop, x_std[hip_vel_stop:angular_stop].mean(), dtype=np.float32),
+                np.full(2, x_std[angular_stop:].mean(), dtype=np.float32),
             ],
             axis=0,
         ).astype(np.float32)
         scale = np.maximum(scale, 1e-8)
 
         joint_weights = default_joint_weights(names)
-        nbones = len(names)
         weights = np.concatenate(
             [
                 np.ones(3, dtype=np.float32),
@@ -223,20 +150,7 @@ class FeatureStatsAccumulator:
         )
 
 
-def _build_stats_shard(task):
-    spec, train_mask, prune_ends_and_fingers = task
-    motion = _process_motion(
-        spec["path"],
-        spec["mirror"],
-        prune_ends_and_fingers=prune_ends_and_fingers,
-    )
-    components = build_motion_feature_components(motion)
-    accumulator = FeatureStatsAccumulator()
-    accumulator.update(components, train_mask)
-    return motion["names"], motion["parents"], accumulator
-
-
-def _build_shard_specs(dataset_name, styles_arg, max_styles, prune_ends_and_fingers):
+def _build_shard_specs(dataset_name, styles_arg, max_styles):
     if dataset_name == "lafan":
         tags_data = build_lafan_tags()
     else:
@@ -254,16 +168,16 @@ def _build_shard_specs(dataset_name, styles_arg, max_styles, prune_ends_and_fing
     if not bvh_paths:
         raise FileNotFoundError(f"No BVH files found for dataset {dataset_name}")
 
-    return [
+    shard_specs = [
         {
             "range_name": path.stem,
             "mirror": bool(mirror),
             "nframes": int(bvh.read_frame_count(path)),
-            "path": path,
         }
         for path in bvh_paths
         for mirror in [False, True]
     ]
+    return shard_specs, tags_data, bvh_paths
 
 
 def _build_split_windows(shard_specs, window_size, seed):
@@ -316,75 +230,89 @@ def _save_motion_shard(output_dir: Path, shard_idx: int, motion: np.ndarray) -> 
     return motion_rel.as_posix()
 
 
-def _write_motion_shard(task):
-    shard_idx, spec, prune_ends_and_fingers, stats, output_dir = task
-    motion = _process_motion(
-        spec["path"],
-        spec["mirror"],
-        prune_ends_and_fingers=prune_ends_and_fingers,
+def _normalize_motion_shard(path: Path, stats: MotionFeatureStats, chunk_size: int = 16384) -> None:
+    motion = np.load(path, mmap_mode="r+")
+    if motion.ndim != 2 or motion.shape[1] != stats.offset.shape[0]:
+        raise ValueError(f"Unexpected raw feature shard shape at {path}: {motion.shape}")
+    for start in range(0, len(motion), chunk_size):
+        stop = min(start + chunk_size, len(motion))
+        motion[start:stop] = (motion[start:stop] - stats.offset) / stats.scale
+    motion.flush()
+
+
+def build_processed_data(
+    dataset_name,
+    output_dir,
+    styles_arg=None,
+    max_styles=None,
+    prune_ends_and_fingers=False,
+    window_size=64,
+    seed=3407,
+    workers=1,
+):
+    output_dir = Path(output_dir)
+    feature_dir = output_dir / "feature_database"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    shard_specs, tags_data, bvh_paths = _build_shard_specs(
+        dataset_name=dataset_name,
+        styles_arg=styles_arg,
+        max_styles=max_styles,
     )
-    components = build_motion_feature_components(motion)
-    norm_x = ((components.x.astype(np.float32) - stats.offset) / stats.scale).astype(np.float32)
-    return shard_idx, _save_motion_shard(output_dir, shard_idx, norm_x)
-
-
-def _map_tasks(fn, tasks, workers, desc):
-    if workers == 1:
-        for task in tqdm(tasks, desc=desc):
-            yield fn(task)
-        return
-
-    context = mp.get_context("fork")
-    chunksize = max(1, len(tasks) // (workers * 4))
-    with ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
-        yield from tqdm(executor.map(fn, tasks, chunksize=chunksize), total=len(tasks), desc=desc)
-
-
-def main():
-    args = parse_args()
-    args.output.mkdir(parents=True, exist_ok=True)
-
-    shard_specs = _build_shard_specs(
-        dataset_name=args.dataset,
-        styles_arg=args.styles,
-        max_styles=args.max_styles,
-        prune_ends_and_fingers=args.prune_ends_and_fingers,
-    )
-    split_windows = _build_split_windows(shard_specs, window_size=args.window_size, seed=args.seed)
+    split_windows = _build_split_windows(shard_specs, window_size=window_size, seed=seed)
 
     train_frame_masks = [np.zeros(spec["nframes"], dtype=bool) for spec in shard_specs]
     for shard_idx, start_idx, end_idx, _range_idx in split_windows["train_windows"].tolist():
         train_frame_masks[int(shard_idx)][int(start_idx):int(end_idx)] = True
 
-    stats_tasks = [
-        (spec, train_frame_masks[shard_idx], args.prune_ends_and_fingers)
-        for shard_idx, spec in enumerate(shard_specs)
-    ]
-
     stats_acc = FeatureStatsAccumulator()
     names = None
     parents = None
-    joint_subset = "prune_ends_and_fingers" if args.prune_ends_and_fingers else "full"
+    joint_subset = "prune_ends_and_fingers" if prune_ends_and_fingers else "full"
+    motion_files = []
+    database_path = output_dir / "database.npz"
+    database = MotionDatabaseWriter(
+        database_path,
+        total_frames=sum(spec["nframes"] for spec in shard_specs),
+        tags_data=tags_data,
+        prune_ends_and_fingers=prune_ends_and_fingers,
+    )
 
-    workers = max(1, int(args.workers))
-    for result_names, result_parents, result_acc in _map_tasks(_build_stats_shard, stats_tasks, workers, "Building stats"):
-        if names is None:
-            names = result_names
-            parents = result_parents
-        stats_acc.merge(result_acc)
+    shard_idx = 0
+    for range_name, motions in iter_motion_pairs(
+        bvh_paths,
+        prune_ends_and_fingers=prune_ends_and_fingers,
+        workers=workers,
+        desc="Building motion + features",
+    ):
+        for mirror, motion in motions:
+            spec = shard_specs[shard_idx]
+            if (range_name, mirror) != (spec["range_name"], spec["mirror"]):
+                raise ValueError(f"Unexpected motion order at shard {shard_idx}: {range_name}, mirror={mirror}")
+            expected_frames = int(spec["nframes"])
+            if len(motion["positions"]) != expected_frames:
+                raise ValueError(
+                    f"Frame count changed for {range_name} (mirror={mirror}): "
+                    f"metadata={expected_frames}, processed={len(motion['positions'])}"
+                )
+            if names is None:
+                names = motion["names"]
+                parents = motion["parents"]
+            elif names != motion["names"] or not np.array_equal(parents, motion["parents"]):
+                raise ValueError(f"Skeleton mismatch while processing {range_name} (mirror={mirror})")
+
+            components = build_motion_feature_components(motion)
+            stats_acc.update(components, train_frame_masks[shard_idx])
+            motion_files.append(_save_motion_shard(feature_dir, shard_idx, components.x))
+            database.add(range_name, mirror, motion)
+            shard_idx += 1
 
     stats = stats_acc.finalize(names)
+    if shard_idx != len(shard_specs):
+        raise ValueError(f"Expected {len(shard_specs)} motion shards, processed {shard_idx}")
+    for motion_rel in tqdm(motion_files, desc="Normalizing features"):
+        _normalize_motion_shard(feature_dir / motion_rel, stats)
 
-    write_tasks = [
-        (shard_idx, spec, args.prune_ends_and_fingers, stats, args.output)
-        for shard_idx, spec in enumerate(shard_specs)
-    ]
-    motion_files = [None] * len(write_tasks)
-    for shard_idx, motion_rel in _map_tasks(_write_motion_shard, write_tasks, workers, "Writing motion"):
-        motion_files[shard_idx] = motion_rel
-    missing_motion = [idx for idx, path in enumerate(motion_files) if path is None]
-    if missing_motion:
-        raise RuntimeError(f"Missing motion shards: {missing_motion}")
+    database.save()
 
     stats_payload = serialize_motion_feature_stats(stats, names=names, parents=parents, joint_subset=joint_subset)
     metadata = {
@@ -394,18 +322,16 @@ def main():
         "test_windows": split_windows["test_windows"],
         "range_names": np.asarray([spec["range_name"] for spec in shard_specs], dtype=object),
         "range_mirror": np.asarray([spec["mirror"] for spec in shard_specs], dtype=bool),
-        "window_size": np.asarray(args.window_size, dtype=np.int32),
+        "window_size": np.asarray(window_size, dtype=np.int32),
         "motion_dim": np.asarray(stats.offset.shape[0], dtype=np.int32),
+        "source_database": np.asarray(str(database_path), dtype=object),
     }
     metadata.update(stats_payload)
-    np.savez(args.output / "metadata.npz", **metadata)
+    np.savez(feature_dir / "metadata.npz", **metadata)
 
-    print(f"saved={args.output}")
+    print(f"saved={output_dir}")
+    print(f"database={database_path}")
     print(f"motion_files={len(motion_files)}")
     print(f"train_windows={len(split_windows['train_windows'])}")
     print(f"val_windows={len(split_windows['val_windows'])}")
     print(f"test_windows={len(split_windows['test_windows'])}")
-
-
-if __name__ == "__main__":
-    main()

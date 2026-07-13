@@ -9,8 +9,6 @@ import numpy as np
 from preprocess import quat
 
 
-DEFAULT_PRUNED_DATABASE = Path("data/processed/100style_test5_pruned/database.npz")
-DEFAULT_FULL_DATABASE = Path("data/processed/100style_test5/database.npz")
 SPLIT_NAMES = ("train", "val", "test")
 
 
@@ -48,12 +46,6 @@ class MotionFeatureComponents:
     x_hip_vel: np.ndarray
     x_ang_local: np.ndarray
     x_contacts: np.ndarray
-
-
-def resolve_database_path(use_full_skeleton: bool = False, database_path: str | Path | None = None) -> Path:
-    if database_path is not None:
-        return Path(database_path)
-    return DEFAULT_FULL_DATABASE if use_full_skeleton else DEFAULT_PRUNED_DATABASE
 
 
 def load_database(database_path: str | Path) -> dict[str, np.ndarray]:

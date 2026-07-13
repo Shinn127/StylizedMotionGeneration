@@ -1,21 +1,20 @@
-import argparse
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 import csv
+from itertools import islice
 import multiprocessing as mp
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import scipy.ndimage as ndimage
 import scipy.signal as signal
 from tqdm import tqdm
 
-import bvh
-import quat
+from preprocess import bvh, quat
 
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-RAW_DIR = DATA_DIR / "raw"
-PROCESSED_DIR = DATA_DIR / "processed"
+RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
 
 LAFAN_SOURCE = RAW_DIR / "lafan"
 STYLE100_SOURCE = RAW_DIR / "100style"
@@ -130,8 +129,7 @@ def _compute_contacts(global_velocities, bone_names):
     return contacts
 
 
-def _process_motion(path, mirror, prune_ends_and_fingers=False):
-    bvh_data = bvh.load(path.as_posix())
+def _process_motion_data(bvh_data, mirror, prune_ends_and_fingers=False):
     positions = bvh_data["positions"].astype(np.float32) * 0.01
     rotations = quat.unroll(quat.from_euler(np.radians(bvh_data["rotations"]), order=bvh_data["order"])).astype(np.float32)
     names, parents, positions, rotations = _prune_skeleton(
@@ -166,41 +164,153 @@ def _process_motion(path, mirror, prune_ends_and_fingers=False):
     }
 
 
-
-
 def _process_motion_pair(task):
     path, prune_ends_and_fingers = task
+    bvh_data = bvh.load(path.as_posix())
     motions = []
     for mirror in [False, True]:
-        motion = _process_motion(path, mirror, prune_ends_and_fingers=prune_ends_and_fingers)
+        motion = _process_motion_data(bvh_data, mirror, prune_ends_and_fingers=prune_ends_and_fingers)
         motions.append((mirror, motion))
     return path.stem, motions
 
 
-def _process_all_motion_pairs(bvh_paths, prune_ends_and_fingers, workers):
-    workers = max(1, int(workers))
+def iter_motion_pairs(bvh_paths, prune_ends_and_fingers, workers, desc="Processing motions"):
+    if workers < 1:
+        raise ValueError(f"workers must be positive, got {workers}")
     tasks = [(path, prune_ends_and_fingers) for path in bvh_paths]
     if workers == 1:
-        results = (_process_motion_pair(task) for task in tqdm(tasks, desc="Processing motions"))
-        return list(results)
+        for task in tqdm(tasks, desc=desc):
+            yield _process_motion_pair(task)
+        return
 
     context = mp.get_context("fork")
-    chunksize = max(1, len(tasks) // (workers * 4))
     with ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
-        results = executor.map(_process_motion_pair, tasks, chunksize=chunksize)
-        return list(tqdm(results, total=len(tasks), desc="Processing motions"))
+        task_iter = iter(tasks)
+        pending = deque(executor.submit(_process_motion_pair, task) for task in islice(task_iter, workers))
+        with tqdm(total=len(tasks), desc=desc) as progress:
+            while pending:
+                yield pending.popleft().result()
+                progress.update()
+                task = next(task_iter, None)
+                if task is not None:
+                    pending.append(executor.submit(_process_motion_pair, task))
+
+
+class MotionDatabaseWriter:
+    def __init__(self, output_path, total_frames, tags_data, prune_ends_and_fingers):
+        self.output_path = Path(output_path)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.total_frames = int(total_frames)
+        self.tags_by_range = {}
+        for range_name, tag, start, stop in tags_data:
+            self.tags_by_range.setdefault(range_name, []).append((tag, start, stop))
+
+        self.prune_ends_and_fingers = bool(prune_ends_and_fingers)
+        self._temp_dir = TemporaryDirectory(prefix=".database-", dir=self.output_path.parent)
+        self._arrays = None
+        self.offset = 0
+        self.range_starts = []
+        self.range_stops = []
+        self.range_names = []
+        self.range_mirror = []
+        self.tag_range_starts = []
+        self.tag_range_stops = []
+        self.tag_range_names = []
+        self.tag_tags = []
+        self.tag_mirror = []
+        self.bone_parents = None
+        self.bone_names = None
+
+    def _allocate(self, motion):
+        num_joints = motion["positions"].shape[1]
+        root = Path(self._temp_dir.name)
+        self._arrays = {
+            "positions": np.lib.format.open_memmap(
+                root / "positions.npy", mode="w+", dtype=np.float32, shape=(self.total_frames, num_joints, 3)
+            ),
+            "velocities": np.lib.format.open_memmap(
+                root / "velocities.npy", mode="w+", dtype=np.float32, shape=(self.total_frames, num_joints, 3)
+            ),
+            "rotations": np.lib.format.open_memmap(
+                root / "rotations.npy", mode="w+", dtype=np.float32, shape=(self.total_frames, num_joints, 4)
+            ),
+            "angular_velocities": np.lib.format.open_memmap(
+                root / "angular_velocities.npy",
+                mode="w+",
+                dtype=np.float32,
+                shape=(self.total_frames, num_joints, 3),
+            ),
+            "contacts": np.lib.format.open_memmap(
+                root / "contacts.npy", mode="w+", dtype=np.uint8, shape=(self.total_frames, 2)
+            ),
+        }
+
+    def add(self, range_name, mirror, motion):
+        if self.bone_parents is None:
+            self.bone_parents = motion["parents"]
+            self.bone_names = motion["names"]
+            self._allocate(motion)
+        elif not np.array_equal(self.bone_parents, motion["parents"]) or self.bone_names != motion["names"]:
+            raise ValueError(f"Skeleton mismatch while processing {range_name} (mirror={mirror})")
+
+        nframes = len(motion["positions"])
+        stop = self.offset + nframes
+        if stop > self.total_frames:
+            raise ValueError(f"Motion stream exceeds declared frame count {self.total_frames}")
+        for key, array in self._arrays.items():
+            array[self.offset:stop] = motion[key]
+
+        self.range_starts.append(self.offset)
+        self.range_stops.append(stop)
+        self.range_names.append(range_name)
+        self.range_mirror.append(mirror)
+
+        for tag, tag_start, tag_stop in self.tags_by_range.get(range_name, []):
+            tag_stop = nframes if tag_stop is None else min(tag_stop, nframes)
+            self.tag_range_starts.append(self.offset + tag_start)
+            self.tag_range_stops.append(self.offset + tag_stop)
+            self.tag_range_names.append(range_name)
+            self.tag_tags.append(tag)
+            self.tag_mirror.append(mirror)
+        self.offset = stop
+
+    def save(self):
+        if self._arrays is None or self.offset != self.total_frames:
+            raise ValueError(f"Expected {self.total_frames} frames, wrote {self.offset}")
+        for array in self._arrays.values():
+            array.flush()
+        np.savez(
+            self.output_path,
+            positions=self._arrays["positions"],
+            velocities=self._arrays["velocities"],
+            rotations=self._arrays["rotations"],
+            angular_velocities=self._arrays["angular_velocities"],
+            parents=self.bone_parents.astype(np.int32),
+            names=self.bone_names,
+            range_starts=np.asarray(self.range_starts, dtype=np.int32),
+            range_stops=np.asarray(self.range_stops, dtype=np.int32),
+            range_mirror=np.asarray(self.range_mirror, dtype=bool),
+            range_names=np.asarray(self.range_names, dtype=object),
+            contacts=self._arrays["contacts"],
+            tag_range_starts=np.asarray(self.tag_range_starts, dtype=np.int32),
+            tag_range_stops=np.asarray(self.tag_range_stops, dtype=np.int32),
+            tag_range_names=np.asarray(self.tag_range_names, dtype=object),
+            tag_tags=np.asarray(self.tag_tags, dtype=object),
+            tag_mirror=np.asarray(self.tag_mirror, dtype=bool),
+            joint_subset=np.asarray(
+                "prune_ends_and_fingers" if self.prune_ends_and_fingers else "full",
+                dtype=object,
+            ),
+        )
+        self._arrays = None
+        self._temp_dir.cleanup()
+
 
 def build_lafan_tags():
     tags = []
     for path in sorted(LAFAN_SOURCE.glob("*.bvh")):
         tags.append((path.stem, "all", 0, None))
     return tags
-
-
-def _parse_style_filter(styles_arg):
-    if not styles_arg:
-        return None
-    return {style.strip() for style in styles_arg.split(",") if style.strip()}
 
 
 def build_100style_tags(style_filter=None, max_styles=None):
@@ -238,147 +348,3 @@ def source_path_for(dataset_name, range_name):
         style_name, _sep, clip = range_name.rpartition("_")
         return STYLE100_SOURCE / style_name / f"{range_name}.bvh"
     raise ValueError(f"Unsupported dataset: {dataset_name}")
-
-
-def generate_database(dataset_name, output_dir, styles_arg=None, max_styles=None, prune_ends_and_fingers=False, workers=1):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if dataset_name == "lafan":
-        tags_data = build_lafan_tags()
-    else:
-        tags_data = build_100style_tags(
-            style_filter=_parse_style_filter(styles_arg),
-            max_styles=max_styles,
-        )
-
-    bvh_paths = []
-    for range_name, tag, _range_start, _range_end in tags_data:
-        if tag != "all":
-            continue
-        bvh_paths.append(source_path_for(dataset_name, range_name))
-    bvh_paths = list(dict.fromkeys(bvh_paths))
-
-    if not bvh_paths:
-        raise FileNotFoundError(f"No BVH files found for dataset {dataset_name}")
-
-    bone_positions = []
-    bone_velocities = []
-    bone_rotations = []
-    bone_angular_velocities = []
-    contact_states = []
-
-    range_starts = []
-    range_stops = []
-    range_names = []
-    range_mirror = []
-
-    tag_range_starts = []
-    tag_range_stops = []
-    tag_range_names = []
-    tag_tags = []
-    tag_mirror = []
-
-    bone_parents = None
-    bone_names = None
-
-    motion_pairs = _process_all_motion_pairs(bvh_paths, prune_ends_and_fingers, workers=workers)
-
-    for range_name, motions in motion_pairs:
-        for mirror, motion in motions:
-            if bone_parents is None:
-                bone_parents = motion["parents"]
-                bone_names = motion["names"]
-
-            offset = 0 if not range_starts else range_stops[-1]
-            nframes = len(motion["positions"])
-
-            bone_positions.append(motion["positions"])
-            bone_velocities.append(motion["velocities"])
-            bone_rotations.append(motion["rotations"])
-            bone_angular_velocities.append(motion["angular_velocities"])
-            contact_states.append(motion["contacts"])
-
-            range_starts.append(offset)
-            range_stops.append(offset + nframes)
-            range_names.append(range_name)
-            range_mirror.append(mirror)
-
-            for tag_range_name, tag, tag_start_in_bvh, tag_stop_in_bvh in tags_data:
-                if tag_range_name != range_name:
-                    continue
-                if tag_stop_in_bvh is None:
-                    tag_stop_in_bvh = nframes
-                tag_range_starts.append(offset + tag_start_in_bvh)
-                tag_range_stops.append(offset + min(tag_stop_in_bvh, nframes))
-                tag_range_names.append(tag_range_name)
-                tag_tags.append(tag)
-                tag_mirror.append(mirror)
-
-    np.savez(
-        output_dir / "database.npz",
-        positions=np.concatenate(bone_positions, axis=0).astype(np.float32),
-        velocities=np.concatenate(bone_velocities, axis=0).astype(np.float32),
-        rotations=np.concatenate(bone_rotations, axis=0).astype(np.float32),
-        angular_velocities=np.concatenate(bone_angular_velocities, axis=0).astype(np.float32),
-        parents=bone_parents.astype(np.int32),
-        names=bone_names,
-        range_starts=np.array(range_starts).astype(np.int32),
-        range_stops=np.array(range_stops).astype(np.int32),
-        range_mirror=np.array(range_mirror).astype(bool),
-        range_names=np.array(range_names, dtype=object),
-        contacts=np.concatenate(contact_states, axis=0).astype(np.uint8),
-        tag_range_starts=np.array(tag_range_starts).astype(np.int32),
-        tag_range_stops=np.array(tag_range_stops).astype(np.int32),
-        tag_range_names=np.array(tag_range_names, dtype=object),
-        tag_tags=np.array(tag_tags, dtype=object),
-        tag_mirror=np.array(tag_mirror).astype(bool),
-        joint_subset=np.array(
-            "prune_ends_and_fingers" if prune_ends_and_fingers else "full",
-            dtype=object,
-        ),
-    )
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Build local motion database from linked raw datasets.")
-    parser.add_argument("--dataset", choices=["lafan", "100style"], required=True)
-    parser.add_argument("--output", type=Path, default=None, help="Optional output directory.")
-    parser.add_argument(
-        "--styles",
-        type=str,
-        default=None,
-        help="Comma-separated 100style subset, e.g. Aeroplane,Akimbo,Angry.",
-    )
-    parser.add_argument(
-        "--max-styles",
-        type=int,
-        default=None,
-        help="Use only the first N styles from 100style's Frame_Cuts.csv order.",
-    )
-    parser.add_argument(
-        "--prune-ends-and-fingers",
-        action="store_true",
-        help="Exclude all *End terminal joints and all hand finger joint chains before building the database.",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=1,
-        help="Number of worker processes for BVH preprocessing. Use 1 for serial processing.",
-    )
-    args = parser.parse_args()
-
-    default_output = PROCESSED_DIR / args.dataset
-    output_dir = args.output or default_output
-    generate_database(
-        args.dataset,
-        output_dir,
-        styles_arg=args.styles,
-        max_styles=args.max_styles,
-        prune_ends_and_fingers=args.prune_ends_and_fingers,
-        workers=args.workers,
-    )
-    print(f"Saved database to {output_dir / 'database.npz'}")
-
-
-if __name__ == "__main__":
-    main()
