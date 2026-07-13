@@ -243,8 +243,11 @@ python analyze_fsq_patterns.py \
     position_histogram spectrum coordinate_covariance coordinate_cooccurrence \
     lagged_coordination histogram_ngram3 histogram_run_length histogram_position \
     histogram_spectrum histogram_cooccurrence histogram_coordination \
+  --n-jobs 4 --parallel-backend threading \
   --output outputs/evaluations/fsq_20x9_pattern_probes.json
 ```
+
+分析器以 representation 为并行任务。`threading` 共享 token arrays，通常是默认选择；`--n-jobs -1` 会使用全部 CPU，但同时构建多个 4096 维特征时会显著提高峰值内存。`loky` 使用独立进程，隔离更强但需要复制或映射较大的输入数据，建议仅在内存充足且 Python 循环特征成为瓶颈时使用。
 
 用反转、逐帧打乱和 block shuffle 做顺序消融：
 

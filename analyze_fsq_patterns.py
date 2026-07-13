@@ -5,9 +5,11 @@ import json
 from pathlib import Path
 
 import numpy as np
+from joblib import Parallel, delayed
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.neural_network import MLPClassifier
+from threadpoolctl import threadpool_limits
 
 from datasets.fsq_token_dataset import (
     FSQTokenDataset,
@@ -60,6 +62,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spectrum-bins", type=int, default=16)
     parser.add_argument("--coordination-lags", type=int, nargs="+", default=[0, 1, 2, 4, 8])
     parser.add_argument("--block-size", type=int, default=8)
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=4,
+        help="Number of representations evaluated concurrently; -1 uses all CPUs.",
+    )
+    parser.add_argument(
+        "--parallel-backend",
+        choices=("threading", "loky"),
+        default="threading",
+        help="threading shares large token arrays; loky uses processes and more memory.",
+    )
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 
@@ -391,10 +405,61 @@ def summarize_pattern_hypothesis(reports: list[dict[str, object]]) -> dict[str, 
     }
 
 
+def analyze_representation(
+    representation: str,
+    split_data: dict[str, dict[str, np.ndarray]] | None,
+    all_data: dict[str, np.ndarray],
+    num_levels: int,
+    action_names: list[str],
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    all_features = build_features(all_data["indices"], representation, num_levels, args.seed + 2, args)
+    if split_data is not None:
+        train_features = build_features(
+            split_data["train"]["indices"], representation, num_levels, args.seed, args
+        )
+        test_features = build_features(
+            split_data["test"]["indices"], representation, num_levels, args.seed + 1, args
+        )
+        style_standard = standard_probe(
+            train_features,
+            split_data["train"]["style_ids"],
+            test_features,
+            split_data["test"]["style_ids"],
+            args,
+        )
+        action_standard = standard_probe(
+            train_features,
+            split_data["train"]["action_ids"],
+            test_features,
+            split_data["test"]["action_ids"],
+            args,
+        )
+    else:
+        train_features = all_features
+        style_standard = None
+        action_standard = None
+    return {
+        "representation": representation,
+        "feature_dim": int(train_features.shape[1]),
+        "style_standard_split_balanced_accuracy": style_standard,
+        "action_standard_split_balanced_accuracy": action_standard,
+        "style_held_out_action": held_out_action_probe(
+            all_features,
+            all_data["style_ids"],
+            all_data["action_ids"],
+            action_names,
+            args,
+        ),
+    }
+
+
 def main() -> None:
     args = parse_args()
     if args.max_windows_per_split is not None and args.max_windows_per_split <= 0:
         raise ValueError("--max-windows-per-split must be positive when provided")
+    if args.n_jobs == 0 or args.n_jobs < -1:
+        raise ValueError("--n-jobs must be -1 or a positive integer")
     store = build_fsq_token_store(args.token_database)
     custom_windows = args.window_size is not None
     if custom_windows:
@@ -417,33 +482,23 @@ def main() -> None:
         for key in ("indices", "style_ids", "action_ids")
         }
 
-    reports = []
-    for representation in args.representations:
-        print(f"building_features={representation}")
-        all_features = build_features(all_data["indices"], representation, store.num_levels, args.seed + 2, args)
-        if split_data is not None:
-            train_features = build_features(split_data["train"]["indices"], representation, store.num_levels, args.seed, args)
-            test_features = build_features(split_data["test"]["indices"], representation, store.num_levels, args.seed + 1, args)
-            style_standard = standard_probe(train_features, split_data["train"]["style_ids"], test_features, split_data["test"]["style_ids"], args)
-            action_standard = standard_probe(train_features, split_data["train"]["action_ids"], test_features, split_data["test"]["action_ids"], args)
-        else:
-            train_features = all_features
-            style_standard = None
-            action_standard = None
-        report = {
-            "representation": representation,
-            "feature_dim": int(train_features.shape[1]),
-            "style_standard_split_balanced_accuracy": style_standard,
-            "action_standard_split_balanced_accuracy": action_standard,
-            "style_held_out_action": held_out_action_probe(
-                all_features,
-                all_data["style_ids"],
-                all_data["action_ids"],
+    print(
+        f"parallel_backend={args.parallel_backend} n_jobs={args.n_jobs} "
+        f"num_representations={len(args.representations)}"
+    )
+    with threadpool_limits(limits=1):
+        reports = Parallel(n_jobs=args.n_jobs, backend=args.parallel_backend)(
+            delayed(analyze_representation)(
+                representation,
+                split_data,
+                all_data,
+                store.num_levels,
                 store.action_names,
                 args,
-            ),
-        }
-        reports.append(report)
+            )
+            for representation in args.representations
+        )
+    for report in reports:
         print(json.dumps(report, indent=2))
 
     result = {
@@ -456,6 +511,8 @@ def main() -> None:
         "action_names": store.action_names,
         "analysis_window_size": int(all_data["indices"].shape[1]),
         "probe_model": args.probe_model,
+        "parallel_backend": args.parallel_backend,
+        "n_jobs": args.n_jobs,
         "standard_split_available": split_data is not None,
         "num_windows": ({split: len(split_data[split]["indices"]) for split in ("train", "val", "test")} if split_data is not None else {"all": len(all_data["indices"])}),
         "reports": reports,
