@@ -7,13 +7,35 @@ import yaml
 
 from evaluate_fsq_generator import _distribution_js, decoded_rollout_metrics
 from models.fsq import FSQMotionAutoencoder
-from models.fsq_generator import FSQCausalTransformerGenerator, FSQGeneratorCache
+from models.fsq_generator import (
+    FSQCausalTransformerGenerator,
+    FSQConditionalTransformerGenerator,
+    FSQGeneratorCache,
+)
 
 
 def build_small_generator(context_frames: int = 8) -> FSQCausalTransformerGenerator:
     return FSQCausalTransformerGenerator(
         num_coordinates=3,
         num_levels=4,
+        coordinate_embedding_dim=4,
+        dim=32,
+        num_layers=2,
+        num_query_heads=4,
+        num_kv_heads=2,
+        ff_dim=64,
+        dropout=0.0,
+        context_frames=context_frames,
+    )
+
+
+def build_small_conditional_generator(context_frames: int = 8) -> FSQConditionalTransformerGenerator:
+    return FSQConditionalTransformerGenerator(
+        num_coordinates=3,
+        num_levels=4,
+        num_styles=5,
+        trajectory_dim=18,
+        trajectory_hidden_dim=16,
         coordinate_embedding_dim=4,
         dim=32,
         num_layers=2,
@@ -78,6 +100,57 @@ def test_kv_cache_is_bounded_while_absolute_position_advances():
     assert cache.length == 4
     assert cache.next_position == 13
     assert all(key.shape[-2] == 4 and value.shape[-2] == 4 for key, value in cache.layers)
+
+
+def test_conditional_prefix_cache_matches_full_forward_and_remains_persistent():
+    torch.manual_seed(23)
+    model = build_small_conditional_generator(context_frames=4).eval()
+    indices = torch.randint(0, 4, (2, 8, 3))
+    styles = torch.tensor([1, 3])
+    trajectory = torch.randn(2, 8, 18)
+    valid = torch.ones(2, 8, dtype=torch.bool)
+    with torch.inference_mode():
+        full_logits = model(
+            indices[:, :4],
+            style_ids=styles,
+            trajectory=trajectory[:, :4],
+            trajectory_valid=valid[:, :4],
+        )["logits"]
+        logits, cache = model.prefill(
+            indices[:, :1],
+            style_ids=styles,
+            seed_trajectory=trajectory[:, :1],
+            seed_trajectory_valid=valid[:, :1],
+        )
+        cached_logits = [logits[:, None]]
+        for frame in range(1, indices.shape[1]):
+            logits, cache = model.decode_step(
+                indices[:, frame],
+                cache,
+                trajectory=trajectory[:, frame],
+                trajectory_valid=valid[:, frame],
+            )
+            if frame < 4:
+                cached_logits.append(logits[:, None])
+    torch.testing.assert_close(full_logits, torch.cat(cached_logits, dim=1), rtol=1e-5, atol=1e-6)
+    assert cache.prefix_length == 1
+    assert cache.motion_length == 4
+    assert cache.length == 5
+    assert cache.next_position == 8
+
+
+def test_conditional_trajectory_changes_logits():
+    torch.manual_seed(29)
+    model = build_small_conditional_generator().eval()
+    indices = torch.randint(0, 4, (1, 4, 3))
+    style = torch.tensor([2])
+    zero = torch.zeros(1, 4, 18)
+    active = torch.ones(1, 4, 18)
+    valid = torch.ones(1, 4, dtype=torch.bool)
+    with torch.inference_mode():
+        zero_logits = model(indices, style_ids=style, trajectory=zero, trajectory_valid=valid)["logits"]
+        active_logits = model(indices, style_ids=style, trajectory=active, trajectory_valid=valid)["logits"]
+    assert not torch.allclose(zero_logits, active_logits)
 
 
 def test_greedy_generation_is_deterministic_and_produces_valid_levels():

@@ -278,6 +278,69 @@ conda run -n mcc python evaluate_fsq_style_gate.py \
 
 Gate checkpoint 会记录冻结 tokenizer 的 SHA256；评估时若 token database 来自不同 checkpoint，会直接拒绝运行。
 
+## FSQ Transformer 与控制接口
+
+先在冻结的全量 FSQ token 上训练无条件因果 Transformer。它预测下一帧的 20 个 FSQ level，并保留 64 帧 KV cache：
+
+```bash
+conda run -n mcc python train_fsq_generator.py \
+  --config configs/fsq_generator.yaml
+```
+
+在此基础上，条件模型不改变 FSQ tokenizer：style label 被编码为一个持续保留在 KV cache 首位的 prefix token；轨迹是每帧 18-D root-local 控制，布局为 `pos(+20,+40,+60), dir(+20,+40,+60)`。每个输入 token `x_t` 接收目标帧 `t+1` 的轨迹，因此新 command 会影响下一次采样，而非天然滞后一帧。
+
+先从全量 motion database 构建并对齐轨迹：
+
+```bash
+conda run -n mcc python preprocess/build_trajectory_inputs.py \
+  --dataset 100style \
+  --database data/processed/100style_pruned/database.npz \
+  --tags all \
+  --future-frames 20,40,60 \
+  --workers 8 \
+  --output data/processed/100style_pruned/trajectory.npz
+
+conda run -n mcc python preprocess/build_fsq_trajectory_database.py \
+  --token-database data/processed/100style_pruned/fsq_20x9_full_loss \
+  --trajectory-input data/processed/100style_pruned/trajectory.npz \
+  --output data/processed/100style_pruned/fsq_20x9_full_loss_trajectory_20_40_60
+```
+
+训练条件模型（base Transformer 低学习率微调，style/trajectory branch 使用较高学习率）：
+
+```bash
+conda run -n mcc python train_fsq_conditional_generator.py \
+  --config configs/fsq_generator_conditional.yaml
+```
+
+它会把 train-window trajectory normalization、style vocabulary、parent generator 和 tokenizer SHA 一并写入 `outputs/fsq_generator_conditional/best.pt`。先检查条件是否真正被使用：
+
+```bash
+conda run -n mcc python evaluate_fsq_conditional_generator.py \
+  --checkpoint outputs/fsq_generator_conditional/best.pt \
+  --token-database data/processed/100style_pruned/fsq_20x9_full_loss \
+  --trajectory-database data/processed/100style_pruned/fsq_20x9_full_loss_trajectory_20_40_60 \
+  --split test \
+  --output outputs/evaluations/fsq_conditional_test.json
+```
+
+报告会并列真实条件、打乱 style、置零 trajectory、打乱 trajectory 的 teacher-forced NLL；这比只报告条件模型本身的 NLL 更直接检验控制分支是否生效。
+
+`realtime_fsq_controller.py` 同时支持无条件和条件 checkpoint。参考轨迹模式的最小 dry run：
+
+```bash
+conda run -n mcc python realtime_fsq_controller.py \
+  --generator-checkpoint outputs/fsq_generator_conditional/best.pt \
+  --token-database data/processed/100style_pruned/fsq_20x9_full_loss \
+  --fsq-checkpoint outputs/fsq_pruned_frame_causal_cnn_20x9_full_loss/best.pt \
+  --trajectory-database data/processed/100style_pruned/fsq_20x9_full_loss_trajectory_20_40_60 \
+  --style-id 0 \
+  --range-idx 0 --start 128 --seed-frames 64 \
+  --dry-run --dry-run-frames 120
+```
+
+程序化 controller 还提供 `set_style(style_id)` 和 `set_trajectory_control(raw_18d)`：两者都会用最近 64 帧 token/command history 重建 cache，使新的 style 或 trajectory 在下一帧采样生效。`set_trajectory_control` 的输入是未归一化的上述 18-D root-local layout。
+
 ## 可视化
 
 ### 原始数据库

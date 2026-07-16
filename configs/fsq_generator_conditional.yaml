@@ -1,0 +1,45 @@
+# 1) Build raw controls from the full database:
+# python preprocess/build_trajectory_inputs.py --dataset 100style \
+#   --database data/processed/100style_pruned/database.npz --tags all \
+#   --future-frames 20,40,60 --workers 8 \
+#   --output data/processed/100style_pruned/trajectory.npz
+#
+# 2) Align them to FSQ shards:
+# python preprocess/build_fsq_trajectory_database.py \
+#   --token-database data/processed/100style_pruned/fsq_20x9_full_loss \
+#   --trajectory-input data/processed/100style_pruned/trajectory.npz \
+#   --output data/processed/100style_pruned/fsq_20x9_full_loss_trajectory_20_40_60
+
+token_database: data/processed/100style_pruned/fsq_20x9_full_loss
+trajectory_database: data/processed/100style_pruned/fsq_20x9_full_loss_trajectory_20_40_60
+base_checkpoint: outputs/fsq_generator/best.pt
+
+batch_size: 512
+epochs: 40
+base_lr: 0.00003
+condition_lr: 0.0003
+min_lr_ratio: 0.1
+warmup_ratio: 0.05
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.01
+grad_clip_norm: 1.0
+
+# This branch is deliberately small: style is one persistent 256-D prefix;
+# trajectory is an 18-D root-local vector (+20/+40/+60 position and direction)
+# encoded per input token.
+trajectory_hidden_dim: 128
+# During training, drop only earlier control history and preserve the latest
+# command. This matches controller attachment/re-prefill at runtime.
+history_condition_dropout: 0.5
+
+num_workers: 8
+prefetch_factor: 2
+persistent_workers: true
+seed: 3407
+deterministic: false
+early_stop_patience: 12
+device: auto
+
+outdir: outputs/fsq_generator_conditional
+run_name: fsq_generator_style_trajectory_100style

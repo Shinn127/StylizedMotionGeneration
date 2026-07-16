@@ -169,6 +169,10 @@ def build_trajectory_inputs(database_path, output_path, tags=None, future_frames
     tag_range_names = data["tag_range_names"]
     tag_tags = data["tag_tags"]
     tag_mirror = data["tag_mirror"]
+    range_starts = np.asarray(data["range_starts"], dtype=np.int32)
+    range_stops = np.asarray(data["range_stops"], dtype=np.int32)
+    range_names = np.asarray(data["range_names"], dtype=object)
+    range_mirror = np.asarray(data["range_mirror"], dtype=bool)
 
     xroot_pos = data["positions"].astype(np.float32)[:, 0]
     xroot_rot = data["rotations"].astype(np.float32)[:, 0]
@@ -220,7 +224,23 @@ def build_trajectory_inputs(database_path, output_path, tags=None, future_frames
     future_directions = np.concatenate(future_directions, axis=0)
     sample_range_names = np.concatenate(sample_range_names, axis=0)
     sample_mirror = np.concatenate(sample_mirror, axis=0)
-    trajectory = np.concatenate([future_positions, future_directions], axis=-1).reshape(len(indices), -1)
+    # Keep the packed representation explicit and stable for learned control:
+    # [pos(+20), pos(+40), pos(+60), dir(+20), dir(+40), dir(+60)].
+    # Tpos and Tdir remain available for visualization code.
+    trajectory = np.concatenate(
+        [future_positions.reshape(len(indices), -1), future_directions.reshape(len(indices), -1)],
+        axis=-1,
+    )
+
+    # ``indices`` are global database frame indices.  Persist a full-range
+    # identity and a range-local offset as well, so downstream FSQ token shards
+    # can be aligned without relying on a particular global concatenation order.
+    sample_range_indices = np.searchsorted(range_starts, indices, side="right") - 1
+    if np.any(sample_range_indices < 0):
+        raise RuntimeError("Trajectory samples could not be mapped to a database range")
+    if np.any(indices >= range_stops[sample_range_indices]):
+        raise RuntimeError("Trajectory samples crossed a database range boundary")
+    sample_local_indices = indices - range_starts[sample_range_indices]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
@@ -233,6 +253,15 @@ def build_trajectory_inputs(database_path, output_path, tags=None, future_frames
         selected_tags=np.array(selected_tags, dtype=object),
         sample_range_names=sample_range_names,
         sample_mirror=sample_mirror.astype(bool),
+        sample_range_indices=sample_range_indices.astype(np.int32),
+        sample_local_indices=sample_local_indices.astype(np.int32),
+        database_range_names=range_names,
+        database_range_mirror=range_mirror,
+        database_range_starts=range_starts,
+        database_range_stops=range_stops,
+        trajectory_feature_order=np.asarray(
+            "pos(+20,+40,+60),dir(+20,+40,+60)", dtype=object
+        ),
         database_path=np.array(str(database_path), dtype=object),
     )
 
