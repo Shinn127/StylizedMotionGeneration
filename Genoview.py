@@ -810,6 +810,9 @@ class GenoView:
                 return str(name)
         return "unknown"
 
+    def _control_hint(self) -> bytes:
+        return b"Space: play/pause | Left/Right: step | Up/Down: speed | Home/End | Drag timeline"
+
     def _reconstruct_full_local_pose_for(self, positions, rotations, frame_index):
         full_positions = self.full_bind_local_positions.copy()
         full_rotations = self.full_bind_local_rotations.copy()
@@ -1163,7 +1166,7 @@ class GenoView:
                     DrawText(f"Sample: {self.sample_index}".encode(), 10, 130, 20, DARKGRAY)
                     DrawText(f"Mirror: {bool(self.sample_mirror[self.sample_index])}".encode(), 10, 154, 20, DARKGRAY)
                 DrawText(b"Ctrl+LMB/RMB+drag: camera | Wheel: zoom", 10, 184, 18, BLACK)
-                DrawText(b"Space: play/pause | Left/Right: step | Up/Down: speed | Home/End | Drag timeline", 10, 208, 18, BLACK)
+                DrawText(self._control_hint(), 10, 208, 18, BLACK)
                 self.playback.draw_ui(screen_width, screen_height, "Sample" if self.indices is not None else "Frame")
                 EndDrawing()
         finally:

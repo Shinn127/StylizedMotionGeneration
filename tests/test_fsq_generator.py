@@ -11,6 +11,7 @@ from models.fsq_generator import (
     FSQCausalTransformerGenerator,
     FSQConditionalTransformerGenerator,
     FSQGeneratorCache,
+    STYLE_CONDITIONING,
 )
 
 
@@ -102,7 +103,7 @@ def test_kv_cache_is_bounded_while_absolute_position_advances():
     assert all(key.shape[-2] == 4 and value.shape[-2] == 4 for key, value in cache.layers)
 
 
-def test_conditional_prefix_cache_matches_full_forward_and_remains_persistent():
+def test_dynamic_film_conditional_cache_matches_full_forward_without_prefix():
     torch.manual_seed(23)
     model = build_small_conditional_generator(context_frames=4).eval()
     indices = torch.randint(0, 4, (2, 8, 3))
@@ -127,15 +128,16 @@ def test_conditional_prefix_cache_matches_full_forward_and_remains_persistent():
             logits, cache = model.decode_step(
                 indices[:, frame],
                 cache,
+                style_ids=styles,
                 trajectory=trajectory[:, frame],
                 trajectory_valid=valid[:, frame],
             )
             if frame < 4:
                 cached_logits.append(logits[:, None])
     torch.testing.assert_close(full_logits, torch.cat(cached_logits, dim=1), rtol=1e-5, atol=1e-6)
-    assert cache.prefix_length == 1
+    assert cache.prefix_length == 0
     assert cache.motion_length == 4
-    assert cache.length == 5
+    assert cache.length == 4
     assert cache.next_position == 8
 
 
@@ -151,6 +153,66 @@ def test_conditional_trajectory_changes_logits():
         zero_logits = model(indices, style_ids=style, trajectory=zero, trajectory_valid=valid)["logits"]
         active_logits = model(indices, style_ids=style, trajectory=active, trajectory_valid=valid)["logits"]
     assert not torch.allclose(zero_logits, active_logits)
+
+
+def test_conditional_style_film_changes_every_frame():
+    torch.manual_seed(31)
+    model = build_small_conditional_generator().eval()
+    indices = torch.randint(0, 4, (1, 8, 3))
+    trajectory = torch.zeros(1, 8, 18)
+    valid = torch.zeros(1, 8, dtype=torch.bool)
+    with torch.inference_mode():
+        first = model(
+            indices,
+            style_ids=torch.tensor([0]),
+            trajectory=trajectory,
+            trajectory_valid=valid,
+        )["logits"]
+        second = model(
+            indices,
+            style_ids=torch.tensor([1]),
+            trajectory=trajectory,
+            trajectory_valid=valid,
+        )["logits"]
+    per_frame_difference = (first - second).abs().sum(dim=(-1, -2))
+    assert bool((per_frame_difference > 0.0).all())
+
+
+def test_dynamic_style_switch_preserves_cached_history_and_modulates_new_frame():
+    torch.manual_seed(37)
+    model = build_small_conditional_generator(context_frames=4).eval()
+    indices = torch.randint(0, 4, (1, 5, 3))
+    trajectory = torch.randn(1, 5, 18)
+    valid = torch.ones(1, 5, dtype=torch.bool)
+    old_style = torch.tensor([0])
+    new_style = torch.tensor([1])
+    with torch.inference_mode():
+        _, cache = model.prefill(
+            indices[:, :4],
+            style_ids=old_style,
+            seed_trajectory=trajectory[:, :4],
+            seed_trajectory_valid=valid[:, :4],
+        )
+        old_keys = [key.clone() for key, _ in cache.layers]
+        old_logits, _ = model.decode_step(
+            indices[:, 4],
+            cache,
+            style_ids=old_style,
+            trajectory=trajectory[:, 4],
+            trajectory_valid=valid[:, 4],
+        )
+        new_logits, switched_cache = model.decode_step(
+            indices[:, 4],
+            cache,
+            style_ids=new_style,
+            trajectory=trajectory[:, 4],
+            trajectory_valid=valid[:, 4],
+        )
+    assert switched_cache.length == 4
+    assert switched_cache.next_position == cache.next_position + 1
+    for old_key, (switched_key, _) in zip(old_keys, switched_cache.layers):
+        torch.testing.assert_close(switched_key[..., :-1, :], old_key[..., 1:, :])
+    assert bool((old_logits != new_logits).any())
 
 
 def test_greedy_generation_is_deterministic_and_produces_valid_levels():
@@ -205,6 +267,21 @@ def test_default_config_targets_full_dataset_and_batch_512():
         config = yaml.safe_load(handle)
     assert config["token_database"] == "data/processed/100style_pruned/fsq_20x9_full_loss"
     assert config["batch_size"] == 512
+
+
+def test_conditional_config_trains_dynamic_film_model_from_scratch():
+    config_path = Path(__file__).resolve().parents[1] / "configs" / "fsq_generator_conditional.yaml"
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+    assert "base_checkpoint" not in config
+    assert "base_lr" not in config
+    assert "condition_lr" not in config
+    assert "history_condition_dropout" not in config
+    assert config["lr"] == 3e-4
+    assert config["epochs"] == 100
+    assert config["style_embedding_dim"] == 128
+    assert config["outdir"] == "outputs/fsq_generator_conditional_dynamic_film"
+    assert STYLE_CONDITIONING == "causal_dynamic_block_film_v1"
 
 
 def test_distribution_js_handles_empty_bins_without_warnings():

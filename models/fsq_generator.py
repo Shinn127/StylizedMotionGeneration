@@ -11,6 +11,10 @@ import torch.nn.functional as F
 LayerKVCache = tuple[torch.Tensor, torch.Tensor]
 
 
+STYLE_CONDITIONING = "causal_dynamic_block_film_v1"
+STYLE_CACHE_POLICY = "append_only"
+
+
 @dataclass
 class FSQGeneratorCache:
     layers: list[LayerKVCache]
@@ -79,6 +83,42 @@ class SwiGLU(nn.Module):
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         return self.output_projection(F.silu(self.gate_projection(values)) * self.value_projection(values))
+
+
+class DynamicStyleFiLM(nn.Module):
+    """Generate current-frame FiLM parameters from causal state and style."""
+
+    def __init__(self, model_dim: int, style_dim: int, hidden_dim: int | None = None) -> None:
+        super().__init__()
+        if model_dim <= 0 or style_dim <= 0:
+            raise ValueError("model_dim and style_dim must be positive")
+        hidden_dim = min(128, model_dim) if hidden_dim is None else int(hidden_dim)
+        if hidden_dim <= 0:
+            raise ValueError("hidden_dim must be positive")
+        self.model_dim = int(model_dim)
+        self.style_dim = int(style_dim)
+        self.condition_norm = RMSNorm(self.model_dim)
+        self.style_projection = nn.Linear(self.style_dim, self.model_dim, bias=False)
+        self.input_projection = nn.Linear(self.model_dim, hidden_dim)
+        self.output_projection = nn.Linear(hidden_dim, 2 * self.model_dim)
+
+    def forward(
+        self,
+        values: torch.Tensor,
+        style_embedding: torch.Tensor,
+    ) -> torch.Tensor:
+        if values.ndim != 3 or values.shape[-1] != self.model_dim:
+            raise ValueError(f"Expected values [B,T,{self.model_dim}], got {tuple(values.shape)}")
+        if style_embedding.ndim != 2 or style_embedding.shape != (values.shape[0], self.style_dim):
+            raise ValueError(
+                f"style_embedding must have shape [{values.shape[0]},{self.style_dim}], "
+                f"got {tuple(style_embedding.shape)}"
+            )
+        condition = values + self.style_projection(style_embedding)[:, None]
+        condition = self.condition_norm(condition)
+        scale, shift = self.output_projection(F.silu(self.input_projection(condition))).chunk(2, dim=-1)
+        scale = 0.5 * torch.tanh(scale)
+        return values * (1.0 + scale) + shift
 
 
 class GroupedQueryAttention(nn.Module):
@@ -227,6 +267,7 @@ class FSQTransformerBlock(nn.Module):
         rope_theta: float,
         qk_norm: bool,
         norm_eps: float,
+        style_embedding_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.attention_norm = RMSNorm(dim, norm_eps)
@@ -242,6 +283,16 @@ class FSQTransformerBlock(nn.Module):
         self.feed_forward_norm = RMSNorm(dim, norm_eps)
         self.feed_forward = SwiGLU(dim, ff_dim)
         self.dropout = float(dropout)
+        self.attention_film = (
+            None
+            if style_embedding_dim is None
+            else DynamicStyleFiLM(dim, style_embedding_dim)
+        )
+        self.feed_forward_film = (
+            None
+            if style_embedding_dim is None
+            else DynamicStyleFiLM(dim, style_embedding_dim)
+        )
 
     def forward(
         self,
@@ -251,9 +302,18 @@ class FSQTransformerBlock(nn.Module):
         use_cache: bool,
         max_cache_length: int,
         prefix_length: int = 0,
+        style_embedding: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, LayerKVCache | None]:
+        attention_input = self.attention_norm(values)
+        if self.attention_film is None:
+            if style_embedding is not None:
+                raise ValueError("style_embedding was supplied to an unconditional Transformer block")
+        else:
+            if style_embedding is None:
+                raise ValueError("Conditional Transformer blocks require style_embedding")
+            attention_input = self.attention_film(attention_input, style_embedding)
         attention, next_cache = self.attention(
-            self.attention_norm(values),
+            attention_input,
             positions=positions,
             cache=cache,
             use_cache=use_cache,
@@ -261,7 +321,15 @@ class FSQTransformerBlock(nn.Module):
             prefix_length=prefix_length,
         )
         values = values + F.dropout(attention, p=self.dropout, training=self.training)
-        feed_forward = self.feed_forward(self.feed_forward_norm(values))
+        feed_forward_input = self.feed_forward_norm(values)
+        if self.feed_forward_film is None:
+            if style_embedding is not None:
+                raise ValueError("style_embedding was supplied to an unconditional Transformer block")
+        else:
+            if style_embedding is None:
+                raise ValueError("Conditional Transformer blocks require style_embedding")
+            feed_forward_input = self.feed_forward_film(feed_forward_input, style_embedding)
+        feed_forward = self.feed_forward(feed_forward_input)
         values = values + F.dropout(feed_forward, p=self.dropout, training=self.training)
         return values, next_cache
 
@@ -282,6 +350,7 @@ class FSQCausalTransformerGenerator(nn.Module):
         rope_theta: float = 10000.0,
         qk_norm: bool = True,
         norm_eps: float = 1e-5,
+        style_embedding_dim: int | None = None,
     ) -> None:
         super().__init__()
         if num_coordinates <= 0 or num_levels <= 1:
@@ -292,6 +361,10 @@ class FSQCausalTransformerGenerator(nn.Module):
             raise ValueError(f"context_frames must be positive, got {context_frames}")
 
         self.config = {key: value for key, value in locals().items() if key not in {"self", "__class__"}}
+        if style_embedding_dim is None:
+            self.config.pop("style_embedding_dim")
+        elif style_embedding_dim <= 0:
+            raise ValueError("style_embedding_dim must be positive when enabled")
         self.num_coordinates = int(num_coordinates)
         self.num_levels = int(num_levels)
         self.coordinate_embedding_dim = int(coordinate_embedding_dim)
@@ -321,6 +394,7 @@ class FSQCausalTransformerGenerator(nn.Module):
                     rope_theta=rope_theta,
                     qk_norm=qk_norm,
                     norm_eps=norm_eps,
+                    style_embedding_dim=style_embedding_dim,
                 )
                 for _ in range(num_layers)
             ]
@@ -339,6 +413,13 @@ class FSQCausalTransformerGenerator(nn.Module):
         for block in self.blocks:
             nn.init.normal_(block.attention.output_projection.weight, mean=0.0, std=residual_std)
             nn.init.normal_(block.feed_forward.output_projection.weight, mean=0.0, std=residual_std)
+            for film in (block.attention_film, block.feed_forward_film):
+                if film is not None:
+                    # Start close to the unconditional block. The FiLM branch
+                    # can then grow without destabilizing scratch training.
+                    nn.init.zeros_(film.input_projection.bias)
+                    nn.init.normal_(film.output_projection.weight, mean=0.0, std=1e-3)
+                    nn.init.zeros_(film.output_projection.bias)
 
     def _embed_frames(self, indices: torch.Tensor) -> torch.Tensor:
         if indices.ndim != 3 or indices.shape[-1] != self.num_coordinates:
@@ -359,6 +440,7 @@ class FSQCausalTransformerGenerator(nn.Module):
         cache: FSQGeneratorCache | None = None,
         use_cache: bool = False,
         position_offset: int = 0,
+        style_embedding: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | FSQGeneratorCache | None]:
         frame_count = hidden.shape[1]
         if cache is not None and not use_cache:
@@ -400,6 +482,7 @@ class FSQCausalTransformerGenerator(nn.Module):
                 use_cache=use_cache,
                 max_cache_length=self.context_frames,
                 prefix_length=prefix_length,
+                style_embedding=style_embedding,
             )
             if next_cache is not None:
                 next_layers.append(next_cache)
@@ -541,13 +624,7 @@ class TrajectoryConditionEncoder(nn.Module):
 
 
 class FSQConditionalTransformerGenerator(FSQCausalTransformerGenerator):
-    """FSQ generator with a persistent style prefix and per-frame controls.
-
-    ``style_ids`` are represented by one virtual token at RoPE position ``-1``.
-    The token remains at the front of every rolling KV cache.  A trajectory is
-    instead fused into each motion-token embedding, so it can be refreshed at
-    every autoregressive decode step without rebuilding the style prefix.
-    """
+    """FSQ generator with causal dynamic style FiLM and trajectory controls."""
 
     def __init__(
         self,
@@ -556,15 +633,31 @@ class FSQConditionalTransformerGenerator(FSQCausalTransformerGenerator):
         num_styles: int,
         trajectory_dim: int = 18,
         trajectory_hidden_dim: int = 128,
+        style_embedding_dim: int = 128,
+        style_conditioning: str = STYLE_CONDITIONING,
         **kwargs,
     ) -> None:
-        super().__init__(num_coordinates=num_coordinates, num_levels=num_levels, **kwargs)
         if num_styles <= 0:
             raise ValueError(f"num_styles must be positive, got {num_styles}")
+        if style_embedding_dim <= 0:
+            raise ValueError(f"style_embedding_dim must be positive, got {style_embedding_dim}")
+        if style_conditioning != STYLE_CONDITIONING:
+            raise ValueError(f"Unsupported style_conditioning={style_conditioning!r}")
+        if "style_embedding_dim" in kwargs:
+            raise ValueError("style_embedding_dim must be passed to FSQConditionalTransformerGenerator directly")
+        super().__init__(
+            num_coordinates=num_coordinates,
+            num_levels=num_levels,
+            style_embedding_dim=int(style_embedding_dim),
+            **kwargs,
+        )
         self.num_styles = int(num_styles)
         self.trajectory_dim = int(trajectory_dim)
         self.trajectory_hidden_dim = int(trajectory_hidden_dim)
-        self.style_embedding = nn.Embedding(self.num_styles, self.dim)
+        self.style_embedding_dim = int(style_embedding_dim)
+        self.style_conditioning = str(style_conditioning)
+        self.style_embedding = nn.Embedding(self.num_styles, self.style_embedding_dim)
+        self.style_embedding_norm = RMSNorm(self.style_embedding_dim)
         self.trajectory_encoder = TrajectoryConditionEncoder(
             trajectory_dim=self.trajectory_dim,
             model_dim=self.dim,
@@ -575,6 +668,8 @@ class FSQConditionalTransformerGenerator(FSQCausalTransformerGenerator):
             "num_styles": self.num_styles,
             "trajectory_dim": self.trajectory_dim,
             "trajectory_hidden_dim": self.trajectory_hidden_dim,
+            "style_embedding_dim": self.style_embedding_dim,
+            "style_conditioning": self.style_conditioning,
         }
         nn.init.normal_(self.style_embedding.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.trajectory_encoder.input_projection.weight, mean=0.0, std=0.02)
@@ -610,6 +705,9 @@ class FSQConditionalTransformerGenerator(FSQCausalTransformerGenerator):
         trajectory_embedding = self.trajectory_encoder(trajectory, trajectory_valid)
         return hidden + trajectory_embedding
 
+    def _style_embeddings(self, style_ids: torch.Tensor) -> torch.Tensor:
+        return self.style_embedding_norm(self.style_embedding(style_ids))
+
     def forward(
         self,
         indices: torch.Tensor,
@@ -619,22 +717,17 @@ class FSQConditionalTransformerGenerator(FSQCausalTransformerGenerator):
         cache: FSQGeneratorCache | None = None,
         use_cache: bool = False,
     ) -> dict[str, torch.Tensor | FSQGeneratorCache | None]:
-        if cache is not None and cache.prefix_length != 1:
-            raise ValueError("Conditional cache must contain exactly one style prefix token")
-        if cache is None:
-            if style_ids is None:
-                raise ValueError("style_ids are required when pre-filling a conditional generator")
-            style_ids = self._validate_style_ids(style_ids, indices.shape[0]).to(indices.device)
+        if style_ids is None:
+            raise ValueError("style_ids are required for every conditional generator step")
+        if cache is not None and cache.prefix_length != 0:
+            raise ValueError("Dynamic-FiLM conditional caches must not contain prefix tokens")
+        style_ids = self._validate_style_ids(style_ids, indices.shape[0]).to(indices.device)
         hidden = self._conditioned_frames(indices, trajectory, trajectory_valid)
-        prefix = None
-        if cache is None:
-            assert style_ids is not None
-            prefix = self.style_embedding(style_ids)[:, None]
         return self._forward_embedded(
             hidden,
-            prefix_embeddings=prefix,
             cache=cache,
             use_cache=use_cache,
+            style_embedding=self._style_embeddings(style_ids),
         )
 
     def prefill(
@@ -660,6 +753,7 @@ class FSQConditionalTransformerGenerator(FSQCausalTransformerGenerator):
         self,
         current_indices: torch.Tensor,
         cache: FSQGeneratorCache,
+        style_ids: torch.Tensor,
         trajectory: torch.Tensor | None = None,
         trajectory_valid: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, FSQGeneratorCache]:
@@ -677,8 +771,14 @@ class FSQConditionalTransformerGenerator(FSQCausalTransformerGenerator):
             trajectory_valid = trajectory_valid[:, None]
         if trajectory.shape[1] != 1:
             raise ValueError("Conditional decode_step accepts exactly one trajectory frame")
-        hidden = self._conditioned_frames(current_indices, trajectory, trajectory_valid)
-        output = self._forward_embedded(hidden, cache=cache, use_cache=True)
+        output = self(
+            current_indices,
+            style_ids=style_ids,
+            trajectory=trajectory,
+            trajectory_valid=trajectory_valid,
+            cache=cache,
+            use_cache=True,
+        )
         next_cache = output["cache"]
         if not isinstance(next_cache, FSQGeneratorCache):
             raise RuntimeError("Conditional decode_step did not produce a KV cache")
@@ -729,6 +829,7 @@ class FSQConditionalTransformerGenerator(FSQCausalTransformerGenerator):
                 next_logits, cache = self.decode_step(
                     current,
                     cache,
+                    style_ids=style_ids,
                     trajectory=future_trajectory[:, step : step + 1],
                     trajectory_valid=(
                         None

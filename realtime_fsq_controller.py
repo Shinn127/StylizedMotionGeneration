@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from raylib import IsKeyPressed, KEY_R
+from raylib import IsKeyDown, IsKeyPressed, KEY_A, KEY_D, KEY_E, KEY_J, KEY_K, KEY_Q, KEY_R, KEY_S, KEY_W
 
 from datasets.feature_dataset import build_feature_store
 from datasets.fsq_token_dataset import build_fsq_token_store
@@ -23,6 +23,8 @@ from models.fsq_generator import (
     FSQCausalTransformerGenerator,
     FSQConditionalTransformerGenerator,
     FSQGeneratorCache,
+    STYLE_CACHE_POLICY,
+    STYLE_CONDITIONING,
 )
 from motion_features import reconstruct_motion_state_from_features
 from train_fsq_generator import choose_device
@@ -89,6 +91,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--sample", action="store_true", help="Sample levels instead of greedy decoding.")
     parser.add_argument(
+        "--move-speed",
+        type=float,
+        default=1.5,
+        help="Keyboard trajectory speed in motion-database units per second.",
+    )
+    parser.add_argument(
+        "--turn-speed",
+        type=float,
+        default=1.0,
+        help="Keyboard yaw speed in radians per second.",
+    )
+    parser.add_argument(
         "--style-id",
         type=int,
         default=0,
@@ -139,6 +153,13 @@ def load_generator(path: Path, store, device: torch.device):
     if family == "fsq_generator":
         model_type = FSQCausalTransformerGenerator
     elif family == "fsq_conditional_generator":
+        if checkpoint.get("style_conditioning") != STYLE_CONDITIONING:
+            raise ValueError(
+                "Conditional checkpoint does not use causal dynamic FiLM; "
+                "train or load a v2 conditional checkpoint"
+            )
+        if checkpoint.get("style_cache_policy") != STYLE_CACHE_POLICY:
+            raise ValueError("Conditional checkpoint does not use the append-only style cache policy")
         model_type = FSQConditionalTransformerGenerator
     else:
         raise ValueError(f"Unsupported generator checkpoint family: {checkpoint.get('model_family')}")
@@ -324,6 +345,81 @@ def encode_seed_from_feature_database(
     return seed_indices
 
 
+class KeyboardTrajectoryControl:
+    """Convert keyboard state into the conditional generator's 18-D control."""
+
+    def __init__(
+        self,
+        future_frames: tuple[int, ...] = (20, 40, 60),
+        motion_fps: float = 60.0,
+        move_speed: float = 1.5,
+        turn_speed: float = 1.0,
+    ) -> None:
+        if not future_frames or any(int(frame) <= 0 for frame in future_frames):
+            raise ValueError("future_frames must contain positive frame offsets")
+        if motion_fps <= 0.0 or move_speed <= 0.0 or turn_speed <= 0.0:
+            raise ValueError("motion_fps, move_speed, and turn_speed must be positive")
+        self.future_frames = tuple(int(frame) for frame in future_frames)
+        self.motion_fps = float(motion_fps)
+        self.move_speed = float(move_speed)
+        self.turn_speed = float(turn_speed)
+
+    def build(
+        self,
+        forward: bool,
+        backward: bool,
+        left: bool,
+        right: bool,
+        turn_left: bool,
+        turn_right: bool,
+    ) -> tuple[np.ndarray, bool, str]:
+        forward_axis = float(bool(forward)) - float(bool(backward))
+        # In this skeleton's root-local frame, +x is character-left and a
+        # positive yaw maps forward (+z) toward +x.
+        strafe_axis = float(bool(left)) - float(bool(right))
+        turn_axis = float(bool(turn_left)) - float(bool(turn_right))
+        active = bool(forward_axis or strafe_axis or turn_axis)
+        values = np.zeros((len(self.future_frames) * 6,), dtype=np.float32)
+        if not active:
+            return values, False, "idle"
+
+        velocity_x = strafe_axis * self.move_speed
+        velocity_z = forward_axis * self.move_speed
+        yaw_rate = turn_axis * self.turn_speed
+        times = np.asarray(self.future_frames, dtype=np.float32) / self.motion_fps
+        if abs(yaw_rate) < 1e-8:
+            position_x = velocity_x * times
+            position_z = velocity_z * times
+        else:
+            angle = yaw_rate * times
+            position_x = velocity_x * np.sin(angle) / yaw_rate + velocity_z * (1.0 - np.cos(angle)) / yaw_rate
+            position_z = velocity_x * (np.cos(angle) - 1.0) / yaw_rate + velocity_z * np.sin(angle) / yaw_rate
+
+        positions = np.stack(
+            (position_x, np.zeros_like(position_x), position_z),
+            axis=-1,
+        )
+        directions = np.stack(
+            (np.sin(yaw_rate * times), np.zeros_like(times), np.cos(yaw_rate * times)),
+            axis=-1,
+        )
+        values = np.concatenate((positions.reshape(-1), directions.reshape(-1))).astype(np.float32)
+        labels = []
+        if forward_axis > 0:
+            labels.append("forward")
+        elif forward_axis < 0:
+            labels.append("backward")
+        if strafe_axis > 0:
+            labels.append("left")
+        elif strafe_axis < 0:
+            labels.append("right")
+        if turn_axis > 0:
+            labels.append("turn-left")
+        elif turn_axis < 0:
+            labels.append("turn-right")
+        return values, True, "+".join(labels)
+
+
 class RealtimeFSQController:
     def __init__(
         self,
@@ -339,6 +435,8 @@ class RealtimeFSQController:
         source_range_idx: int = 0,
         source_start: int = 0,
         style_id: int | None = None,
+        style_names: list[str] | None = None,
+        trajectory_future_frames: tuple[int, ...] = (20, 40, 60),
         trajectory_store: FSQTrajectoryStore | None = None,
         trajectory_normalization: TrajectoryNormalization | None = None,
     ) -> None:
@@ -373,6 +471,17 @@ class RealtimeFSQController:
         self.sample = bool(sample)
         self.conditional = conditional
         self.style_id = None if style_id is None else int(style_id)
+        self._style_ids = (
+            None
+            if self.style_id is None
+            else torch.tensor([self.style_id], dtype=torch.long, device=self.device)
+        )
+        self.style_names = [] if style_names is None else [str(name) for name in style_names]
+        if self.conditional and len(self.style_names) != self.generator.num_styles:
+            raise ValueError("style_names must match the conditional generator style embedding")
+        self.trajectory_future_frames = tuple(int(frame) for frame in trajectory_future_frames)
+        if self.conditional and len(self.trajectory_future_frames) * 6 != self.generator.trajectory_dim:
+            raise ValueError("trajectory_future_frames do not match the conditional trajectory dimension")
         self.source_range_idx = int(source_range_idx)
         self.source_start = int(source_start)
         self.trajectory_store = trajectory_store
@@ -494,9 +603,10 @@ class RealtimeFSQController:
             return self.generator.prefill(self.token_history)
         assert isinstance(self.generator, FSQConditionalTransformerGenerator)
         assert self.style_id is not None
+        assert self._style_ids is not None
         return self.generator.prefill(
             self.token_history,
-            style_ids=torch.tensor([self.style_id], dtype=torch.long, device=self.device),
+            style_ids=self._style_ids,
             seed_trajectory=self.control_history,
             seed_trajectory_valid=self.control_valid_history,
         )
@@ -519,8 +629,44 @@ class RealtimeFSQController:
             (self.control_valid_history[:, :-1], valid), dim=1
         ).clone()
 
+    def _cache_before_latest_input(self) -> FSQGeneratorCache:
+        """Return the rolling cache immediately before its newest token input."""
+        if not isinstance(self.cache, FSQGeneratorCache):
+            raise RuntimeError("Generator cache is unavailable")
+        if self.cache.prefix_length != 0 or self.cache.motion_length <= 0:
+            raise RuntimeError("Style replay requires a non-empty prefix-free motion cache")
+        return FSQGeneratorCache(
+            layers=[
+                (key[..., :-1, :], value[..., :-1, :])
+                for key, value in self.cache.layers
+            ],
+            next_position=self.cache.next_position - 1,
+            prefix_length=0,
+        )
+
+    def _replay_latest_input_with_style(self) -> None:
+        """Refresh staged logits by replaying one input frame under the active style."""
+        assert isinstance(self.generator, FSQConditionalTransformerGenerator)
+        assert self._style_ids is not None
+        if self.token_history.shape[1] != self.control_history.shape[1]:
+            raise RuntimeError("Token and trajectory histories must remain aligned")
+        previous_cache = self._cache_before_latest_input()
+        with torch.inference_mode():
+            self.next_logits, self.cache = self.generator.decode_step(
+                self.token_history[:, -1],
+                previous_cache,
+                style_ids=self._style_ids,
+                trajectory=self.control_history[:, -1:],
+                trajectory_valid=self.control_valid_history[:, -1:],
+            )
+
     def set_style(self, style_id: int) -> None:
-        """Switch the style prefix and make it effective for the next token."""
+        """Use a new style for the next sample without rebuilding the full KV cache.
+
+        Only the latest cached input is replayed, so the staged next-token
+        logits respond immediately. Older K/V values retain their original
+        style and naturally leave the rolling context as generation continues.
+        """
         if not self.conditional:
             raise RuntimeError("Style control requires an FSQConditionalTransformerGenerator")
         assert isinstance(self.generator, FSQConditionalTransformerGenerator)
@@ -528,7 +674,8 @@ class RealtimeFSQController:
         if style_id < 0 or style_id >= self.generator.num_styles:
             raise ValueError(f"style_id must be in [0,{self.generator.num_styles - 1}], got {style_id}")
         self.style_id = style_id
-        self._rebuild_cache()
+        self._style_ids = torch.tensor([style_id], dtype=torch.long, device=self.device)
+        self._replay_latest_input_with_style()
 
     def set_trajectory_control(self, trajectory: np.ndarray | list[float] | None, valid: bool = True) -> None:
         """Set an external raw root-local 18-D command for the next prediction.
@@ -606,6 +753,7 @@ class RealtimeFSQController:
             )
             if self.conditional:
                 assert isinstance(self.generator, FSQConditionalTransformerGenerator)
+                assert self._style_ids is not None
                 # ``current`` is source frame source_start + frame_index. Its
                 # decoder input gets the command for the next generated token.
                 next_control, next_control_valid = self._control_for_target(
@@ -614,6 +762,7 @@ class RealtimeFSQController:
                 self.next_logits, self.cache = self.generator.decode_step(
                     current,
                     self.cache,
+                    style_ids=self._style_ids,
                     trajectory=next_control,
                     trajectory_valid=next_control_valid,
                 )
@@ -714,7 +863,15 @@ class RealtimeFSQController:
 
 
 class RealtimeGenoView(GenoView):
-    def __init__(self, database: dict[str, np.ndarray], controller: RealtimeFSQController, resources_root: Path, fps: int):
+    def __init__(
+        self,
+        database: dict[str, np.ndarray],
+        controller: RealtimeFSQController,
+        resources_root: Path,
+        fps: int,
+        move_speed: float = 1.5,
+        turn_speed: float = 1.0,
+    ):
         super().__init__(database=database, trajectory_path=None, resources_root=resources_root, fps=fps)
         self.controller = controller
 
@@ -722,6 +879,49 @@ class RealtimeGenoView(GenoView):
         # the controller-owned buffers so generated frames become visible.
         self._sync_controller_arrays()
         self.playback = RealtimePlaybackController(frame_time=1.0 / float(fps), playing=True)
+        self.keyboard_control = None
+        self._last_keyboard_command: tuple[bool, bytes] | None = None
+        self._keyboard_status = "keyboard unavailable"
+        if self.controller.conditional:
+            future_frames = tuple(
+                int(frame)
+                for frame in getattr(self.controller, "trajectory_future_frames", (20, 40, 60))
+            )
+            self.keyboard_control = KeyboardTrajectoryControl(
+                future_frames=future_frames,
+                motion_fps=60.0,
+                move_speed=move_speed,
+                turn_speed=turn_speed,
+            )
+            self._keyboard_status = "idle"
+
+    def _handle_keyboard_controls(self) -> None:
+        if not self.controller.conditional or self.keyboard_control is None:
+            return
+        if IsKeyPressed(KEY_J):
+            assert self.controller.style_id is not None
+            self.controller.set_style(
+                (self.controller.style_id - 1) % len(self.controller.style_names)
+            )
+        if IsKeyPressed(KEY_K):
+            assert self.controller.style_id is not None
+            self.controller.set_style(
+                (self.controller.style_id + 1) % len(self.controller.style_names)
+            )
+
+        trajectory, valid, status = self.keyboard_control.build(
+            forward=IsKeyDown(KEY_W),
+            backward=IsKeyDown(KEY_S),
+            left=IsKeyDown(KEY_A),
+            right=IsKeyDown(KEY_D),
+            turn_left=IsKeyDown(KEY_Q),
+            turn_right=IsKeyDown(KEY_E),
+        )
+        signature = (valid, trajectory.tobytes())
+        if signature != self._last_keyboard_command:
+            self.controller.set_trajectory_control(trajectory, valid=valid)
+            self._last_keyboard_command = signature
+        self._keyboard_status = status
 
     def _sync_controller_arrays(self) -> None:
         if self.positions is not self.controller.positions:
@@ -737,6 +937,7 @@ class RealtimeGenoView(GenoView):
             self.controller.reset()
             self.playback.set_current_frame(0)
             self.playback.playing = True
+        self._handle_keyboard_controls()
 
         target_frame = self.playback.current_frame
         if self.playback.playing:
@@ -750,10 +951,18 @@ class RealtimeGenoView(GenoView):
         self.frame_index = target_frame
 
     def _frame_range_name(self):
+        style = "unconditional"
+        if self.controller.conditional and self.controller.style_id is not None:
+            style = f"style={self.controller.style_names[self.controller.style_id]}"
         return (
-            f"Realtime FSQ | {self.controller.generated_count} generated "
-            f"| {self.controller.last_step_ms:.1f} ms | Space: pause | R: reset"
+            f"Realtime FSQ | {style} | input={self._keyboard_status} "
+            f"| {self.controller.generated_count} generated | {self.controller.last_step_ms:.1f} ms"
         )
+
+    def _control_hint(self) -> bytes:
+        if self.controller.conditional:
+            return b"Space: pause/play | WASD: move | Q/E: turn | J/K: style | R: reset"
+        return b"Space: pause/play | R: reset | conditional checkpoint required for WASD/QE/J/K"
 
 
 class RealtimePlaybackController(PlaybackController):
@@ -793,6 +1002,8 @@ def main() -> None:
     initial_capacity = args.max_frames if args.max_frames is not None else args.initial_capacity
     if args.fps <= 0 or initial_capacity <= 0 or args.dry_run_frames <= 0:
         raise ValueError("fps, initial capacity, and dry_run_frames must be positive")
+    if args.move_speed <= 0.0 or args.turn_speed <= 0.0:
+        raise ValueError("move-speed and turn-speed must be positive")
     device = choose_device(args.device)
     store = build_fsq_token_store(args.token_database)
     generator_checkpoint, generator = load_generator(args.generator_checkpoint, store, device)
@@ -823,6 +1034,16 @@ def main() -> None:
         raise ValueError(
             f"seed_frames must be in [1,{generator.context_frames}], got {args.seed_frames}"
         )
+    style_names = [] if style_id is None else [
+        str(name) for name in generator_checkpoint.get("style_names", store.style_names)
+    ]
+    trajectory_future_frames = tuple(
+        int(frame)
+        for frame in np.asarray(
+            generator_checkpoint.get("trajectory_future_frames", (20, 40, 60)),
+            dtype=np.int32,
+        ).reshape(-1).tolist()
+    )
     feature_database = None
     if args.seed_source == "reencode":
         feature_database = resolve_feature_database(args.feature_database, store)
@@ -862,6 +1083,8 @@ def main() -> None:
         source_range_idx=args.range_idx,
         source_start=args.start,
         style_id=style_id,
+        style_names=style_names,
+        trajectory_future_frames=trajectory_future_frames,
         trajectory_store=trajectory_store,
         trajectory_normalization=trajectory_normalization,
     )
@@ -890,7 +1113,7 @@ def main() -> None:
                     "style_name": (
                         None
                         if style_id is None
-                        else str(generator_checkpoint.get("style_names", store.style_names)[style_id])
+                        else style_names[style_id]
                     ),
                     "trajectory_database": (
                         None if trajectory_store is None else str(trajectory_store.database)
@@ -902,7 +1125,14 @@ def main() -> None:
         return
 
     database = controller.database()
-    viewer = RealtimeGenoView(database, controller, args.resources_root, args.fps)
+    viewer = RealtimeGenoView(
+        database,
+        controller,
+        args.resources_root,
+        args.fps,
+        move_speed=args.move_speed,
+        turn_speed=args.turn_speed,
+    )
     viewer.run()
     if args.save_output is not None:
         save_output(args.save_output, controller)

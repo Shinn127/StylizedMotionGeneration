@@ -287,7 +287,7 @@ conda run -n mcc python train_fsq_generator.py \
   --config configs/fsq_generator.yaml
 ```
 
-在此基础上，条件模型不改变 FSQ tokenizer：style label 被编码为一个持续保留在 KV cache 首位的 prefix token；轨迹是每帧 18-D root-local 控制，布局为 `pos(+20,+40,+60), dir(+20,+40,+60)`。每个输入 token `x_t` 接收目标帧 `t+1` 的轨迹，因此新 command 会影响下一次采样，而非天然滞后一帧。
+条件模型同样使用冻结的 FSQ tokenizer，但不读取无条件 generator checkpoint，而是独立随机初始化并训练完整 Transformer。style label 映射为 embedding；在每个 Transformer block 中，当前因果 hidden state 与该 embedding 共同生成 attention 前和 FFN 前的逐通道 FiLM scale/shift。KV cache 中不再保留 style prefix，而是保存每个历史帧当时 style 调制后的 K/V。轨迹仍是每帧 18-D root-local 控制，布局为 `pos(+20,+40,+60), dir(+20,+40,+60)`；训练时不做 trajectory dropout。每个输入 token `x_t` 接收目标帧 `t+1` 的轨迹，因此新 command 会影响下一次采样，而非天然滞后一帧。
 
 先从全量 motion database 构建并对齐轨迹：
 
@@ -306,18 +306,18 @@ conda run -n mcc python preprocess/build_fsq_trajectory_database.py \
   --output data/processed/100style_pruned/fsq_20x9_full_loss_trajectory_20_40_60
 ```
 
-训练条件模型（base Transformer 低学习率微调，style/trajectory branch 使用较高学习率）：
+从零开始训练完整条件模型：
 
 ```bash
 conda run -n mcc python train_fsq_conditional_generator.py \
   --config configs/fsq_generator_conditional.yaml
 ```
 
-它会把 train-window trajectory normalization、style vocabulary、parent generator 和 tokenizer SHA 一并写入 `outputs/fsq_generator_conditional/best.pt`。先检查条件是否真正被使用：
+它会把 train-window trajectory normalization、style vocabulary、初始化方式和 tokenizer SHA 一并写入 `outputs/fsq_generator_conditional_dynamic_film/best.pt`。旧的 `outputs/fsq_generator_conditional/best.pt` 属于 style-prefix 架构，旧的 `outputs/fsq_generator_conditional_film/best.pt` 属于输入层静态 FiLM，均不能加载到当前模型。先检查条件是否真正被使用：
 
 ```bash
 conda run -n mcc python evaluate_fsq_conditional_generator.py \
-  --checkpoint outputs/fsq_generator_conditional/best.pt \
+  --checkpoint outputs/fsq_generator_conditional_dynamic_film/best.pt \
   --token-database data/processed/100style_pruned/fsq_20x9_full_loss \
   --trajectory-database data/processed/100style_pruned/fsq_20x9_full_loss_trajectory_20_40_60 \
   --split test \
@@ -330,7 +330,7 @@ conda run -n mcc python evaluate_fsq_conditional_generator.py \
 
 ```bash
 conda run -n mcc python realtime_fsq_controller.py \
-  --generator-checkpoint outputs/fsq_generator_conditional/best.pt \
+  --generator-checkpoint outputs/fsq_generator_conditional_dynamic_film/best.pt \
   --token-database data/processed/100style_pruned/fsq_20x9_full_loss \
   --fsq-checkpoint outputs/fsq_pruned_frame_causal_cnn_20x9_full_loss/best.pt \
   --trajectory-database data/processed/100style_pruned/fsq_20x9_full_loss_trajectory_20_40_60 \
@@ -339,7 +339,20 @@ conda run -n mcc python realtime_fsq_controller.py \
   --dry-run --dry-run-frames 120
 ```
 
-程序化 controller 还提供 `set_style(style_id)` 和 `set_trajectory_control(raw_18d)`：两者都会用最近 64 帧 token/command history 重建 cache，使新的 style 或 trajectory 在下一帧采样生效。`set_trajectory_control` 的输入是未归一化的上述 18-D root-local layout。
+使用 GenoView 窗口运行条件 checkpoint 时，键盘控制会直接覆盖下一帧的 trajectory condition：`W/S` 前进/后退，`A/D` 左右侧移，`Q/E` 左右转向，`J/K` 循环切换上一个/下一个 style，`Space` 暂停/继续，`R` 重置。实时交互建议使用采样生成，并可通过 `--move-speed` 与 `--turn-speed` 调整控制幅度：
+
+如果当前机器没有完整数据集，只需使用本地已有的 `100style_test5_pruned` token/feature database；键盘模式不需要 `--trajectory-database`：
+
+```bash
+conda run -n mcc python realtime_fsq_controller.py \
+  --generator-checkpoint outputs/fsq_generator_conditional_dynamic_film/best.pt \
+  --token-database data/processed/100style_test5_pruned/fsq_20x9_full_loss \
+  --fsq-checkpoint outputs/fsq_pruned_frame_causal_cnn_20x9_full_loss/best.pt \
+  --style-id 0 --sample --temperature 0.8 \
+  --range-idx 0 --start 0 --seed-frames 64
+```
+
+程序化 controller 还提供 `set_style(style_id)` 和 `set_trajectory_control(raw_18d)`。style 切换不会重建 64-frame KV cache：它只回放最新一个输入 token，立即用新 style 刷新下一 token 的 logits；更早的 K/V 保留原 style，并在后续生成中自然滑出窗口。`set_trajectory_control` 的输入是未归一化的上述 18-D root-local layout，并会重建 cache 以令下一次采样立即使用新的目标轨迹。
 
 ## 可视化
 

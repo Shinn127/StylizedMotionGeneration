@@ -12,34 +12,44 @@
 
 token_database: data/processed/100style_pruned/fsq_20x9_full_loss
 trajectory_database: data/processed/100style_pruned/fsq_20x9_full_loss_trajectory_20_40_60
-base_checkpoint: outputs/fsq_generator/best.pt
 
 batch_size: 512
-epochs: 40
-base_lr: 0.00003
-condition_lr: 0.0003
-min_lr_ratio: 0.1
+epochs: 100
+lr: 0.0003
+min_lr: 0.00001
 warmup_ratio: 0.05
 beta1: 0.9
 beta2: 0.95
 weight_decay: 0.01
 grad_clip_norm: 1.0
 
-# This branch is deliberately small: style is one persistent 256-D prefix;
-# trajectory is an 18-D root-local vector (+20/+40/+60 position and direction)
-# encoded per input token.
+# The complete conditional Transformer is randomly initialized. Each block
+# generates attention/FFN FiLM from its current causal hidden state and a style
+# embedding; no unconditional generator weights are read.
+coordinate_embedding_dim: 16
+d_model: 256
+num_layers: 6
+num_query_heads: 8
+num_kv_heads: 4
+ff_dim: 768
+dropout: 0.1
+context_frames: 64
+rope_theta: 10000.0
+qk_norm: true
+norm_eps: 0.00001
+style_embedding_dim: 128
+
+# Trajectory remains an 18-D root-local vector (+20/+40/+60 position and
+# direction) encoded per input token. It is never dropped during training.
 trajectory_hidden_dim: 128
-# During training, drop only earlier control history and preserve the latest
-# command. This matches controller attachment/re-prefill at runtime.
-history_condition_dropout: 0.5
 
 num_workers: 8
 prefetch_factor: 2
 persistent_workers: true
 seed: 3407
 deterministic: false
-early_stop_patience: 12
+early_stop_patience: 15
 device: auto
 
-outdir: outputs/fsq_generator_conditional
-run_name: fsq_generator_style_trajectory_100style
+outdir: outputs/fsq_generator_conditional_dynamic_film
+run_name: fsq_generator_dynamic_film_trajectory_100style

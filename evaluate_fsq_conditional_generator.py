@@ -17,7 +17,11 @@ from datasets.fsq_trajectory_dataset import (
     TrajectoryNormalization,
     build_fsq_trajectory_store,
 )
-from models.fsq_generator import FSQConditionalTransformerGenerator
+from models.fsq_generator import (
+    FSQConditionalTransformerGenerator,
+    STYLE_CACHE_POLICY,
+    STYLE_CONDITIONING,
+)
 from train_fsq_generator import choose_device, maybe_subset
 
 
@@ -46,6 +50,10 @@ def load_checkpoint(path: Path, token_store, device: torch.device):
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     if checkpoint.get("model_family") != "fsq_conditional_generator":
         raise ValueError(f"Unsupported checkpoint family: {checkpoint.get('model_family')}")
+    if checkpoint.get("style_conditioning") != STYLE_CONDITIONING:
+        raise ValueError("Checkpoint is not a causal dynamic-FiLM conditional generator")
+    if checkpoint.get("style_cache_policy") != STYLE_CACHE_POLICY:
+        raise ValueError("Checkpoint does not use the append-only style cache policy")
     if checkpoint.get("tokenizer_checkpoint_sha256") != token_store.checkpoint_sha256:
         raise ValueError("Conditional checkpoint and token database use different FSQ tokenizers")
     model = FSQConditionalTransformerGenerator(**checkpoint["model_config"]).to(device)
@@ -67,11 +75,14 @@ def ablate(
     style_ids: torch.Tensor,
     trajectory: torch.Tensor,
     valid: torch.Tensor,
+    num_styles: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if name == "true":
         return style_ids, trajectory, valid
     if name == "shuffled-style":
-        return style_ids.roll(1), trajectory, valid
+        # Dataset windows are grouped by style, so rolling a batch often leaves
+        # nearly every label unchanged. A cyclic offset guarantees a wrong label.
+        return (style_ids + 1) % num_styles, trajectory, valid
     if name == "zero-trajectory":
         return style_ids, torch.zeros_like(trajectory), torch.zeros_like(valid)
     if name == "shuffled-trajectory":
@@ -89,7 +100,13 @@ def evaluate(model: FSQConditionalTransformerGenerator, loader, device: torch.de
     with torch.inference_mode():
         for batch in loader:
             inputs, targets, styles, trajectory, valid = prepare_batch(batch, device)
-            styles, trajectory, valid = ablate(ablation_name, styles, trajectory, valid)
+            styles, trajectory, valid = ablate(
+                ablation_name,
+                styles,
+                trajectory,
+                valid,
+                model.num_styles,
+            )
             logits = model(
                 inputs,
                 style_ids=styles,
