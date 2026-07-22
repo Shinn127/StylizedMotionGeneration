@@ -5,7 +5,7 @@
 1. 训练 frame-level FSQ motion tokenizer，把每帧 230D motion feature 编码为 20 个 9-level 离散坐标；
 2. 冻结 FSQ tokenizer/decoder，在离散 token 空间训练 causal Transformer generator，并通过 style 与 future trajectory 实现实时控制。
 
-仓库同时保留 VQ-VAE baseline、FSQ style-information probe 和 dynamic style gate，均属于辅助实验，不是当前 generator 主线。
+仓库同时保留 VQ-VAE baseline，作为辅助对照，不是当前 generator 主线。
 
 ## 当前主线
 
@@ -504,28 +504,7 @@ python view_motion_sequence.py \
 
 无显示环境可添加 `--dry-run --save-debug`。`Genoview.py` 也可以读取独立 `[T,D]` `.npy/.npz` feature 文件；normalized feature 必须同时提供 `--stats-source`。
 
-## 辅助实验
-
-### Dynamic FSQ Style Gate
-
-```bash
-python train_fsq_style_gate.py \
-  --config configs/fsq_style_gate.yaml
-
-python evaluate_fsq_style_gate.py \
-  --checkpoint outputs/fsq_style_gate/best.pt \
-  --token-database data/processed/100style_test5_pruned/fsq_20x9_full_loss \
-  --split test \
-  --output outputs/evaluations/fsq_style_gate_test5.json
-```
-
-Gate 在冻结 token 上学习 coordinate-level Hard Concrete mask，并与 full-token、matched-random baseline 比较。
-
-### Style information probes
-
-`analyze_fsq_patterns.py` 使用 histogram、transition、n-gram、run length、spectrum、coordinate co-occurrence 等表示，分析 style 信息来自 level occupancy 还是 temporal structure。
-
-### VQ-VAE baselines
+## VQ-VAE baseline
 
 ```bash
 python train_vqvae.py --config configs/vqvae_pruned.yaml
@@ -559,12 +538,10 @@ configs/
   fsq_pruned_frame_causal_cnn.yaml       FSQ tokenizer 主配置
   fsq_generator.yaml                     无条件 generator
   fsq_generator_conditional.yaml         style + trajectory 条件 generator
-  fsq_style_gate.yaml                    dynamic style gate
 
 models/
   fsq.py                                 FSQ encoder/quantizer/decoder
   fsq_generator.py                       causal Transformer、FiLM、KV cache
-  fsq_style_gate.py                      coordinate-level style gate
   causal_cnn.py                          frame-causal convolution modules
   losses.py                              reconstruction 与 kinematic losses
 
