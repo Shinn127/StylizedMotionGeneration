@@ -1,4 +1,4 @@
-feature_database: data/processed/100style_pruned_test5/feature_database
+feature_database: data/processed/100style_pruned/feature_database
 split_train: train
 split_val: val
 
@@ -12,8 +12,8 @@ seed: 3407
 deterministic: false
 grad_clip_norm: 1.0
 
-num_workers: 4
-prefetch_factor: 2
+num_workers: 8
+prefetch_factor: 4
 pin_memory: true
 persistent_workers: true
 
@@ -48,7 +48,7 @@ contact_temperature: 10.0
 root_dt: 0.016666666666666666
 
 outdir: outputs/part_fsq_pruned_40x9
-run_name: part_fsq_pruned_40x9_test5
+run_name: part_fsq_pruned_40x9
 resume:
 save_every: 0
 log_every: 50
