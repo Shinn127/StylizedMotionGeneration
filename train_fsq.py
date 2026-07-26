@@ -62,6 +62,7 @@ def parse_args(argv=None):
     parser.add_argument("--num-workers", type=int, default=cfg("num_workers", default_num_workers()))
     parser.add_argument("--prefetch-factor", type=int, default=cfg("prefetch_factor", 4))
     parser.add_argument("--log-every", type=int, default=cfg("log_every", 50))
+    parser.add_argument("--metrics-interval", type=int, default=cfg("metrics_interval", 100))
     parser.add_argument("--run-name", type=str, default=cfg("run_name", None))
     parser.add_argument("--model-type", choices=["frame_causal_cnn"], default=cfg("model_type", "frame_causal_cnn"))
     parser.add_argument("--code-dim", type=int, default=cfg("code_dim", 256))
@@ -187,6 +188,45 @@ def init_metric_totals() -> dict[str, float]:
     }
 
 
+_LOSS_METRICS = ("loss", "recon", "delta", "root_pos", "root_rot", "joint", "contact", "foot_slide", "foot_height")
+_REPRESENTATION_METRICS = (
+    "level_perplexity",
+    "level_usage",
+    "level_perplexity_min",
+    "level_perplexity_max",
+    "level_usage_min",
+    "level_usage_max",
+    "tuple_unique_ratio",
+    "tuple_change_rate",
+    "coordinate_change_rate",
+)
+
+
+def init_training_metric_totals(device: torch.device) -> dict[str, torch.Tensor]:
+    """Accumulate on device to avoid one CUDA synchronization per scalar."""
+    return {name: torch.zeros((), device=device) for name in (*_LOSS_METRICS, *_REPRESENTATION_METRICS)}
+
+
+def update_training_metric_totals(totals, losses, output, batch_size: int, collect_metrics: bool) -> None:
+    for name in _LOSS_METRICS:
+        value = losses.loss if name == "loss" else getattr(losses, name)
+        totals[name].add_(value.detach() * batch_size)
+    if collect_metrics:
+        for name in _REPRESENTATION_METRICS:
+            totals[name].add_(output[name].detach() * batch_size)
+
+
+def finalize_training_metric_totals(totals, count: int, representation_count: int) -> dict[str, float]:
+    if count == 0:
+        raise ValueError("Cannot finalize metrics with count=0")
+    result = {name: float(totals[name] / count) for name in _LOSS_METRICS}
+    if representation_count > 0:
+        result.update({name: float(totals[name] / representation_count) for name in _REPRESENTATION_METRICS})
+    else:
+        result.update({name: 0.0 for name in _REPRESENTATION_METRICS})
+    return result
+
+
 def update_metric_totals(totals, losses, output, batch_size):
     totals["loss"] += losses.loss.item() * batch_size
     totals["recon"] += losses.recon.item() * batch_size
@@ -271,16 +311,21 @@ def train_one_epoch(
     writer,
     global_step,
     log_every,
+    metrics_interval,
     non_blocking: bool,
 ):
     model.train()
-    totals = init_metric_totals()
+    totals = init_training_metric_totals(device)
     count = 0
+    representation_count = 0
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     start_time = time.perf_counter()
 
     for batch in loader:
         motion = move_motion_to_device(batch, device, non_blocking=non_blocking)
-        output = model(motion)
+        collect_metrics = global_step == 0 or global_step % metrics_interval == 0
+        output = model(motion, collect_metrics=collect_metrics)
         losses = compute_losses(motion, output, feature_weights, feature_offset, feature_scale, loss_metadata, args)
         optimizer.zero_grad(set_to_none=True)
         losses.loss.backward()
@@ -289,8 +334,10 @@ def train_one_epoch(
         optimizer.step()
 
         batch_size = motion.shape[0]
-        update_metric_totals(totals, losses, output, batch_size)
+        update_training_metric_totals(totals, losses, output, batch_size, collect_metrics)
         count += batch_size
+        if collect_metrics:
+            representation_count += batch_size
         global_step += 1
 
         if writer is not None and (global_step == 1 or global_step % log_every == 0):
@@ -303,19 +350,15 @@ def train_one_epoch(
             writer.add_scalar("train_step/contact", losses.contact.item(), global_step)
             writer.add_scalar("train_step/foot_slide", losses.foot_slide.item(), global_step)
             writer.add_scalar("train_step/foot_height", losses.foot_height.item(), global_step)
-            writer.add_scalar("train_step/level_perplexity", output["level_perplexity"].item(), global_step)
-            writer.add_scalar("train_step/level_usage", output["level_usage"].item(), global_step)
-            writer.add_scalar("train_step/level_perplexity_min", output["level_perplexity_min"].item(), global_step)
-            writer.add_scalar("train_step/level_perplexity_max", output["level_perplexity_max"].item(), global_step)
-            writer.add_scalar("train_step/level_usage_min", output["level_usage_min"].item(), global_step)
-            writer.add_scalar("train_step/level_usage_max", output["level_usage_max"].item(), global_step)
-            writer.add_scalar("train_step/tuple_unique_ratio", output["tuple_unique_ratio"].item(), global_step)
-            writer.add_scalar("train_step/tuple_change_rate", output["tuple_change_rate"].item(), global_step)
-            writer.add_scalar("train_step/coordinate_change_rate", output["coordinate_change_rate"].item(), global_step)
+            if collect_metrics:
+                for name in _REPRESENTATION_METRICS:
+                    writer.add_scalar(f"train_step/{name}", output[name].item(), global_step)
             writer.add_scalar("train_step/lr", optimizer.param_groups[0]["lr"], global_step)
 
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     epoch_time = time.perf_counter() - start_time
-    stats = finalize_metric_totals(totals, count)
+    stats = finalize_training_metric_totals(totals, count, representation_count)
     stats["epoch_seconds"] = epoch_time
     stats["samples_per_second"] = count / max(epoch_time, 1e-8)
     return stats, global_step
@@ -378,7 +421,7 @@ def build_loss_metadata(dataset, device: torch.device) -> dict[str, object]:
     joint_weights[0] = 0.0
     return {
         "ref_pos": torch.from_numpy(dataset.feature_stats().ref_pos.astype("float32")).to(device),
-        "parents": torch.from_numpy(dataset.parents.astype("int64")).to(device),
+        "parents": tuple(int(parent) for parent in dataset.parents.tolist()),
         "joint_weights": torch.from_numpy(joint_weights).to(device),
         "foot_indices": foot_indices,
     }
@@ -441,6 +484,8 @@ def build_checkpoint(
 
 def main():
     args = parse_args()
+    if args.metrics_interval <= 0:
+        raise ValueError("metrics_interval must be positive")
     args.outdir.mkdir(parents=True, exist_ok=True)
     set_seed(args.seed, args.deterministic)
 
@@ -506,6 +551,7 @@ def main():
             writer=writer,
             global_step=global_step,
             log_every=args.log_every,
+            metrics_interval=args.metrics_interval,
             non_blocking=non_blocking,
         )
         val_stats = evaluate(

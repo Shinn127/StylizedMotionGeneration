@@ -1,7 +1,15 @@
 import torch
 
 from models.fsq import FSQMotionAutoencoder
-from models.losses import compute_motion_reconstruction_losses, reconstruct_joint_positions
+from models.losses import (
+    compute_motion_reconstruction_losses,
+    denormalize_motion_features,
+    forward_kinematics,
+    integrate_root_trajectory,
+    quaternion_to_matrix,
+    reconstruct_joint_positions,
+    rotation_6d_to_matrix,
+)
 
 
 def _identity_rotation_6d() -> torch.Tensor:
@@ -79,3 +87,31 @@ def test_joint_and_foot_losses_use_target_contact_gates():
     moved[:, 1:, 0] = 1.0
     positions = reconstruct_joint_positions(moved, offset, scale, ref_pos, parents, 1.0 / 60.0, world_space=True)
     assert torch.linalg.vector_norm(positions[:, 1:, list(foot_indices), :] - positions[:, :-1, list(foot_indices), :]) > 0
+
+
+def test_world_fk_is_equivalent_to_root_transform_of_local_fk():
+    motion, ref_pos, parents, _ = _simple_motion()
+    motion = motion.repeat(2, 1, 1)
+    motion[0, :, 0] = torch.tensor([0.2, -0.1, 0.3])
+    motion[1, :, 0] = torch.tensor([0.0, 0.1, -0.2])
+    motion[:, :, 3] = 0.15
+    offset = torch.zeros(motion.shape[-1])
+    scale = torch.ones(motion.shape[-1])
+
+    actual = reconstruct_joint_positions(motion, offset, scale, ref_pos, parents, 1.0 / 60.0, world_space=True)
+
+    # Reference: the pre-optimization world-space FK construction.
+    raw = denormalize_motion_features(motion, offset, scale)
+    batch_size, seq_len, _ = raw.shape
+    num_joints = ref_pos.shape[0]
+    local_positions = ref_pos.view(1, 1, num_joints, 3).expand(batch_size, seq_len, -1, -1).clone()
+    local_positions[:, :, 1] = raw[:, :, 6:9]
+    identity = torch.eye(3).view(1, 1, 1, 3, 3).expand(batch_size, seq_len, num_joints, -1, -1).clone()
+    rotations = raw[:, :, 9 : 9 + (num_joints - 1) * 6].reshape(batch_size, seq_len, num_joints - 1, 3, 2)
+    identity[:, :, 1:] = rotation_6d_to_matrix(rotations)
+    root_positions, root_rotations = integrate_root_trajectory(motion, offset, scale, 1.0 / 60.0)
+    local_positions[:, :, 0] = root_positions
+    identity[:, :, 0] = quaternion_to_matrix(root_rotations)
+    _, expected = forward_kinematics(local_positions, identity, parents)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -20,6 +21,7 @@ class MotionReconstructionLosses:
     contact: torch.Tensor
     foot_slide: torch.Tensor
     foot_height: torch.Tensor
+    target_contact: torch.Tensor
 
 
 VQVAELosses = MotionReconstructionLosses
@@ -141,14 +143,20 @@ def quaternion_to_matrix(quaternion: torch.Tensor) -> torch.Tensor:
 def forward_kinematics(
     local_positions: torch.Tensor,
     local_rotations: torch.Tensor,
-    parents: torch.Tensor,
+    parents: Sequence[int] | torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Computes global rotations and positions for a parent-ordered skeleton."""
-    if parents.ndim != 1 or parents.shape[0] != local_positions.shape[2]:
+    if isinstance(parents, torch.Tensor):
+        if parents.ndim != 1:
+            raise ValueError("parents must have shape [num_joints] matching local transforms")
+        parent_indices = tuple(int(parent) for parent in parents.detach().cpu().tolist())
+    else:
+        parent_indices = tuple(int(parent) for parent in parents)
+    if len(parent_indices) != local_positions.shape[2]:
         raise ValueError("parents must have shape [num_joints] matching local transforms")
     global_rotations = []
     global_positions = []
-    for joint, parent in enumerate(parents.detach().cpu().tolist()):
+    for joint, parent in enumerate(parent_indices):
         if parent < 0:
             global_rotations.append(local_rotations[:, :, joint])
             global_positions.append(local_positions[:, :, joint])
@@ -162,17 +170,12 @@ def forward_kinematics(
     return torch.stack(global_rotations, dim=2), torch.stack(global_positions, dim=2)
 
 
-def reconstruct_joint_positions(
-    motion: torch.Tensor,
-    feature_offset: torch.Tensor,
-    feature_scale: torch.Tensor,
+def reconstruct_local_joint_positions(
+    motion_raw: torch.Tensor,
     ref_pos: torch.Tensor,
-    parents: torch.Tensor,
-    dt: float,
-    world_space: bool,
+    parents: Sequence[int] | torch.Tensor,
 ) -> torch.Tensor:
-    """Recovers FK joint positions from normalized feature vectors."""
-    motion_raw = denormalize_motion_features(motion, feature_offset, feature_scale)
+    """Runs FK in the root-local frame from already denormalized features."""
     batch_size, seq_len, _ = motion_raw.shape
     num_joints = int(ref_pos.shape[0])
     expected_dim = 3 + 3 + 3 + (num_joints - 1) * 6 + 3 + (num_joints - 1) * 3 + 2
@@ -181,13 +184,47 @@ def reconstruct_joint_positions(
 
     rotation_end = 9 + (num_joints - 1) * 6
     local_positions = ref_pos.view(1, 1, num_joints, 3).expand(batch_size, seq_len, -1, -1).clone()
+    local_positions[:, :, 0] = 0.0
     local_positions[:, :, 1] = motion_raw[:, :, 6:9]
 
-    identity = torch.eye(3, device=motion.device, dtype=motion.dtype)
+    identity = torch.eye(3, device=motion_raw.device, dtype=motion_raw.dtype)
     local_rotations = identity.view(1, 1, 1, 3, 3).expand(batch_size, seq_len, num_joints, -1, -1).clone()
     rotations_6d = motion_raw[:, :, 9:rotation_end].reshape(batch_size, seq_len, num_joints - 1, 3, 2)
     local_rotations[:, :, 1:] = rotation_6d_to_matrix(rotations_6d)
+    _, positions = forward_kinematics(local_positions, local_rotations, parents)
+    return positions
 
+
+def root_local_to_world_positions(
+    local_positions: torch.Tensor,
+    root_positions: torch.Tensor,
+    root_rotations: torch.Tensor,
+) -> torch.Tensor:
+    """Applies a root trajectory to root-local FK positions.
+
+    A world-space FK is exactly this rigid transform of the root-local FK, so
+    reusing the latter avoids a second full skeleton traversal.
+    """
+    if root_positions.shape != (*local_positions.shape[:2], 3):
+        raise ValueError("root_positions must have shape [B, T, 3]")
+    if root_rotations.shape != (*local_positions.shape[:2], 4):
+        raise ValueError("root_rotations must have shape [B, T, 4]")
+    root_matrices = quaternion_to_matrix(root_rotations)
+    return (root_matrices.unsqueeze(2) @ local_positions.unsqueeze(-1)).squeeze(-1) + root_positions.unsqueeze(2)
+
+
+def reconstruct_joint_positions(
+    motion: torch.Tensor,
+    feature_offset: torch.Tensor,
+    feature_scale: torch.Tensor,
+    ref_pos: torch.Tensor,
+    parents: Sequence[int] | torch.Tensor,
+    dt: float,
+    world_space: bool,
+) -> torch.Tensor:
+    """Recovers FK joint positions from normalized feature vectors."""
+    motion_raw = denormalize_motion_features(motion, feature_offset, feature_scale)
+    local_positions = reconstruct_local_joint_positions(motion_raw, ref_pos, parents)
     if world_space:
         root_positions, root_rotations = integrate_root_trajectory(
             motion,
@@ -197,13 +234,8 @@ def reconstruct_joint_positions(
             return_positions=True,
             return_rotations=True,
         )
-        local_positions[:, :, 0] = root_positions
-        local_rotations[:, :, 0] = quaternion_to_matrix(root_rotations)
-    else:
-        local_positions[:, :, 0] = 0.0
-
-    _, global_positions = forward_kinematics(local_positions, local_rotations, parents)
-    return global_positions
+        return root_local_to_world_positions(local_positions, root_positions, root_rotations)
+    return local_positions
 
 
 def compute_motion_reconstruction_losses(
@@ -223,7 +255,7 @@ def compute_motion_reconstruction_losses(
     foot_height_weight: float = 0.0,
     contact_temperature: float = 10.0,
     ref_pos: torch.Tensor | None = None,
-    parents: torch.Tensor | None = None,
+    parents: Sequence[int] | torch.Tensor | None = None,
     joint_weights: torch.Tensor | None = None,
     foot_indices: tuple[int, int] | None = None,
 ) -> MotionReconstructionLosses:
@@ -235,39 +267,66 @@ def compute_motion_reconstruction_losses(
     recon_loss = torch.mean(feature_weights * torch.abs(recon - batch_motion))
     delta_loss = F.l1_loss(recon[:, 1:] - recon[:, :-1], batch_motion[:, 1:] - batch_motion[:, :-1])
     commit_loss = output["commit_loss"]
+    motion_raw_pred = denormalize_motion_features(recon, feature_offset, feature_scale)
+    motion_raw_target = denormalize_motion_features(batch_motion, feature_offset, feature_scale)
+    target_contact = motion_raw_target[..., -2:].clamp(0.0, 1.0)
 
     compute_root_pos = root_pos_weight > 0.0
     compute_root_rot = root_rot_weight > 0.0
-    if compute_root_pos or compute_root_rot:
-        root_pos_loss, root_rot_loss = root_trajectory_losses(
-            pred=recon,
-            target=batch_motion,
+    compute_joint = joint_weight > 0.0
+    compute_foot = foot_slide_weight > 0.0 or foot_height_weight > 0.0
+    need_root_positions = compute_root_pos or compute_foot
+    need_root_rotations = compute_root_rot or compute_foot
+    if need_root_positions or need_root_rotations:
+        pred_root_positions, pred_root_rotations = integrate_root_trajectory(
+            recon,
             feature_offset=feature_offset,
             feature_scale=feature_scale,
             dt=root_dt,
-            compute_pos=compute_root_pos,
-            compute_rot=compute_root_rot,
+            return_positions=need_root_positions,
+            return_rotations=need_root_rotations,
+        )
+        with torch.no_grad():
+            target_root_positions, target_root_rotations = integrate_root_trajectory(
+                batch_motion,
+                feature_offset=feature_offset,
+                feature_scale=feature_scale,
+                dt=root_dt,
+                return_positions=need_root_positions,
+                return_rotations=need_root_rotations,
+            )
+        root_pos_loss = (
+            F.l1_loss(pred_root_positions[:, 1:], target_root_positions[:, 1:]) if compute_root_pos else recon.new_zeros(())
+        )
+        root_rot_loss = (
+            quat.torch_quat_angle(pred_root_rotations[:, 1:], target_root_rotations[:, 1:]).mean()
+            if compute_root_rot
+            else recon.new_zeros(())
         )
     else:
         root_pos_loss = recon.new_zeros(())
         root_rot_loss = recon.new_zeros(())
 
-    compute_joint = joint_weight > 0.0
-    compute_foot = foot_slide_weight > 0.0 or foot_height_weight > 0.0
     if compute_joint or compute_foot:
         if ref_pos is None or parents is None:
             raise ValueError("ref_pos and parents are required for joint or foot kinematic losses")
         ref_pos = ref_pos.to(batch_motion.device, dtype=batch_motion.dtype)
-        parents = parents.to(batch_motion.device, dtype=torch.long)
+        # parents are topology metadata, not tensor data for FK. Keep the
+        # common trainer path on CPU to avoid GPU-to-CPU synchronization here.
+        if isinstance(parents, torch.Tensor):
+            parents = tuple(int(parent) for parent in parents.detach().cpu().tolist())
+
+    if compute_joint or compute_foot:
+        # One batched root-local FK replaces separate pred/target and
+        # local/world FK traversals. World positions are a rigid transform of
+        # the same root-local result.
+        batch_size = batch_motion.shape[0]
+        local_positions = reconstruct_local_joint_positions(
+            torch.cat((motion_raw_pred, motion_raw_target.detach()), dim=0), ref_pos, parents
+        )
+        pred_joint_positions, target_joint_positions = local_positions.split(batch_size, dim=0)
 
     if compute_joint:
-        pred_joint_positions = reconstruct_joint_positions(
-            recon, feature_offset, feature_scale, ref_pos, parents, root_dt, world_space=False
-        )
-        with torch.no_grad():
-            target_joint_positions = reconstruct_joint_positions(
-                batch_motion, feature_offset, feature_scale, ref_pos, parents, root_dt, world_space=False
-            )
         if joint_weights is None:
             weights = torch.ones(ref_pos.shape[0], device=batch_motion.device, dtype=batch_motion.dtype)
         else:
@@ -280,9 +339,6 @@ def compute_motion_reconstruction_losses(
     else:
         joint_loss = recon.new_zeros(())
 
-    motion_raw_pred = denormalize_motion_features(recon, feature_offset, feature_scale)
-    motion_raw_target = denormalize_motion_features(batch_motion, feature_offset, feature_scale)
-    target_contact = motion_raw_target[..., -2:].clamp(0.0, 1.0)
     if contact_weight > 0.0:
         contact_logits = float(contact_temperature) * (motion_raw_pred[..., -2:] - 0.5)
         contact_loss = F.binary_cross_entropy_with_logits(contact_logits, target_contact)
@@ -292,13 +348,12 @@ def compute_motion_reconstruction_losses(
     if compute_foot:
         if foot_indices is None:
             raise ValueError("foot_indices are required for foot losses")
-        pred_world_positions = reconstruct_joint_positions(
-            recon, feature_offset, feature_scale, ref_pos, parents, root_dt, world_space=True
+        world_positions = root_local_to_world_positions(
+            local_positions,
+            torch.cat((pred_root_positions, target_root_positions), dim=0),
+            torch.cat((pred_root_rotations, target_root_rotations), dim=0),
         )
-        with torch.no_grad():
-            target_world_positions = reconstruct_joint_positions(
-                batch_motion, feature_offset, feature_scale, ref_pos, parents, root_dt, world_space=True
-            )
+        pred_world_positions, target_world_positions = world_positions.split(batch_motion.shape[0], dim=0)
         pred_feet = pred_world_positions[:, :, list(foot_indices)]
         target_feet = target_world_positions[:, :, list(foot_indices)]
         contact_gate = target_contact[:, 1:] * target_contact[:, :-1]
@@ -333,6 +388,7 @@ def compute_motion_reconstruction_losses(
         contact=contact_loss,
         foot_slide=foot_slide_loss,
         foot_height=foot_height_loss,
+        target_contact=target_contact,
     )
 
 

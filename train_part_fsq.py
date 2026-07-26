@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from datasets.feature_dataset import FeatureDataset, build_feature_store
-from models.losses import compute_motion_reconstruction_losses, denormalize_motion_features
+from models.losses import compute_motion_reconstruction_losses
 from models.part_fsq import HierarchicalPartFSQMotionAutoencoder
 from models.part_fsq_losses import adaptive_part_fsq_reuse_loss
 from models.part_layout import GROUP_NAMES
@@ -152,7 +152,7 @@ def build_loss_metadata(dataset, device: torch.device) -> dict[str, object]:
             joint_weights[index] = 2.0
     return {
         "ref_pos": torch.from_numpy(dataset.feature_stats().ref_pos.astype("float32")).to(device),
-        "parents": torch.from_numpy(dataset.parents.astype("int64")).to(device),
+        "parents": tuple(int(parent) for parent in dataset.parents.tolist()),
         "joint_weights": torch.from_numpy(joint_weights).to(device),
         "foot_indices": foot_indices,
     }
@@ -180,14 +180,13 @@ def compute_losses(model, motion, output, feature_weights, feature_offset, featu
         joint_weights=loss_metadata["joint_weights"],
         foot_indices=loss_metadata["foot_indices"],
     )
-    raw_contacts = denormalize_motion_features(motion, feature_offset, feature_scale)[..., -2:]
     reuse = adaptive_part_fsq_reuse_loss(
         codes=output["fsq_codes"],
         target_motion=motion,
         layout=unwrap_model(model).layout,
         thresholds=args.reuse_thresholds,
         feature_weights=feature_weights,
-        contact_values=raw_contacts,
+        contact_values=reconstruction.target_contact,
         contact_transition_threshold=args.contact_transition_threshold,
         level_step=2.0 / float(args.fsq_num_levels - 1),
     )

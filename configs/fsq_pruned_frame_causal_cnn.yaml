@@ -1,4 +1,4 @@
-feature_database: data/processed/100style_pruned_test5/feature_database
+feature_database: data/processed/100style_pruned/feature_database
 split_train: train
 split_val: val
 
@@ -20,7 +20,7 @@ model_type: frame_causal_cnn
 code_dim: 128
 width: 512
 
-fsq_num_coordinates: 20
+fsq_num_coordinates: 40
 fsq_num_levels: 9
 fsq_scale:
 fsq_preserve_symmetry: false
@@ -36,9 +36,10 @@ foot_height_weight: 0.1
 contact_temperature: 10.0
 root_dt: 0.016666666666666666
 
-outdir: outputs/fsq_pruned_frame_causal_cnn_20x9
-run_name: fsq_pruned_frame_causal_cnn_20x9_test5
+outdir: outputs/fsq_pruned_frame_causal_cnn_40x9
+run_name: fsq_pruned_frame_causal_cnn_40x9
 resume:
 save_every: 0
-log_every: 50
+log_every: 100
+metrics_interval: 100
 data_parallel: false
