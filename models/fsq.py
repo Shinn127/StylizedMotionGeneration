@@ -95,19 +95,33 @@ class MotionFSQ(nn.Module):
             )
         return self.fsq.project_out(codes).permute(0, 2, 1).contiguous()
 
-    def forward(self, z: torch.Tensor):
+    def forward(self, z: torch.Tensor, collect_stats: bool = True):
         projected = self.project_to_coordinates(z)
         codes, indices = self.quantize_coordinates(projected)
         quantized = self.project_codes_to_latent(codes)
-        (
-            level_perplexity,
-            level_usage,
-            level_perplexity_min,
-            level_perplexity_max,
-            level_usage_min,
-            level_usage_max,
-        ) = self._usage_stats(indices)
-        tuple_unique_ratio, tuple_change_rate, coordinate_change_rate = self._sequence_stats(indices)
+        if collect_stats:
+            (
+                level_perplexity,
+                level_usage,
+                level_perplexity_min,
+                level_perplexity_max,
+                level_usage_min,
+                level_usage_max,
+            ) = self._usage_stats(indices)
+            tuple_unique_ratio, tuple_change_rate, coordinate_change_rate = self._sequence_stats(indices)
+        else:
+            zero = quantized.new_zeros(())
+            (
+                level_perplexity,
+                level_usage,
+                level_perplexity_min,
+                level_perplexity_max,
+                level_usage_min,
+                level_usage_max,
+                tuple_unique_ratio,
+                tuple_change_rate,
+                coordinate_change_rate,
+            ) = (zero,) * 9
         commit_loss = quantized.new_zeros(())
         return (
             quantized,
@@ -180,7 +194,7 @@ class FSQMotionAutoencoder(nn.Module):
     def _decode_output(self, x: torch.Tensor) -> torch.Tensor:
         return x.permute(0, 2, 1).contiguous()
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, collect_metrics: bool = True) -> dict[str, torch.Tensor]:
         z_e = self.encoder(self._encode_input(x))
         (
             z_q,
@@ -196,7 +210,7 @@ class FSQMotionAutoencoder(nn.Module):
             tuple_unique_ratio,
             tuple_change_rate,
             coordinate_change_rate,
-        ) = self.quantizer(z_e)
+        ) = self.quantizer(z_e, collect_stats=collect_metrics)
         recon = self._decode_output(self.decoder(z_q))
         return {
             "recon_state": recon,
@@ -216,17 +230,17 @@ class FSQMotionAutoencoder(nn.Module):
 
     def encode_to_indices(self, x: torch.Tensor) -> torch.Tensor:
         z_e = self.encoder(self._encode_input(x))
-        _, _, indices, *_ = self.quantizer(z_e)
+        _, _, indices, *_ = self.quantizer(z_e, collect_stats=False)
         return indices
 
     def encode_to_codes(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         z_e = self.encoder(self._encode_input(x))
-        _, codes, indices, *_ = self.quantizer(z_e)
+        _, codes, indices, *_ = self.quantizer(z_e, collect_stats=False)
         return codes, indices
 
     def encode_to_embeddings(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         z_e = self.encoder(self._encode_input(x))
-        z_q, _, indices, *_ = self.quantizer(z_e)
+        z_q, _, indices, *_ = self.quantizer(z_e, collect_stats=False)
         return z_q, indices
 
     def decode_from_indices(self, indices: torch.Tensor) -> torch.Tensor:

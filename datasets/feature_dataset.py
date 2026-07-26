@@ -10,6 +10,9 @@ from torch.utils.data import Dataset
 from motion_features import MotionFeatureStats, deserialize_motion_feature_stats
 
 
+DEFAULT_WINDOW_SIZE = 64
+
+
 @dataclass
 class FeatureWindow:
     shard_idx: int
@@ -48,6 +51,39 @@ def _load_windows(data: dict[str, np.ndarray], key: str) -> list[FeatureWindow]:
     ]
 
 
+def _fixed_windows_from_intervals(intervals: np.ndarray, window_size: int) -> list[FeatureWindow]:
+    """Build old-style fixed windows from V2 interval metadata.
+
+    The tokenizer in this checkout still trains on fully supervised 64-frame
+    windows.  V2 feature databases store split-safe intervals instead of
+    materialized window requests, so derive the same non-overlapping plus tail
+    window policy without changing the model's 64-frame contract.
+    """
+    rows = np.asarray(intervals, dtype=np.int32)
+    if rows.ndim != 2 or rows.shape[1] != 4:
+        raise ValueError(f"Expected intervals with shape [N, 4], got {rows.shape}")
+    windows = []
+    for shard_idx, start_idx, stop_idx, range_idx in rows.tolist():
+        if stop_idx - start_idx < window_size:
+            continue
+        last_start = stop_idx - window_size
+        starts = list(range(start_idx, last_start + 1, window_size))
+        if starts[-1] != last_start:
+            starts.append(last_start)
+        windows.extend(
+            FeatureWindow(
+                shard_idx=int(shard_idx),
+                start_idx=int(window_start),
+                end_idx=int(window_start + window_size),
+                range_idx=int(range_idx),
+            )
+            for window_start in starts
+        )
+    if not windows:
+        raise ValueError(f"No {window_size}-frame windows can be built from the supplied intervals")
+    return windows
+
+
 def build_feature_store(feature_database: str | Path) -> FeatureStore:
     feature_database = Path(feature_database)
     metadata_path = feature_database / "metadata.npz"
@@ -59,7 +95,6 @@ def build_feature_store(feature_database: str | Path) -> FeatureStore:
     motion_files = [(feature_database / str(name)) for name in np.asarray(data["motion_files"], dtype=object).tolist()]
     range_names = np.asarray(data["range_names"], dtype=object)
     range_mirror = np.asarray(data["range_mirror"], dtype=bool)
-    window_size = int(np.asarray(data["window_size"], dtype=np.int32).item())
     motion_dim = int(np.asarray(data["motion_dim"], dtype=np.int32).item())
 
     stats, stats_meta = deserialize_motion_feature_stats(data)
@@ -69,12 +104,24 @@ def build_feature_store(feature_database: str | Path) -> FeatureStore:
     parents = np.asarray(stats_meta["parents"], dtype=np.int32)
     joint_subset = str(stats_meta["joint_subset"])
     num_joints = int(len(names))
-    clip_names = sorted(set(str(name) for name in range_names.tolist()))
-    split_windows = {
-        "train": _load_windows(data, "train_windows"),
-        "val": _load_windows(data, "val_windows"),
-        "test": _load_windows(data, "test_windows"),
-    }
+    if {"train_windows", "val_windows", "test_windows", "window_size"}.issubset(data):
+        window_size = int(np.asarray(data["window_size"], dtype=np.int32).item())
+        split_windows = {
+            "train": _load_windows(data, "train_windows"),
+            "val": _load_windows(data, "val_windows"),
+            "test": _load_windows(data, "test_windows"),
+        }
+        clip_names = sorted(set(str(name) for name in range_names.tolist()))
+    elif {"train_intervals", "val_intervals", "test_intervals"}.issubset(data):
+        window_size = DEFAULT_WINDOW_SIZE
+        split_windows = {
+            split: _fixed_windows_from_intervals(data[f"{split}_intervals"], window_size)
+            for split in ("train", "val", "test")
+        }
+        clip_source = data.get("source_clip_ids", range_names)
+        clip_names = sorted(set(str(name) for name in np.asarray(clip_source, dtype=object).tolist()))
+    else:
+        raise ValueError("Feature metadata must contain either split windows or V2 split intervals")
 
     return FeatureStore(
         feature_database=feature_database,

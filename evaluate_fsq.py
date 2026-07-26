@@ -16,6 +16,7 @@ from models.losses import (
     integrate_root_trajectory,
     reconstruct_joint_positions,
 )
+from models.part_fsq import HierarchicalPartFSQMotionAutoencoder
 from preprocess import quat
 
 
@@ -52,13 +53,21 @@ def choose_device(name: str) -> torch.device:
     return device
 
 
-def load_checkpoint(path: Path, device: torch.device) -> tuple[dict, FSQMotionAutoencoder]:
+TokenizerModel = FSQMotionAutoencoder | HierarchicalPartFSQMotionAutoencoder
+
+
+def load_checkpoint(path: Path, device: torch.device) -> tuple[dict, TokenizerModel]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    if checkpoint.get("model_family") != "fsq":
-        raise ValueError(f"{path} is not an FSQ checkpoint")
     if "model_config" not in checkpoint:
         raise ValueError(f"{path} is missing model_config and cannot be evaluated by this entry point")
-    model = FSQMotionAutoencoder(**checkpoint["model_config"]).to(device)
+    family = checkpoint.get("model_family")
+    if family == "fsq":
+        model = FSQMotionAutoencoder(**checkpoint["model_config"])
+    elif family == "part_fsq":
+        model = HierarchicalPartFSQMotionAutoencoder(**checkpoint["model_config"])
+    else:
+        raise ValueError(f"{path} is not a supported FSQ tokenizer checkpoint: {family!r}")
+    model = model.to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     return checkpoint, model
@@ -131,7 +140,7 @@ def add_weighted(totals: dict[str, float], name: str, value: torch.Tensor, batch
 def evaluate_checkpoint(
     checkpoint_path: Path,
     checkpoint: dict,
-    model: FSQMotionAutoencoder,
+    model: TokenizerModel,
     dataset,
     loader: DataLoader,
     device: torch.device,
@@ -161,7 +170,7 @@ def evaluate_checkpoint(
             # with each checkpoint's own training statistics before inference.
             target_raw = denormalize_motion_features(dataset_motion, eval_offset, eval_scale)
             model_motion = (target_raw - kinematics["offset"].view(1, 1, -1)) / kinematics["scale"].view(1, 1, -1)
-            output = model(model_motion)
+            output = model(model_motion, collect_metrics=True) if checkpoint.get("model_family") == "part_fsq" else model(model_motion)
             prediction_raw = denormalize_motion_features(
                 output["recon_state"], kinematics["offset"], kinematics["scale"]
             )
@@ -338,4 +347,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

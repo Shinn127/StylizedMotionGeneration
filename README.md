@@ -96,6 +96,13 @@ python train_fsq.py \
   --config configs/fsq_pruned_frame_causal_cnn.yaml
 ```
 
+40×9 Hierarchical Part-FSQ 使用当前固定 64 帧 window、全 FP32 训练，并暂时只覆盖 tokenizer reconstruction / evaluation：
+
+```bash
+python train_part_fsq.py \
+  --config configs/part_fsq_pruned.yaml
+```
+
 默认 checkpoint：
 
 ```text

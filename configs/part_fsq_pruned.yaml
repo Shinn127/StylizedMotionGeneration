@@ -2,7 +2,8 @@ feature_database: data/processed/100style_pruned_test5/feature_database
 split_train: train
 split_val: val
 
-batch_size: 512
+# The current feature database provides fixed 64-frame windows.
+batch_size: 256
 epochs: 100
 lr: 0.0002
 min_lr: 0.00001
@@ -11,20 +12,30 @@ seed: 3407
 deterministic: false
 grad_clip_norm: 1.0
 
-num_workers: 8
-prefetch_factor: 4
+num_workers: 4
+prefetch_factor: 2
 pin_memory: true
 persistent_workers: true
 
-model_type: frame_causal_cnn
-code_dim: 128
-width: 512
-
-fsq_num_coordinates: 20
+# Full FP32: no AMP/autocast/GradScaler path is used by train_part_fsq.py.
+precision: fp32
+stream_dim: 64
 fsq_num_levels: 9
 fsq_scale:
 fsq_preserve_symmetry: false
 fsq_noise_dropout: 0.0
+metrics_interval: 100
+
+reuse_weight: 0.01
+reuse_thresholds:
+  global: 1.0
+  sync: 1.0
+  torso: 1.0
+  left_leg: 1.0
+  right_leg: 1.0
+  left_arm: 1.0
+  right_arm: 1.0
+contact_transition_threshold: 0.25
 
 delta_weight: 3.0
 root_pos_weight: 0.1
@@ -36,8 +47,8 @@ foot_height_weight: 0.1
 contact_temperature: 10.0
 root_dt: 0.016666666666666666
 
-outdir: outputs/fsq_pruned_frame_causal_cnn_20x9
-run_name: fsq_pruned_frame_causal_cnn_20x9_test5
+outdir: outputs/part_fsq_pruned_40x9
+run_name: part_fsq_pruned_40x9_test5
 resume:
 save_every: 0
 log_every: 50
