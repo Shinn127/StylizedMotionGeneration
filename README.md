@@ -1,36 +1,19 @@
 # Stylized Motion Generation
 
-本项目研究基于离散运动表征的风格化角色动作生成。当前主线由两个阶段组成：
+面向风格化角色动作的离散 motion tokenizer 研究项目。当前工作的主线是 **Hierarchical Part-FSQ**：在不做时间下采样、不使用图消息传递的前提下，将 230D frame-level motion feature 编码为按身体部位组织的 40 个 FSQ 坐标，并以 9 个离散 level 量化每个坐标。
 
-1. 训练 frame-level FSQ motion tokenizer，把每帧 230D motion feature 编码为 20 个 9-level 离散坐标；
-2. 冻结 FSQ tokenizer/decoder，在离散 token 空间训练 causal Transformer generator，并通过 style 与 future trajectory 实现实时控制。
+当前阶段只落地 tokenizer 的训练和定量评估。Generator、token database、实时控制和可视化工具仍是旧的 Flat-FSQ 路线，尚未接入 Part-FSQ，不能和 Part-FSQ checkpoint 混用。
 
-仓库同时保留 VQ-VAE baseline，作为辅助对照，不是当前 generator 主线。
+## 当前状态
 
-## 当前主线
-
-```text
-BVH motion
-  │
-  ├─ preprocess/build_data.py
-  │    ├─ database.npz                 可视化与 trajectory 来源
-  │    └─ feature_database/            normalized 230D motion shards
-  │
-  ├─ frozen FSQ tokenizer
-  │    └─ token database               indices [T,20], levels 0...8
-  │
-  ├─ future trajectory database        18D root-local control
-  │
-  └─ conditional causal Transformer
-       ├─ token embedding
-       ├─ trajectory embedding
-       ├─ block-level causal dynamic FiLM style conditioning
-       └─ next-frame logits [B,T,20,9]
-             │
-             └─ frozen FSQ decoder → motion features → articulated pose
-```
-
-Generator 训练期间不加载 FSQ encoder/decoder，也不回传到 tokenizer；它直接读取提前编码好的离散 token。条件 generator 的完整 Transformer 从零训练，不继承无条件 generator 权重。
+| 模块 | 状态 | 入口 |
+| --- | --- | --- |
+| Hierarchical Part-FSQ 训练 | 当前主线 | `train_part_fsq.py` |
+| Part-FSQ 断点续训 | 支持 | `--resume <checkpoint>` |
+| Part-FSQ 定量评估 | 支持 | `evaluate_fsq.py` |
+| Flat-FSQ tokenizer | 保留的基线 | `train_fsq.py` |
+| FSQ token database / generator / realtime | 仅 Flat-FSQ | 见“未接入功能” |
+| GraphFSQ | 已放弃 | 不在代码路径中 |
 
 ## 环境
 
@@ -42,32 +25,26 @@ conda activate mcc
 pip install -r requirements.txt
 ```
 
-自动设备选择顺序为 CUDA、MPS、CPU。部分训练入口支持多 CUDA GPU 的 `DataParallel`，generator 默认使用单设备。
+训练设备自动按 CUDA、MPS、CPU 选择。Part-FSQ 训练固定使用 **FP32**：没有 AMP、`autocast` 或 `GradScaler` 路径。CUDA 多卡可通过 `--data-parallel` 启用 PyTorch `DataParallel`。
 
-## 数据布局
+## 数据
 
-原始数据建议通过软链接放入 `data/raw/`：
+### 原始 BVH 布局
+
+原始数据可通过软链接放入 `data/raw/`：
 
 ```bash
 mkdir -p data/raw data/processed
 ln -s /Users/shinn/Documents/DATASETS/100style data/raw/100style
-ln -s /Users/shinn/Documents/DATASETS/lafan data/raw/lafan
 ```
 
 ```text
-data/raw/
-├── 100style/
-│   ├── Frame_Cuts.csv
-│   └── <Style>/<Style>_<Clip>.bvh
-└── lafan/
-    └── *.bvh
+data/raw/100style/
+├── Frame_Cuts.csv
+└── <Style>/<Style>_<Clip>.bvh
 ```
 
-## 最小端到端流程
-
-下面使用 100STYLE 前 5 个 style 和 pruned skeleton。完整数据训练时应重新构建 `100style_pruned`，并通过 CLI 或 YAML 将 tokenizer、token database 和 trajectory database 全部切换到完整数据路径；不要只修改输出目录。
-
-### 1. 构建 motion database
+构建 pruned skeleton 的 feature database：
 
 ```bash
 python preprocess/build_data.py \
@@ -76,511 +53,246 @@ python preprocess/build_data.py \
   --prune-ends-and-fingers \
   --window-size 64 \
   --workers 8 \
-  --output data/processed/100style_test5_pruned
+  --output data/processed/100style_pruned_test5
 ```
 
-输出：
+输出中 tokenizer 直接使用 `feature_database/`：
 
 ```text
-data/processed/100style_test5_pruned/
+data/processed/100style_pruned_test5/
 ├── database.npz
 └── feature_database/
     ├── metadata.npz
     └── motion/motion_*.npy
 ```
 
-### 2. 训练 FSQ tokenizer
+`FeatureDataset` mmap 读取 motion shards。它兼容两种 metadata：
+
+- 旧格式：直接读取 `train_windows` / `val_windows` / `test_windows`；
+- V2 格式：从 split-safe intervals 派生固定 **64 帧**窗口。每段 interval 按 64 帧步长取窗，并补充末尾对齐窗口。
+
+Part-FSQ 训练要求 window size 恰好为 64；全部 64 帧均参与重建和 loss，不存在 context/target 的切分或时间下采样。
+
+### 230D motion feature
+
+pruned skeleton 的 feature layout 为：
+
+```text
+root local linear velocity            3
+root local angular velocity           3
+hips local position                   3
+non-root joint rotations (6D)       144
+hips local velocity                   3
+non-root joint angular velocities    72
+left/right toe contacts               2
+total                               230
+```
+
+`metadata.npz` 同时保存 train-only normalization stats、feature loss weights、joint names、parents 与 split 信息。Part-FSQ 假设 root 位于 joint index 0，joint 按 parent order 排列，并且 skeleton 能划分为 torso、左右腿、左右臂五个互斥部分。
+
+## Hierarchical Part-FSQ
+
+### 表征规格
+
+```text
+输入：normalized motion [B, 64, 230]
+输出：FSQ indices / continuous codes [B, 64, 40]
+每个坐标：9 levels，index ∈ {0, ..., 8}
+时间尺度：frame-level，无 temporal downsampling
+因果性：左侧 context 63 帧，无 lookahead，receptive field = 64
+```
+
+40 个坐标按以下顺序拼接，checkpoint 和后续消费代码必须保持此顺序：
+
+| group | coordinates | 来源 / 职责 |
+| --- | ---: | --- |
+| `global` | 6 | root、hips、contact 等全局 feature stream |
+| `sync` | 4 | 融合 global 与五个 part state 的跨身体同步信息 |
+| `torso` | 6 | 躯干 joints |
+| `left_leg` | 7 | 左腿 joints |
+| `right_leg` | 7 | 右腿 joints；与左腿共享参数 |
+| `left_arm` | 5 | 左臂 joints |
+| `right_arm` | 5 | 右臂 joints；与左臂共享参数 |
+| **total** | **40** | **40 × 9 FSQ** |
+
+### 完整数据流
+
+```text
+normalized motion [B,T,230]
+  │
+  ├─ static feature partition
+  │    global | torso | left/right leg | left/right arm
+  │
+  ├─ per-group input projection + stream embedding
+  │
+  ├─ shared frame-causal encoder
+  │    six streams fold into batch dimension: [B×6,C,T]
+  │
+  ├─ quantization hierarchy
+  │    global state ───────────────→ global FSQ (6)
+  │    all six encoded states ─────→ sync FSQ (4)
+  │    part state + global + sync ─→ torso FSQ (6)
+  │                                → shared leg FSQ (7 × 2)
+  │                                → shared arm FSQ (5 × 2)
+  │
+  ├─ decode hierarchy
+  │    [global, sync] ─────────────→ global stream
+  │    [part, global, sync] ───────→ each part stream
+  │
+  ├─ shared frame-causal decoder [B×6,C,T]
+  │
+  └─ per-group output heads + static scatter
+       reconstructed motion [B,T,230]
+```
+
+这是 dense static routing，不使用 GNN、scatter/index-add 聚合、动态图或 virtual nodes。六条 temporal stream 共用同一个 causal encoder 和 decoder：通过折叠到 batch 维实现，避免 GraphFSQ 的图 kernel 开销。左右腿共享 projection、fusion、quantizer、output head；左右臂同理。
+
+`global` 和 `sync` 是跨 group 的唯一共享通道。part token 不直接读其他 part 的私有 token，从而保持身体部位 token 的语义隔离。
+
+### 训练 objective
+
+训练直接使用完整 loss，不采用先训 reconstruction、再微调 reuse 的阶段式流程：
+
+```text
+L = L_recon
+  + 3.0 L_delta
+  + 0.1 L_root_pos
+  + 0.1 L_root_rot
+  + 0.5 L_joint
+  + 0.1 L_contact
+  + 0.1 L_foot_slide
+  + 0.1 L_foot_height
+  + 0.01 L_reuse
+```
+
+其中：
+
+- `L_recon`：按 feature weights 加权的 L1 reconstruction；
+- `L_delta`：相邻帧 feature delta L1；
+- `L_root_pos` / `L_root_rot`：由 root velocity 积分得到的误差；
+- `L_joint`：differentiable FK joint-position loss；
+- `L_contact`：toe contact BCE；
+- `L_foot_slide` / `L_foot_height`：ground-truth contact gating 下的物理一致性项；
+- `L_reuse`：对量化后的连续 FSQ codes 的相邻帧差异施加 Charbonnier penalty。
+
+reuse gate 根据对应身体区域 target feature 的创新度计算：慢速段 gate 接近 1，快速运动时趋向 0。contact 切换时关闭 `global`、`sync` 和受影响腿的 reuse gate，避免接触事件被错误平滑。默认 `reuse_weight=0.01`，各 group 的创新度阈值均为 1.0，可通过 YAML 或 CLI 调整。
+
+### 训练
+
+当前配置文件是 [configs/part_fsq_pruned.yaml](configs/part_fsq_pruned.yaml)。其中默认路径为完整数据集的 `data/processed/100style_pruned/feature_database`；若使用仓库当前 test5 数据，请显式覆盖：
+
+```bash
+python train_part_fsq.py \
+  --config configs/part_fsq_pruned.yaml \
+  --feature-database data/processed/100style_pruned_test5/feature_database
+```
+
+默认超参数：
+
+| item | value |
+| --- | ---: |
+| batch size | 256 |
+| epochs | 100 |
+| learning rate | 2e-4 |
+| warmup | 2 epochs |
+| stream dimension | 64 |
+| FSQ levels | 9 |
+| DataLoader workers | 8 |
+| prefetch factor | 4 |
+| metrics interval | 100 steps |
+
+训练输出位于 `outputs/part_fsq_pruned_40x9/`：
+
+```text
+outputs/part_fsq_pruned_40x9/
+├── best.pt
+├── last.pt
+├── part_fsq_pruned_40x9.yaml
+└── tensorboard/part_fsq_pruned_40x9/
+```
+
+续训只接受 `model_family == "part_fsq"` 且 `model_config` 完全一致的 checkpoint：
+
+```bash
+python train_part_fsq.py \
+  --config configs/part_fsq_pruned.yaml \
+  --feature-database data/processed/100style_pruned_test5/feature_database \
+  --resume outputs/part_fsq_pruned_40x9/last.pt
+```
+
+每个 epoch 会在终端打印 train/validation loss、reconstruction/kinematic 子项、reuse、representation metrics、吞吐量和 learning rate。训练中只有第一个 step 及每 `metrics_interval` 个 step 计算 `bincount` / `unique` 类 representation metrics；它们仅用于观测，不参与反传或 loss。这避免每个 batch 同步计算高开销的 level usage、token tuple unique ratio 等统计。
+
+### 定量评估
+
+`evaluate_fsq.py` 能按 checkpoint 的 `model_family` 自动载入 Flat-FSQ 或 Part-FSQ。Part-FSQ 评估示例：
+
+```bash
+python evaluate_fsq.py \
+  --checkpoint outputs/part_fsq_pruned_40x9/best.pt \
+  --feature-database data/processed/100style_pruned_test5/feature_database \
+  --split test \
+  --batch-size 128 \
+  --device auto \
+  --output outputs/evaluations/part_fsq_test5.json
+```
+
+报告包含 feature reconstruction、root trajectory、FK joint error、contact precision/recall/F1、foot slide/height，以及 FSQ representation metrics。`--checkpoint` 可重复传入，以同一数据集切分比较多个 tokenizer。
+
+## Flat-FSQ 基线
+
+旧的 frame-level Flat-FSQ 仍可用于对照：20 个 9-level 坐标，causal CNN encoder/decoder，receptive field 同为 64。
 
 ```bash
 python train_fsq.py \
   --config configs/fsq_pruned_frame_causal_cnn.yaml
 ```
 
-40×9 Hierarchical Part-FSQ 使用当前固定 64 帧 window、全 FP32 训练，并暂时只覆盖 tokenizer reconstruction / evaluation：
+其配置见 [configs/fsq_pruned_frame_causal_cnn.yaml](configs/fsq_pruned_frame_causal_cnn.yaml)。Flat-FSQ 的训练、token database 与生成器是旧路线；Flat 和 Part checkpoint 的 `model_family`、model config、坐标数均不同，不能互换。
 
-```bash
-python train_part_fsq.py \
-  --config configs/part_fsq_pruned.yaml
-```
+## 未接入 Part-FSQ 的功能
 
-默认 checkpoint：
+以下脚本目前硬性要求 `model_family == "fsq"` 或只理解 20×9 Flat-FSQ token layout，不能输入 `part_fsq` checkpoint：
 
-```text
-outputs/fsq_pruned_frame_causal_cnn_20x9/
-├── best.pt
-├── last.pt
-├── <run_name>.yaml
-└── tensorboard/<run_name>/
-```
+- `encode_fsq_database.py`
+- `view_motion_sequence.py`
+- `train_fsq_generator.py`
+- `train_fsq_conditional_generator.py`
+- `evaluate_fsq_generator.py`
+- `evaluate_fsq_conditional_generator.py`
+- `generate_fsq_motion.py`
+- `realtime_fsq_controller.py`
 
-评估与可视化：
+因此当前不要为 Part-FSQ 调用 token database 构建、generator 训练、离线 token rollout 或实时控制。将 Part-FSQ 接入这些模块需要单独设计 40-coordinate token schema、checkpoint metadata 校验和 decoder loading 路径。
 
-```bash
-python evaluate_fsq.py \
-  --checkpoint outputs/fsq_pruned_frame_causal_cnn_20x9/best.pt \
-  --feature-database data/processed/100style_test5_pruned/feature_database \
-  --split test \
-  --device auto \
-  --output outputs/evaluations/fsq_test5.json
-
-python view_motion_sequence.py \
-  --checkpoint outputs/fsq_pruned_frame_causal_cnn_20x9/best.pt \
-  --feature-database data/processed/100style_test5_pruned/feature_database \
-  --range-idx 0 --start 128 --length 256 \
-  --view compare --device auto
-```
-
-### 3. 编码完整 FSQ token database
-
-```bash
-python encode_fsq_database.py \
-  --checkpoint outputs/fsq_pruned_frame_causal_cnn_20x9/best.pt \
-  --feature-database data/processed/100style_test5_pruned/feature_database \
-  --output data/processed/100style_test5_pruned/fsq_20x9_full_loss \
-  --chunk-size 1024 \
-  --device auto \
-  --save-codes
-```
-
-Token database 保存：
-
-- 每个 motion shard 的 `indices [T,20]`；
-- 可选 float16 FSQ codes；
-- style、action、mirror 和 range metadata；
-- train/val/test windows；
-- FSQ checkpoint 路径、配置和 SHA256。
-
-重复写入同一路径时必须显式添加 `--overwrite`。
-
-### 4. 构建 trajectory database
-
-```bash
-python preprocess/build_trajectory_inputs.py \
-  --dataset 100style \
-  --database data/processed/100style_test5_pruned/database.npz \
-  --tags all \
-  --future-frames 20,40,60 \
-  --workers 8 \
-  --output data/processed/100style_test5_pruned/trajectory.npz
-
-python preprocess/build_fsq_trajectory_database.py \
-  --token-database data/processed/100style_test5_pruned/fsq_20x9_full_loss \
-  --trajectory-input data/processed/100style_test5_pruned/trajectory.npz \
-  --output data/processed/100style_test5_pruned/fsq_20x9_full_loss_trajectory_20_40_60
-```
-
-每帧 trajectory 是 18D root-local future control：
-
-```text
-[pos(+20), pos(+40), pos(+60), dir(+20), dir(+40), dir(+60)]
-```
-
-每个 position/direction 都是 xyz。无有效 future control 的帧保存为零向量并令 `valid=false`。对齐后的 trajectory database 必须与 token database 使用完全相同的 shard 顺序、帧数和 tokenizer SHA。
-
-### 5. 训练 conditional generator
-
-默认配置指向完整 100STYLE。使用 test5 数据时通过 CLI 覆盖路径：
-
-```bash
-python train_fsq_conditional_generator.py \
-  --config configs/fsq_generator_conditional.yaml \
-  --token-database data/processed/100style_test5_pruned/fsq_20x9_full_loss \
-  --trajectory-database data/processed/100style_test5_pruned/fsq_20x9_full_loss_trajectory_20_40_60 \
-  --outdir outputs/fsq_generator_conditional_dynamic_film_test5
-```
-
-快速 smoke test：
-
-```bash
-python train_fsq_conditional_generator.py \
-  --config configs/fsq_generator_conditional.yaml \
-  --token-database data/processed/100style_test5_pruned/fsq_20x9_full_loss \
-  --trajectory-database data/processed/100style_test5_pruned/fsq_20x9_full_loss_trajectory_20_40_60 \
-  --outdir outputs/fsq_generator_conditional_smoke \
-  --max-samples 512 --epochs 1 --num-workers 0
-```
-
-### 6. 检查条件是否被模型使用
-
-```bash
-python evaluate_fsq_conditional_generator.py \
-  --checkpoint outputs/fsq_generator_conditional_dynamic_film_test5/best.pt \
-  --token-database data/processed/100style_test5_pruned/fsq_20x9_full_loss \
-  --trajectory-database data/processed/100style_test5_pruned/fsq_20x9_full_loss_trajectory_20_40_60 \
-  --split test \
-  --output outputs/evaluations/fsq_conditional_test5.json
-```
-
-评估报告并列：
-
-- 正确 style 与 trajectory；
-- 循环错置的 style；
-- zero/invalid trajectory；
-- batch 内打乱的 trajectory。
-
-条件 ablation 的 NLL 差异用于判断模型是否真正依赖控制分支。
-
-## 数据与时间对齐
-
-### 230D motion feature
-
-Pruned skeleton 包含 simulation root 和 24 个角色 joints：
-
-```text
-root local linear velocity           3
-root local angular velocity          3
-hips local position                  3
-non-root joint rotations (6D)      144
-hips local velocity                  3
-non-root joint angular velocities   72
-left/right toe contacts              2
-total                              230
-```
-
-`feature_database/metadata.npz` 保存 train-only normalization stats、loss weights、skeleton metadata、motion shard 路径和 split windows。Motion shard 通过 mmap 读取。
-
-窗口在 clip 内近似按 80/10/10 划分，original 与 mirror 使用相同 split。当前划分服务于 reconstruction 和 generator 开发，不应视为严格的跨动作或跨 style 泛化协议。
-
-### Next-token control alignment
-
-对一个长度为 `W` 的 token window：
-
-```text
-indices:    x0, x1, ..., x(W-1)       [W,20]
-inputs:     x0, x1, ..., x(W-2)       [W-1,20]
-targets:    x1, x2, ..., x(W-1)       [W-1,20]
-trajectory: c1, c2, ..., c(W-1)       [W-1,18]
-```
-
-`ct` 表示目标帧 `xt` 自身坐标系下的 future trajectory。因此模型位置 `t` 的关系是：
-
-```text
-input xt + control c(t+1) + style → predict x(t+1)
-```
-
-Trajectory normalization 只从 train windows 覆盖的有效目标帧拟合。当前训练不做 trajectory dropout。
-
-## FSQ tokenizer
-
-推荐配置：[configs/fsq_pruned_frame_causal_cnn.yaml](configs/fsq_pruned_frame_causal_cnn.yaml)。
-
-```text
-normalized motion [B,T,230]
-  → frame-causal CNN encoder
-  → FSQ indices [B,T,20], each in 0...8
-  → dequantization
-  → frame-causal CNN decoder
-  → reconstructed motion [B,T,230]
-```
-
-Encoder/decoder receptive field 为 64 帧，只依赖当前帧及左侧历史，没有 lookahead。当前 objective 包含：
-
-- weighted feature L1 与 adjacent-frame delta L1；
-- integrated root position/rotation error；
-- differentiable FK joint-position loss；
-- toe-contact BCE；
-- ground-truth-contact-gated foot sliding 与 foot-height loss。
-
-训练同时记录 level perplexity/usage、tuple unique ratio、tuple change rate 和 coordinate change rate。
-
-## Generator 实现
-
-核心实现位于 [models/fsq_generator.py](models/fsq_generator.py)。无条件和条件 generator 共享同一个 causal Transformer 主体。
-
-### Token embedding
-
-每个 FSQ coordinate 使用独立的 level vocabulary 区间：
-
-```text
-indices [B,T,20]
-  → coordinate-aware level embedding [B,T,20,16]
-  → concatenate [B,T,320]
-  → Linear + RMSNorm
-  → frame hidden [B,T,256]
-```
-
-Transformer 最终一次性输出 20 个 9-way categorical distributions；同一帧内的 coordinate 不进行额外自回归。
-
-### Trajectory conditioning
-
-```text
-[trajectory_18D, valid_flag]
-  → Linear(19,128)
-  → SiLU
-  → Linear(128,256)
-  → RMSNorm
-  → add to frame hidden
-```
-
-### Causal dynamic block FiLM
-
-当前 style 架构标识为：
-
-```text
-causal_dynamic_block_film_v1
-```
-
-`style_id` 先映射为 128D embedding。在每个 Transformer block 中，attention 和 FFN 前各有一套独立 Dynamic FiLM：
-
-```text
-u = RMSNorm(h)
-condition = RMSNorm(u + style_projection(style_embedding))
-gamma, beta = MLP(condition)
-u_style = u * (1 + 0.5 * tanh(gamma)) + beta
-```
-
-FiLM 参数 shape 为 `[B,T,256]`，因此即使一个 training clip 使用同一个 style，调制仍会随当前 causal hidden state 逐帧变化。
-
-默认条件模型配置：
-
-| 项目 | 值 |
-| --- | ---: |
-| context | 64 frames |
-| model dim | 256 |
-| Transformer blocks | 6 |
-| query / KV heads | 8 / 4 |
-| FFN dim | 768 |
-| style embedding | 128 |
-| trajectory hidden | 128 |
-| optimizer | AdamW |
-| initial LR | 3e-4 |
-
-### Output 与 loss
-
-```text
-hidden [B,T,256]
-  → RMSNorm
-  → Linear(256,20×9)
-  → logits [B,T,20,9]
-```
-
-训练 loss 是所有时间位置、所有 FSQ coordinate 上的 cross entropy。完整条件 Transformer、style embedding、FiLM 和 trajectory encoder 都从零训练。
-
-## KV cache 与实时切换
-
-每个 Transformer block 保存最近 64 个输入帧的 K/V；`next_position` 持续增长，因此 RoPE 仍使用绝对位置。cache 不包含 style prefix，`prefix_length=0`。
-
-正常生成步骤：
-
-```text
-cache 已处理到 xt，并持有预测 x(t+1) 的 logits
-  → sample x(t+1)
-  → 取 control c(t+2)
-  → decode_step(x(t+1), c(t+2), current_style)
-  → append 新 K/V，超出 64 帧时丢弃最旧 K/V
-  → 得到预测 x(t+2) 的 logits
-```
-
-Checkpoint 中的 style cache policy 为 `append_only`：历史 K/V 保留其生成时的 style。实时切换 style 时，为了立即影响下一次采样，controller 只做一次局部 replay：
-
-1. 从 cache 移除最新输入 token 的 K/V；
-2. 保留更早的历史 K/V；
-3. 用新 style 和同一 trajectory 重放最新输入 token；
-4. 更新最新 K/V 与 staged next-token logits。
-
-因此不会重建整个 64-frame cache；更早的旧 style K/V 会在后续生成中自然滑出窗口。
-
-Trajectory command 更新目前会替换最新 control 并重新 prefill rolling history，以保证新的 command 立即进入下一次采样。
-
-## Generator 训练与评估
-
-### 无条件 generator
-
-```bash
-python train_fsq_generator.py \
-  --config configs/fsq_generator.yaml
-```
-
-评估 teacher-forced NLL、rollout、decoded motion 和增量推理延迟：
-
-```bash
-python evaluate_fsq_generator.py \
-  --checkpoint outputs/fsq_generator/best.pt \
-  --token-database data/processed/100style_pruned/fsq_20x9_full_loss \
-  --fsq-checkpoint <MATCHING_FSQ_CHECKPOINT> \
-  --split test \
-  --output outputs/evaluations/fsq_generator_test.json
-```
-
-离线生成无条件 continuation：
-
-```bash
-python generate_fsq_motion.py \
-  --checkpoint outputs/fsq_generator/best.pt \
-  --token-database data/processed/100style_pruned/fsq_20x9_full_loss \
-  --fsq-checkpoint <MATCHING_FSQ_CHECKPOINT> \
-  --range-idx 0 --start 128 \
-  --seed-frames 64 --generate-frames 120 \
-  --sample --temperature 0.8 \
-  --output-dir outputs/generated/fsq_unconditional
-```
-
-### 条件 generator checkpoint 约束
-
-加载条件 checkpoint 时会校验：
-
-- `model_family == fsq_conditional_generator`；
-- `style_conditioning == causal_dynamic_block_film_v1`；
-- `style_cache_policy == append_only`；
-- checkpoint、token database、trajectory database 的 tokenizer SHA 一致；
-- style vocabulary、FSQ coordinates/levels 和 shard layout 一致。
-
-旧 style-prefix、输入层静态 FiLM 或缺少 cache-policy metadata 的 checkpoint 不兼容当前实现。
-
-## 实时控制
-
-`realtime_fsq_controller.py` 同时支持无条件与当前条件 generator checkpoint。
-
-Headless dry run：
-
-```bash
-python realtime_fsq_controller.py \
-  --generator-checkpoint outputs/fsq_generator_conditional_dynamic_film_test5/best.pt \
-  --token-database data/processed/100style_test5_pruned/fsq_20x9_full_loss \
-  --fsq-checkpoint outputs/fsq_pruned_frame_causal_cnn_20x9/best.pt \
-  --trajectory-database data/processed/100style_test5_pruned/fsq_20x9_full_loss_trajectory_20_40_60 \
-  --style-id 0 \
-  --range-idx 0 --start 128 --seed-frames 64 \
-  --dry-run --dry-run-frames 120
-```
-
-交互模式可省略 `--dry-run`。键盘控制：
-
-| 键位 | 功能 |
-| --- | --- |
-| `W/S` | 前进 / 后退 |
-| `A/D` | 左右侧移 |
-| `Q/E` | 左右转向 |
-| `J/K` | 上一个 / 下一个 style |
-| `Space` | 暂停 / 继续 |
-| `R` | 重置 |
-
-建议实时生成使用 `--sample --temperature 0.8`，并通过 `--move-speed`、`--turn-speed` 调整键盘 trajectory。
-
-程序化接口：
-
-```python
-controller.set_style(style_id)
-controller.set_trajectory_control(raw_18d, valid=True)
-controller.set_trajectory_control(None)  # 恢复 reference trajectory
-```
-
-外部 trajectory 输入使用未归一化的 18D root-local layout；controller 使用 checkpoint 中保存的 train normalization 自动归一化。
-
-## Token 到动作
-
-生成新 token 后，controller 使用最近最多 64 帧 token：
-
-```text
-FSQ indices
-  → frozen FSQ dequantization
-  → frozen causal CNN decoder
-  → normalized 230D feature
-  → denormalization / root integration / FK
-  → local joint positions and rotations
-```
-
-FSQ decoder 是 causal model，因此 rolling 64-frame token history 足以恢复当前最后一帧 feature。
-
-## 可视化工具
-
-打开原始 motion database：
-
-```bash
-python Genoview.py \
-  --database data/processed/100style_test5_pruned/database.npz
-```
-
-显示 future trajectory：
-
-```bash
-python Genoview.py \
-  --database data/processed/100style_test5_pruned/database.npz \
-  --trajectory data/processed/100style_test5_pruned/trajectory.npz
-```
-
-查看 tokenizer 连续片段重建：
-
-```bash
-python view_motion_sequence.py \
-  --checkpoint outputs/fsq_pruned_frame_causal_cnn_20x9/best.pt \
-  --feature-database data/processed/100style_test5_pruned/feature_database \
-  --range-idx 0 --start 128 --length 256 \
-  --view compare
-```
-
-无显示环境可添加 `--dry-run --save-debug`。`Genoview.py` 也可以读取独立 `[T,D]` `.npy/.npz` feature 文件；normalized feature 必须同时提供 `--stats-source`。
-
-## VQ-VAE baseline
-
-```bash
-python train_vqvae.py --config configs/vqvae_pruned.yaml
-```
-
-其他配置：
-
-- `configs/vqvae_pruned_frame_causal_cnn.yaml`
-- `configs/vqvae_pruned_causal_transformer.yaml`
-
-## 验证
+## 测试
 
 ```bash
 python -m pytest -q
 ```
 
-测试覆盖：
-
-- causal CNN receptive field；
-- FSQ codes/indices roundtrip 与 STE gradient；
-- motion feature、6D rotation、FK 和 kinematic losses；
-- preprocessing 与 mmap database；
-- unconditional/conditional generator cache/full-forward 一致性；
-- dynamic FiLM、style-switch replay 和 bounded KV cache；
-- realtime keyboard trajectory mapping。
+测试覆盖 causal receptive field、FSQ index/code roundtrip、STE gradient、kinematic losses、feature-database window adapter、Part-FSQ layout/参数共享/因果性，以及 adaptive reuse contact gating。
 
 ## 代码结构
 
 ```text
 configs/
-  fsq_pruned_frame_causal_cnn.yaml       FSQ tokenizer 主配置
-  fsq_generator.yaml                     无条件 generator
-  fsq_generator_conditional.yaml         style + trajectory 条件 generator
-
-models/
-  fsq.py                                 FSQ encoder/quantizer/decoder
-  fsq_generator.py                       causal Transformer、FiLM、KV cache
-  causal_cnn.py                          frame-causal convolution modules
-  losses.py                              reconstruction 与 kinematic losses
+  part_fsq_pruned.yaml                 Part-FSQ 主配置
+  fsq_pruned_frame_causal_cnn.yaml     Flat-FSQ 基线配置
 
 datasets/
-  feature_dataset.py                     mmap motion feature windows
-  fsq_token_dataset.py                   frozen FSQ token windows
-  fsq_trajectory_dataset.py              shifted next-token trajectory controls
+  feature_dataset.py                   mmap feature windows；V1/V2 metadata adapter
 
-preprocess/
-  build_data.py                          BVH → database + feature database
-  build_database.py                      motion processing 与 disk-backed writer
-  build_feature_database.py              split、stats 与 pipeline orchestration
-  build_trajectory_inputs.py             raw future trajectory
-  build_fsq_trajectory_database.py       trajectory → FSQ shard alignment
+models/
+  part_layout.py                       skeleton → static body-part feature partition
+  part_fsq.py                          dense causal Hierarchical Part-FSQ
+  part_fsq_losses.py                   adaptive latent reuse loss
+  fsq.py                               Flat-FSQ quantizer / tokenizer
+  causal_cnn.py                        shared causal CNN modules
+  losses.py                            reconstruction 与 kinematic losses
 
-train_fsq.py                             FSQ tokenizer 训练
-encode_fsq_database.py                   完整 motion shard tokenization
-train_fsq_generator.py                   无条件 generator 训练
-train_fsq_conditional_generator.py       当前条件 generator 训练
-evaluate_fsq.py                          tokenizer 定量评估
-evaluate_fsq_generator.py                无条件 generator 评估
-evaluate_fsq_conditional_generator.py    条件 ablation
-generate_fsq_motion.py                   无条件离线 continuation
-realtime_fsq_controller.py               实时 token rollout 与 GenoView
-view_motion_sequence.py                  source/reconstruction 对比
-Genoview.py                              database、feature 与 realtime viewer
+train_part_fsq.py                      Part-FSQ train / resume / logging
+train_fsq.py                           Flat-FSQ baseline training
+evaluate_fsq.py                        Flat-FSQ / Part-FSQ tokenizer evaluation
+preprocess/build_data.py               BVH → database + feature database
+tests/test_part_fsq.py                 Part-FSQ unit tests
 ```
-
-## 实验注意事项
-
-- Token database 与 generator checkpoint 强绑定 FSQ checkpoint SHA；不要混用不同 tokenizer 产生的 token。
-- Trajectory database 只保存 raw values；normalization 由条件训练脚本从 train targets 拟合并写入 checkpoint。
-- `window_size`、FSQ causal receptive field 和 generator context 应保持一致；当前主线使用 64 帧。
-- 输出目录命名不是兼容性依据，应以 checkpoint 内的 `model_family`、model config、style metadata 和 tokenizer SHA 为准。
-- 工作树中的旧 checkpoint 可能来自已淘汰架构；当前 loader 会主动拒绝不兼容的 conditional checkpoint。
