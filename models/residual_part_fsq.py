@@ -272,7 +272,7 @@ class ResidualPartFSQMotionAutoencoder(nn.Module):
         base = embeddings["base"]
         if base.ndim != 3 or base.shape[-1] != self.base_code_dim:
             raise ValueError(f"Base embedding must have shape [B, T, {self.base_code_dim}]")
-        base_recon = self.base_decoder(base.permute(0, 2, 1).contiguous()).permute(0, 2, 1).contiguous()
+        base_recon = self._decode_base_embedding(base)
 
         streams = []
         for part in PART_NAMES:
@@ -301,6 +301,11 @@ class ResidualPartFSQMotionAutoencoder(nn.Module):
             residuals[part] = residual
             recon[..., self._feature_index(part)] = recon[..., self._feature_index(part)] + residual
         return recon, base_recon, residuals
+
+    def _decode_base_embedding(self, embedding: torch.Tensor) -> torch.Tensor:
+        if embedding.ndim != 3 or embedding.shape[-1] != self.base_code_dim:
+            raise ValueError(f"Base embedding must have shape [B, T, {self.base_code_dim}]")
+        return self.base_decoder(embedding.permute(0, 2, 1).contiguous()).permute(0, 2, 1).contiguous()
 
     def _decode_indices_to_embeddings(self, indices: torch.Tensor) -> dict[str, torch.Tensor]:
         self._validate_code_tensor(indices, "indices")
@@ -408,3 +413,12 @@ class ResidualPartFSQMotionAutoencoder(nn.Module):
         recon, _, _ = self._decode_embeddings(self._decode_codes_to_embeddings(codes), apply_dropout=False)
         return recon
 
+    def decode_base_from_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Decode only the holistic base path from a full 40-coordinate index tensor."""
+        embeddings = self._decode_indices_to_embeddings(indices)
+        return self._decode_base_embedding(embeddings["base"])
+
+    def decode_base_from_codes(self, codes: torch.Tensor) -> torch.Tensor:
+        """Decode only the holistic base path from a full 40-coordinate code tensor."""
+        embeddings = self._decode_codes_to_embeddings(codes)
+        return self._decode_base_embedding(embeddings["base"])
