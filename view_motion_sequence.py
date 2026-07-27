@@ -8,12 +8,14 @@ import torch
 from datasets.feature_dataset import build_feature_store
 from Genoview import GenoView, GenoViewCompare, build_database_from_feature_array
 from models.fsq import FSQMotionAutoencoder
+from models.part_fsq import HierarchicalPartFSQMotionAutoencoder
+from models.residual_part_fsq import ResidualPartFSQMotionAutoencoder
 from models.vqvae import CausalMotionVQVAE
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="View a continuous database motion segment through an FSQ or VQ-VAE checkpoint.")
-    parser.add_argument("--checkpoint", type=Path, required=True, help="Path to FSQ or VQ-VAE checkpoint.")
+    parser = argparse.ArgumentParser(description="View a motion segment through an FSQ-family or VQ-VAE checkpoint.")
+    parser.add_argument("--checkpoint", type=Path, required=True, help="Path to a supported tokenizer checkpoint.")
     parser.add_argument("--feature-database", type=Path, default=None, help="Path to feature_database. Defaults to checkpoint args.")
     parser.add_argument("--range-idx", type=int, required=True, help="Motion shard / range index in feature_database metadata.")
     parser.add_argument("--start", type=int, required=True, help="Target segment start frame.")
@@ -53,9 +55,14 @@ def choose_device(name: str) -> torch.device:
 
 def build_model_from_checkpoint(ckpt: dict):
     family = ckpt["model_family"]
-    if family not in {"fsq", "vqvae"}:
+    if family not in {"fsq", "part_fsq", "residual_part_fsq", "vqvae"}:
         raise ValueError(f"Unsupported model_family: {family}")
-    model_class = FSQMotionAutoencoder if family == "fsq" else CausalMotionVQVAE
+    model_class = {
+        "fsq": FSQMotionAutoencoder,
+        "part_fsq": HierarchicalPartFSQMotionAutoencoder,
+        "residual_part_fsq": ResidualPartFSQMotionAutoencoder,
+        "vqvae": CausalMotionVQVAE,
+    }[family]
     model = model_class(**ckpt["model_config"])
     model.load_state_dict(ckpt["model"])
     return model, family
