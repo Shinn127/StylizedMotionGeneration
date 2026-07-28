@@ -17,6 +17,7 @@ from models.losses import (
     reconstruct_joint_positions,
 )
 from models.part_fsq import HierarchicalPartFSQMotionAutoencoder
+from models.latent_residual_part_fsq import LatentResidualPartFSQMotionAutoencoder
 from models.residual_part_fsq import ResidualPartFSQMotionAutoencoder
 from preprocess import quat
 
@@ -54,7 +55,12 @@ def choose_device(name: str) -> torch.device:
     return device
 
 
-TokenizerModel = FSQMotionAutoencoder | HierarchicalPartFSQMotionAutoencoder | ResidualPartFSQMotionAutoencoder
+TokenizerModel = (
+    FSQMotionAutoencoder
+    | HierarchicalPartFSQMotionAutoencoder
+    | ResidualPartFSQMotionAutoencoder
+    | LatentResidualPartFSQMotionAutoencoder
+)
 
 
 def load_checkpoint(path: Path, device: torch.device) -> tuple[dict, TokenizerModel]:
@@ -68,6 +74,8 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[dict, TokenizerMo
         model = HierarchicalPartFSQMotionAutoencoder(**checkpoint["model_config"])
     elif family == "residual_part_fsq":
         model = ResidualPartFSQMotionAutoencoder(**checkpoint["model_config"])
+    elif family == "latent_residual_part_fsq":
+        model = LatentResidualPartFSQMotionAutoencoder(**checkpoint["model_config"])
     else:
         raise ValueError(f"{path} is not a supported FSQ tokenizer checkpoint: {family!r}")
     model = model.to(device)
@@ -175,7 +183,11 @@ def evaluate_checkpoint(
             model_motion = (target_raw - kinematics["offset"].view(1, 1, -1)) / kinematics["scale"].view(1, 1, -1)
             output = (
                 model(model_motion, collect_metrics=True)
-                if checkpoint.get("model_family") in {"part_fsq", "residual_part_fsq"}
+                if checkpoint.get("model_family") in {
+                    "part_fsq",
+                    "residual_part_fsq",
+                    "latent_residual_part_fsq",
+                }
                 else model(model_motion)
             )
             prediction_raw = denormalize_motion_features(

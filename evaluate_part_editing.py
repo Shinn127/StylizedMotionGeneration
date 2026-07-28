@@ -10,13 +10,18 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from datasets.feature_dataset import FeatureDataset, build_feature_store
+from models.latent_residual_part_fsq import LatentResidualPartFSQMotionAutoencoder
 from models.part_fsq import HierarchicalPartFSQMotionAutoencoder
 from models.part_layout import PART_NAMES
 from models.residual_part_fsq import ResidualPartFSQMotionAutoencoder
 from models.losses import denormalize_motion_features
 
 
-TokenizerModel = HierarchicalPartFSQMotionAutoencoder | ResidualPartFSQMotionAutoencoder
+TokenizerModel = (
+    HierarchicalPartFSQMotionAutoencoder
+    | ResidualPartFSQMotionAutoencoder
+    | LatentResidualPartFSQMotionAutoencoder
+)
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -93,10 +98,12 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[dict, TokenizerMo
         model: TokenizerModel = HierarchicalPartFSQMotionAutoencoder(**checkpoint["model_config"])
     elif family == "residual_part_fsq":
         model = ResidualPartFSQMotionAutoencoder(**checkpoint["model_config"])
+    elif family == "latent_residual_part_fsq":
+        model = LatentResidualPartFSQMotionAutoencoder(**checkpoint["model_config"])
     else:
         raise ValueError(
             f"{path} is not a Part-FSQ editing checkpoint: {family!r}; "
-            "expected 'part_fsq' or 'residual_part_fsq'"
+            "expected 'part_fsq', 'residual_part_fsq', or 'latent_residual_part_fsq'"
         )
     model.load_state_dict(checkpoint["model"])
     model = model.to(device)
@@ -328,7 +335,10 @@ def evaluate_checkpoint(
             source_motion = (source_raw - checkpoint_offset.view(1, 1, -1)) / checkpoint_scale.view(1, 1, -1)
             donor_motion = (donor_raw - checkpoint_offset.view(1, 1, -1)) / checkpoint_scale.view(1, 1, -1)
 
-            encoded = model(torch.cat((source_motion, donor_motion), dim=0))
+            if family in {"residual_part_fsq", "latent_residual_part_fsq"}:
+                encoded = model(torch.cat((source_motion, donor_motion), dim=0), decode_base=True)
+            else:
+                encoded = model(torch.cat((source_motion, donor_motion), dim=0))
             source_indices = encoded["indices"][:batch_size]
             donor_indices = encoded["indices"][batch_size:]
             source_recon = encoded["recon_state"][:batch_size]
@@ -341,7 +351,7 @@ def evaluate_checkpoint(
 
             source_base = None
             edited_base = None
-            if family == "residual_part_fsq":
+            if family in {"residual_part_fsq", "latent_residual_part_fsq"}:
                 source_base = encoded["base_recon_state"][:batch_size]
                 edited_base = model.decode_base_from_indices(flat_edited_indices).reshape(
                     batch_size, len(parts), flat_edited.shape[1], flat_edited.shape[2]
@@ -421,7 +431,7 @@ def print_report(report: dict[str, object]) -> None:
             f"leakage_ratio={metrics['leakage_ratio']:.8f} "
             f"target_transfer_gain={metrics['target_transfer_gain']:.8f}"
         )
-        if report["model_family"] == "residual_part_fsq":
+        if report["model_family"] in {"residual_part_fsq", "latent_residual_part_fsq"}:
             print(f"part={part} base_change={metrics['base_change']:.8f}")
 
 

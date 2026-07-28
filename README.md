@@ -238,6 +238,17 @@ python evaluate_fsq.py \
 
 报告包含 feature reconstruction、root trajectory、FK joint error、contact precision/recall/F1、foot slide/height，以及 FSQ representation metrics。`--checkpoint` 可重复传入，以同一数据集切分比较多个 tokenizer。
 
+## Latent Residual Part-FSQ
+
+`latent_residual_part_fsq` 保持 Residual Part-FSQ 的 `20 base + 20 part`、40×9 token 布局，但将五个 part embedding 投影到 holistic base latent，在单一 causal decoder 前完成融合。训练时通过 `decode_base=True` 将 base/fused latent 拼到 batch 维共同解码；`decode_from_indices` 和 `decode_from_codes` 的推理路径只运行一次 decoder。
+
+```bash
+python train_latent_residual_part_fsq.py \
+  --config configs/latent_residual_part_fsq_pruned.yaml
+```
+
+可通过 `--init-from-residual-checkpoint` 选择性加载 feature-side Residual Part-FSQ 的 encoder、quantizer 与 base decoder。新旧模型虽然坐标布局相同，但 `model_family` 和 part token 语义不同，checkpoint/token database 不能直接互换。`evaluate_fsq.py` 和 `evaluate_part_editing.py` 均支持新 family。
+
 ## Flat-FSQ 基线
 
 旧的 frame-level Flat-FSQ 仍可用于对照：20 个 9-level 坐标，causal CNN encoder/decoder，receptive field 同为 64。
@@ -277,6 +288,8 @@ python -m pytest -q
 ```text
 configs/
   part_fsq_pruned.yaml                 Part-FSQ 主配置
+  residual_part_fsq_pruned.yaml        feature-side Residual Part-FSQ
+  latent_residual_part_fsq_pruned.yaml single-decoder latent residual 配置
   fsq_pruned_frame_causal_cnn.yaml     Flat-FSQ 基线配置
 
 datasets/
@@ -285,14 +298,21 @@ datasets/
 models/
   part_layout.py                       skeleton → static body-part feature partition
   part_fsq.py                          dense causal Hierarchical Part-FSQ
+  residual_part_fsq.py                 feature-side Residual Part-FSQ
+  latent_residual_part_fsq.py          single-decoder latent Residual Part-FSQ
   part_fsq_losses.py                   adaptive latent reuse loss
   fsq.py                               Flat-FSQ quantizer / tokenizer
   causal_cnn.py                        shared causal CNN modules
   losses.py                            reconstruction 与 kinematic losses
 
 train_part_fsq.py                      Part-FSQ train / resume / logging
+train_residual_part_fsq.py             feature-side Residual Part-FSQ trainer
+train_latent_residual_part_fsq.py      latent Residual Part-FSQ trainer
 train_fsq.py                           Flat-FSQ baseline training
-evaluate_fsq.py                        Flat-FSQ / Part-FSQ tokenizer evaluation
+evaluate_fsq.py                        unified tokenizer evaluation
+evaluate_part_editing.py               body-part token editing evaluation
 preprocess/build_data.py               BVH → database + feature database
 tests/test_part_fsq.py                 Part-FSQ unit tests
+tests/test_residual_part_fsq.py        feature-side residual tests
+tests/test_latent_residual_part_fsq.py latent-side residual tests
 ```

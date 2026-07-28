@@ -6,6 +6,7 @@ from evaluate_part_editing import (
     model_feature_indices,
     model_group_slices,
 )
+from models.latent_residual_part_fsq import LatentResidualPartFSQMotionAutoencoder
 from models.part_fsq import HierarchicalPartFSQMotionAutoencoder
 from models.residual_part_fsq import ResidualPartFSQMotionAutoencoder
 
@@ -99,3 +100,43 @@ def test_residual_part_edit_keeps_base_path_unchanged():
         source_base = model.decode_base_from_indices(source_indices)
         edited_base = model.decode_base_from_indices(edited_indices)
     torch.testing.assert_close(edited_base, source_base, rtol=0.0, atol=0.0)
+
+
+def test_latent_residual_part_edit_keeps_base_fixed_and_reports_soft_leakage():
+    torch.manual_seed(47)
+    names, parents = _skeleton()
+    model = LatentResidualPartFSQMotionAutoencoder(
+        names,
+        parents,
+        base_code_dim=32,
+        base_width=32,
+        part_state_dim=16,
+        latent_fusion_hidden_dim=24,
+        residual_group_dropout=0.0,
+    ).eval()
+    for projector in model.latent_residual_fuse.values():
+        torch.nn.init.normal_(projector[-1].weight, std=0.05)
+        torch.nn.init.normal_(projector[-1].bias, std=0.01)
+
+    motion = torch.randn(1, 64, model.motion_dim)
+    with torch.no_grad():
+        source_indices = model.encode_to_indices(motion)
+        donor_indices = source_indices.clone()
+        part_slice = model.group_slices["left_arm"]
+        donor_indices[..., part_slice] = 8 - donor_indices[..., part_slice]
+        edited_indices = edit_indices(source_indices, donor_indices, part_slice)
+        source_base = model.decode_base_from_indices(source_indices)
+        edited_base = model.decode_base_from_indices(edited_indices)
+        source_recon = model.decode_from_indices(source_indices)
+        edited = model.decode_from_indices(edited_indices)
+
+    torch.testing.assert_close(edited_base, source_base, rtol=0.0, atol=0.0)
+    response = (edited - source_recon).abs()
+    features = model_feature_indices(model)
+    target_response = response.index_select(-1, features["left_arm"]).mean()
+    non_target = torch.ones(model.motion_dim, dtype=torch.bool)
+    non_target[features["left_arm"]] = False
+    non_target_response = response[..., non_target].mean()
+    leakage_ratio = non_target_response / target_response.clamp_min(1e-7)
+    assert target_response > 0.0
+    assert torch.isfinite(leakage_ratio)
