@@ -10,7 +10,6 @@ from torch.utils.tensorboard import SummaryWriter
 from models.latent_residual_part_fsq import LatentResidualPartFSQMotionAutoencoder
 from models.part_layout import PART_NAMES
 from models.residual_part_fsq import GROUP_COORDINATES, GROUP_NAMES
-from models.residual_part_fsq_losses import adaptive_base_reuse_loss
 from motion_features import serialize_motion_feature_stats
 from train_residual_part_fsq import (
     build_dataloaders,
@@ -39,13 +38,13 @@ def parse_args(argv=None):
         return None if value is None else Path(value)
 
     parser = argparse.ArgumentParser(
-        description="Train full-FP32 latent Residual Part-FSQ on fixed 64-frame windows."
+        description="Train full-FP32 latent Residual Part-FSQ V2 on fixed 64-frame windows."
     )
     parser.add_argument("--config", type=Path, default=pre_args.config)
     parser.add_argument("--split-train", default=cfg("split_train", "train"))
     parser.add_argument("--split-val", default=cfg("split_val", "val"))
     parser.add_argument("--feature-database", type=Path, default=cfg_path("feature_database", None))
-    parser.add_argument("--batch-size", type=int, default=cfg("batch_size", 256))
+    parser.add_argument("--batch-size", type=int, default=cfg("batch_size", 512))
     parser.add_argument("--epochs", type=int, default=cfg("epochs", 100))
     parser.add_argument("--lr", type=float, default=cfg("lr", 2e-4))
     parser.add_argument("--min-lr", type=float, default=cfg("min_lr", 1e-5))
@@ -54,11 +53,6 @@ def parse_args(argv=None):
     parser.add_argument("--deterministic", action="store_true", default=cfg("deterministic", False))
     parser.add_argument("--grad-clip-norm", type=float, default=cfg("grad_clip_norm", 1.0))
     parser.add_argument("--resume", type=Path, default=cfg_path("resume", None))
-    parser.add_argument(
-        "--init-from-residual-checkpoint",
-        type=Path,
-        default=cfg_path("init_from_residual_checkpoint", None),
-    )
     parser.add_argument("--save-every", type=int, default=cfg("save_every", 0))
     parser.add_argument("--num-workers", type=int, default=cfg("num_workers", default_num_workers()))
     parser.add_argument("--prefetch-factor", type=int, default=cfg("prefetch_factor", 4))
@@ -69,26 +63,26 @@ def parse_args(argv=None):
     parser.add_argument("--base-width", type=int, default=cfg("base_width", 512))
     parser.add_argument("--part-state-dim", type=int, default=cfg("part_state_dim", 64))
     parser.add_argument(
-        "--latent-fusion-hidden-dim", type=int, default=cfg("latent_fusion_hidden_dim", 128)
+        "--part-predictor-hidden-dim", type=int, default=cfg("part_predictor_hidden_dim", 128)
     )
-    parser.add_argument("--residual-group-dropout", type=float, default=cfg("residual_group_dropout", 0.1))
+    parser.add_argument(
+        "--latent-projector-hidden-dim", type=int, default=cfg("latent_projector_hidden_dim", 128)
+    )
+    parser.add_argument(
+        "--part-latent-dims",
+        type=int,
+        nargs=len(PART_NAMES),
+        default=cfg("part_latent_dims", [40, 24, 24, 20, 20]),
+        metavar=("TORSO", "LEFT_LEG", "RIGHT_LEG", "LEFT_ARM", "RIGHT_ARM"),
+    )
     parser.add_argument("--fsq-num-levels", type=int, default=cfg("fsq_num_levels", 9))
     parser.add_argument("--fsq-scale", type=float, default=cfg("fsq_scale", None))
     parser.add_argument(
         "--fsq-preserve-symmetry", action="store_true", default=cfg("fsq_preserve_symmetry", False)
     )
     parser.add_argument("--fsq-noise-dropout", type=float, default=cfg("fsq_noise_dropout", 0.0))
-    parser.add_argument("--base-loss-weight", type=float, default=cfg("base_loss_weight", 0.25))
-    parser.add_argument("--base-reuse-weight", type=float, default=cfg("base_reuse_weight", 0.0025))
-    parser.add_argument("--base-reuse-threshold", type=float, default=cfg("base_reuse_threshold", 1.0))
-    parser.add_argument(
-        "--latent-residual-energy-weight",
-        type=float,
-        default=cfg("latent_residual_energy_weight", 1e-4),
-    )
-    parser.add_argument(
-        "--contact-transition-threshold", type=float, default=cfg("contact_transition_threshold", 0.25)
-    )
+    parser.add_argument("--base-loss-weight", type=float, default=cfg("base_loss_weight", 0.1))
+    parser.add_argument("--edit-loss-weight", type=float, default=cfg("edit_loss_weight", 1.0))
     parser.add_argument("--delta-weight", type=float, default=cfg("delta_weight", 3.0))
     parser.add_argument("--root-pos-weight", type=float, default=cfg("root_pos_weight", 0.1))
     parser.add_argument("--root-rot-weight", type=float, default=cfg("root_rot_weight", 0.1))
@@ -113,7 +107,55 @@ def parse_args(argv=None):
     return args
 
 
-def compute_losses(model, motion, output, feature_weights, feature_offset, feature_scale, metadata, args):
+def donor_permutation(batch_size: int, device: torch.device, offset: int | None = None) -> torch.Tensor:
+    if batch_size < 2:
+        return torch.zeros(batch_size, dtype=torch.long, device=device)
+    if offset is None:
+        offset = int(torch.randint(1, batch_size, (), device=device))
+    offset = int(offset) % batch_size
+    if offset == 0:
+        offset = 1
+    return (torch.arange(batch_size, device=device) + offset) % batch_size
+
+
+def _weighted_region_l1(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    feature_weights: torch.Tensor,
+    feature_index: torch.Tensor,
+) -> torch.Tensor:
+    error = (prediction - target).abs().index_select(-1, feature_index)
+    weights = feature_weights.index_select(0, feature_index)
+    return (error * weights.view(1, 1, -1)).sum(dim=-1).div(weights.sum().clamp_min(1e-7)).mean()
+
+
+def edit_reconstruction_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    target_features: torch.Tensor,
+    motion_dim: int,
+    feature_weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    mask = torch.ones(motion_dim, dtype=torch.bool, device=prediction.device)
+    mask[target_features] = False
+    non_target_features = torch.arange(motion_dim, device=prediction.device)[mask]
+    target_l1 = _weighted_region_l1(prediction, target, feature_weights, target_features)
+    non_target_l1 = _weighted_region_l1(prediction, target, feature_weights, non_target_features)
+    return 0.5 * (target_l1 + non_target_l1), target_l1, non_target_l1
+
+
+def compute_losses(
+    model,
+    motion,
+    output,
+    edit_part,
+    permutation,
+    feature_weights,
+    feature_offset,
+    feature_scale,
+    metadata,
+    args,
+):
     final = reconstruction_loss(
         motion, output["recon_state"], feature_weights, feature_offset, feature_scale, metadata, args, base=False
     )
@@ -127,24 +169,25 @@ def compute_losses(model, motion, output, feature_weights, feature_offset, featu
         args,
         base=True,
     )
-    reuse = adaptive_base_reuse_loss(
-        base_codes=output["base_codes"],
-        target_motion=motion,
-        layout=unwrap_model(model).layout,
-        thresholds=args.base_reuse_threshold,
-        feature_weights=feature_weights,
-        contact_values=final.target_contact,
-        contact_transition_threshold=args.contact_transition_threshold,
-        level_step=2.0 / float(args.fsq_num_levels - 1),
+    unwrapped = unwrap_model(model)
+    target_features = unwrapped._feature_index(edit_part)
+    donor_motion = motion.index_select(0, permutation)
+    source_base = output["base_recon_state"].detach()
+    donor_base = source_base.index_select(0, permutation)
+    edit_target = motion.clone()
+    donor_residual = donor_motion.index_select(-1, target_features) - donor_base.index_select(
+        -1, target_features
     )
-    latent_energy = output["latent_residual_energy"]
-    total = (
-        final.loss
-        + float(args.base_loss_weight) * base.loss
-        + float(args.base_reuse_weight) * reuse.loss
-        + float(args.latent_residual_energy_weight) * latent_energy
+    edit_target[..., target_features] = source_base.index_select(-1, target_features) + donor_residual
+    edit, edit_target_l1, edit_non_target_l1 = edit_reconstruction_loss(
+        output["edit_recon_state"],
+        edit_target,
+        target_features,
+        unwrapped.motion_dim,
+        feature_weights,
     )
-    return final, base, reuse, latent_energy, total
+    total = final.loss + float(args.base_loss_weight) * base.loss + float(args.edit_loss_weight) * edit
+    return final, base, edit, edit_target_l1, edit_non_target_l1, total
 
 
 LOSS_METRICS = (
@@ -161,7 +204,9 @@ LOSS_METRICS = (
     "base_recon",
     "base_delta",
     "base_joint",
-    "base_reuse",
+    "edit_loss",
+    "edit_target_l1",
+    "edit_non_target_l1",
     "latent_residual_energy",
     "latent_to_base_ratio",
 )
@@ -182,7 +227,19 @@ def init_totals(device: torch.device):
     }
 
 
-def update_totals(totals, final, base, reuse, latent_energy, total, output, batch_size, collect_metrics):
+def update_totals(
+    totals,
+    final,
+    base,
+    edit,
+    edit_target_l1,
+    edit_non_target_l1,
+    total,
+    output,
+    model,
+    batch_size,
+    collect_metrics,
+):
     values = {
         "loss": total,
         "recon": final.recon,
@@ -197,15 +254,19 @@ def update_totals(totals, final, base, reuse, latent_energy, total, output, batc
         "base_recon": base.recon,
         "base_delta": base.delta,
         "base_joint": base.joint,
-        "base_reuse": reuse.loss,
-        "latent_residual_energy": latent_energy,
+        "edit_loss": edit,
+        "edit_target_l1": edit_target_l1,
+        "edit_non_target_l1": edit_non_target_l1,
+        "latent_residual_energy": output["latent_residual_energy"],
         "latent_to_base_ratio": output["latent_to_base_ratio"],
     }
     for name, value in values.items():
         totals[name].add_(value.detach() * batch_size)
+    unwrapped = unwrap_model(model)
     for part in PART_NAMES:
-        rms = output["part_latent_residuals"][part].detach().square().mean().sqrt()
-        totals[f"latent_residual_rms_{part}"].add_(rms * batch_size)
+        part_slice = unwrapped.part_latent_slices[part]
+        active = output["part_latent_residuals"][part][..., part_slice]
+        totals[f"latent_residual_rms_{part}"].add_(active.detach().square().mean().sqrt() * batch_size)
     if collect_metrics:
         for name in REPRESENTATION_METRICS:
             totals[name].add_(output[name].detach() * batch_size)
@@ -225,14 +286,20 @@ def evaluate(model, loader, tensors, metadata, device, args, non_blocking):
     model.eval()
     totals = init_totals(device)
     count = 0
-    for batch in loader:
+    for batch_index, batch in enumerate(loader):
         motion = batch["motion"].to(device, non_blocking=non_blocking)
-        output = model(motion, collect_metrics=True, decode_base=True)
-        final, base, reuse, latent_energy, total = compute_losses(
-            model, motion, output, *tensors, metadata, args
+        edit_part = PART_NAMES[batch_index % len(PART_NAMES)]
+        permutation = donor_permutation(motion.shape[0], device, offset=17)
+        output = model(
+            motion,
+            collect_metrics=True,
+            decode_base=True,
+            edit_part=edit_part,
+            donor_permutation=permutation,
         )
+        values = compute_losses(model, motion, output, edit_part, permutation, *tensors, metadata, args)
         batch_size = motion.shape[0]
-        update_totals(totals, final, base, reuse, latent_energy, total, output, batch_size, True)
+        update_totals(totals, *values, output, model, batch_size, True)
         count += batch_size
     return finalize_totals(totals, count, count)
 
@@ -248,10 +315,17 @@ def train_one_epoch(model, loader, optimizer, tensors, metadata, device, args, n
     for batch in loader:
         motion = batch["motion"].to(device, non_blocking=non_blocking)
         collect_metrics = global_step == 0 or global_step % args.metrics_interval == 0
-        output = model(motion, collect_metrics=collect_metrics, decode_base=True)
-        final, base, reuse, latent_energy, total = compute_losses(
-            model, motion, output, *tensors, metadata, args
+        edit_part = PART_NAMES[int(torch.randint(len(PART_NAMES), (), device=device))]
+        permutation = donor_permutation(motion.shape[0], device)
+        output = model(
+            motion,
+            collect_metrics=collect_metrics,
+            decode_base=True,
+            edit_part=edit_part,
+            donor_permutation=permutation,
         )
+        values = compute_losses(model, motion, output, edit_part, permutation, *tensors, metadata, args)
+        final, base, edit, edit_target_l1, edit_non_target_l1, total = values
         optimizer.zero_grad(set_to_none=True)
         total.backward()
         if args.grad_clip_norm is not None and args.grad_clip_norm > 0.0:
@@ -259,9 +333,7 @@ def train_one_epoch(model, loader, optimizer, tensors, metadata, device, args, n
         optimizer.step()
 
         batch_size = motion.shape[0]
-        update_totals(
-            totals, final, base, reuse, latent_energy, total, output, batch_size, collect_metrics
-        )
+        update_totals(totals, *values, output, model, batch_size, collect_metrics)
         count += batch_size
         if collect_metrics:
             representation_count += batch_size
@@ -269,8 +341,9 @@ def train_one_epoch(model, loader, optimizer, tensors, metadata, device, args, n
         if global_step == 1 or global_step % args.log_every == 0:
             writer.add_scalar("train_step/loss", total.item(), global_step)
             writer.add_scalar("train_step/base_loss", base.loss.item(), global_step)
-            writer.add_scalar("train_step/base_reuse", reuse.loss.item(), global_step)
-            writer.add_scalar("train_step/latent_residual_energy", latent_energy.item(), global_step)
+            writer.add_scalar("train_step/edit_loss", edit.item(), global_step)
+            writer.add_scalar("train_step/edit_target_l1", edit_target_l1.item(), global_step)
+            writer.add_scalar("train_step/edit_non_target_l1", edit_non_target_l1.item(), global_step)
             writer.add_scalar("train_step/latent_to_base_ratio", output["latent_to_base_ratio"].item(), global_step)
             if collect_metrics:
                 for group, value in zip(GROUP_NAMES, output["group_coordinate_change_rates"]):
@@ -285,35 +358,6 @@ def train_one_epoch(model, loader, optimizer, tensors, metadata, device, args, n
     return stats, global_step
 
 
-def initialize_from_residual_checkpoint(model, path: Path, device: torch.device) -> list[str]:
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
-    if checkpoint.get("model_family") != "residual_part_fsq":
-        raise ValueError(
-            f"Initialization checkpoint must be residual_part_fsq, got {checkpoint.get('model_family')!r}"
-        )
-    prefixes = (
-        "base_encoder.",
-        "base_quantizer.",
-        "base_decoder.",
-        "latent_residual_norm.",
-        "local_projections.",
-        "part_fuse.",
-        "part_quantizers.",
-    )
-    target = model.state_dict()
-    selected = {
-        name: value
-        for name, value in checkpoint["model"].items()
-        if name.startswith(prefixes) and name in target and target[name].shape == value.shape
-    }
-    required = [name for name in target if name.startswith(prefixes)]
-    missing = sorted(set(required) - set(selected))
-    if missing:
-        raise ValueError(f"Residual checkpoint is missing compatible warm-start tensors: {missing}")
-    model.load_state_dict(selected, strict=False)
-    return sorted(selected)
-
-
 def build_checkpoint(model, optimizer, scheduler, args, dataset, epoch, global_step, best_val, train_stats, val_stats):
     unwrapped = unwrap_model(model)
     return {
@@ -324,10 +368,13 @@ def build_checkpoint(model, optimizer, scheduler, args, dataset, epoch, global_s
         "scheduler": scheduler.state_dict(),
         "args": serializable_args(args),
         "representation": {
-            "tokenizer": "latent_residual_part_fsq_40x9_v1",
+            "tokenizer": "latent_residual_part_fsq_40x9_v2",
+            "architecture_version": 2,
             "fusion_space": "latent",
+            "residual_definition": "local_latent_prediction_error",
             "coordinate_order": list(GROUP_NAMES),
             "coordinate_counts": dict(GROUP_COORDINATES),
+            "part_latent_dims": dict(unwrapped.part_latent_dims),
             "num_coordinates": unwrapped.num_coordinates,
             "num_levels": unwrapped.num_levels,
             "temporal_downsample": 1,
@@ -355,12 +402,12 @@ def main():
     args = parse_args()
     if args.feature_database is None:
         raise ValueError("--feature-database is required")
-    if args.resume is not None and args.init_from_residual_checkpoint is not None:
-        raise ValueError("--resume and --init-from-residual-checkpoint are mutually exclusive")
     if args.metrics_interval <= 0 or args.fsq_num_levels <= 1:
         raise ValueError("metrics_interval must be positive and fsq_num_levels must be > 1")
-    if args.latent_residual_energy_weight < 0.0:
-        raise ValueError("latent_residual_energy_weight must be non-negative")
+    if args.base_loss_weight < 0.0 or args.edit_loss_weight < 0.0:
+        raise ValueError("Loss weights must be non-negative")
+    if sum(args.part_latent_dims) != args.base_code_dim:
+        raise ValueError("part_latent_dims must sum to base_code_dim")
     args.outdir.mkdir(parents=True, exist_ok=True)
     set_seed(args.seed, args.deterministic)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -377,18 +424,16 @@ def main():
         base_code_dim=args.base_code_dim,
         base_width=args.base_width,
         part_state_dim=args.part_state_dim,
-        latent_fusion_hidden_dim=args.latent_fusion_hidden_dim,
+        part_predictor_hidden_dim=args.part_predictor_hidden_dim,
+        latent_projector_hidden_dim=args.latent_projector_hidden_dim,
+        part_latent_dims=args.part_latent_dims,
         num_levels=args.fsq_num_levels,
         fsq_scale=args.fsq_scale,
         fsq_preserve_symmetry=args.fsq_preserve_symmetry,
         fsq_noise_dropout=args.fsq_noise_dropout,
-        residual_group_dropout=args.residual_group_dropout,
     )
     if train_dataset.window_size != model.receptive_field:
         raise ValueError(f"Dataset window_size={train_dataset.window_size}, model RF={model.receptive_field}")
-    if args.init_from_residual_checkpoint is not None:
-        loaded = initialize_from_residual_checkpoint(model, args.init_from_residual_checkpoint, device)
-        print(f"warm_started_tensors={len(loaded)} source={args.init_from_residual_checkpoint}")
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
     model = model.to(device)
@@ -415,6 +460,8 @@ def main():
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         if checkpoint.get("model_family") != "latent_residual_part_fsq":
             raise ValueError(f"Unsupported checkpoint family: {checkpoint.get('model_family')}")
+        if checkpoint.get("representation", {}).get("architecture_version") != 2:
+            raise ValueError("Resume checkpoint is not Latent Residual Part-FSQ V2")
         if checkpoint["model_config"] != unwrap_model(model).config:
             raise ValueError("Resume model_config does not match")
         unwrap_model(model).load_state_dict(checkpoint["model"])
@@ -428,6 +475,7 @@ def main():
     print(f"train_summary={train_dataset.split_summary()}")
     print(f"val_summary={val_dataset.split_summary()}")
     print(f"coordinate_layout={GROUP_COORDINATES}")
+    print(f"part_latent_dims={unwrap_model(model).part_latent_dims}")
     for epoch in range(start_epoch, args.epochs):
         train_stats, global_step = train_one_epoch(
             model, train_loader, optimizer, tensors, metadata, device, args, non_blocking, writer, global_step
@@ -439,9 +487,9 @@ def main():
                 writer.add_scalar(f"{prefix}/{name}", value, epoch + 1)
         print(
             f"epoch={epoch + 1}/{args.epochs} train_loss={train_stats['loss']:.6f} "
-            f"train_recon={train_stats['recon']:.6f} train_base_recon={train_stats['base_recon']:.6f} "
+            f"train_recon={train_stats['recon']:.6f} train_edit={train_stats['edit_loss']:.6f} "
             f"val_loss={val_stats['loss']:.6f} val_recon={val_stats['recon']:.6f} "
-            f"val_base_recon={val_stats['base_recon']:.6f} "
+            f"val_base_recon={val_stats['base_recon']:.6f} val_edit={val_stats['edit_loss']:.6f} "
             f"val_latent_ratio={val_stats['latent_to_base_ratio']:.6f} "
             f"train_samples_per_second={train_stats['samples_per_second']:.2f}"
         )

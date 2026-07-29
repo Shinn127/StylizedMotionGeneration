@@ -75,6 +75,8 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[dict, TokenizerMo
     elif family == "residual_part_fsq":
         model = ResidualPartFSQMotionAutoencoder(**checkpoint["model_config"])
     elif family == "latent_residual_part_fsq":
+        if checkpoint.get("representation", {}).get("architecture_version") != 2:
+            raise ValueError(f"{path} is an obsolete Latent Residual Part-FSQ V1 checkpoint")
         model = LatentResidualPartFSQMotionAutoencoder(**checkpoint["model_config"])
     else:
         raise ValueError(f"{path} is not a supported FSQ tokenizer checkpoint: {family!r}")

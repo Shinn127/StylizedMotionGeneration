@@ -240,14 +240,14 @@ python evaluate_fsq.py \
 
 ## Latent Residual Part-FSQ
 
-`latent_residual_part_fsq` 保持 Residual Part-FSQ 的 `20 base + 20 part`、40×9 token 布局，但将五个 part embedding 投影到 holistic base latent，在单一 causal decoder 前完成融合。训练时通过 `decode_base=True` 将 base/fused latent 拼到 batch 维共同解码；`decode_from_indices` 和 `decode_from_codes` 的推理路径只运行一次 decoder。
+`latent_residual_part_fsq` 采用覆盖式 V2 架构，保持 `20 base + 20 part`、40×9 token 布局。每个 part token 编码 `local_state - base_predicted_state`，再由独立 projector 写入互斥的 holistic latent 子空间；最终以 `q_base + sum(delta_z_part)` 进入单一 causal decoder。训练随机构造一项 donor residual edit，并将 base/full/edit latent 以 `3B` 拼到 batch 维共同解码；`decode_from_indices` 和 `decode_from_codes` 的推理路径只运行一次 decoder。
 
 ```bash
 python train_latent_residual_part_fsq.py \
   --config configs/latent_residual_part_fsq_pruned.yaml
 ```
 
-可通过 `--init-from-residual-checkpoint` 选择性加载 feature-side Residual Part-FSQ 的 encoder、quantizer 与 base decoder。新旧模型虽然坐标布局相同，但 `model_family` 和 part token 语义不同，checkpoint/token database 不能直接互换。`evaluate_fsq.py` 和 `evaluate_part_editing.py` 均支持新 family。
+V2 仅支持从零训练或从同一 V2 checkpoint 续训，不再支持 feature-side warm start。V1/V2 虽然沿用同一个 `model_family` 和坐标布局，但 V2 checkpoint 记录 `architecture_version: 2`，旧 checkpoint/token database 与当前实现不兼容。`evaluate_fsq.py` 和 `evaluate_part_editing.py` 均支持当前架构。
 
 ## Flat-FSQ 基线
 

@@ -20,8 +20,9 @@ precision: fp32
 base_code_dim: 128
 base_width: 512
 part_state_dim: 64
-latent_fusion_hidden_dim: 128
-residual_group_dropout: 0.1
+part_predictor_hidden_dim: 128
+latent_projector_hidden_dim: 128
+part_latent_dims: [40, 24, 24, 20, 20]
 
 fsq_num_levels: 9
 fsq_scale:
@@ -29,11 +30,8 @@ fsq_preserve_symmetry: false
 fsq_noise_dropout: 0.0
 metrics_interval: 100
 
-base_loss_weight: 0.25
-base_reuse_weight: 0.0025
-base_reuse_threshold: 1.0
-latent_residual_energy_weight: 0.0001
-contact_transition_threshold: 0.25
+base_loss_weight: 0.1
+edit_loss_weight: 1.0
 
 delta_weight: 3.0
 root_pos_weight: 0.1
@@ -48,7 +46,6 @@ root_dt: 0.016666666666666666
 outdir: outputs/latent_residual_part_fsq_pruned_40x9
 run_name: latent_residual_part_fsq_pruned_40x9
 resume:
-init_from_residual_checkpoint:
 save_every: 0
 log_every: 100
 data_parallel: false

@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 from datasets.feature_dataset import FeatureDataset, build_feature_store
 from models.latent_residual_part_fsq import LatentResidualPartFSQMotionAutoencoder
 from models.part_fsq import HierarchicalPartFSQMotionAutoencoder
-from models.part_layout import PART_NAMES
+from models.part_layout import FEATURE_GROUP_NAMES, PART_NAMES
 from models.residual_part_fsq import ResidualPartFSQMotionAutoencoder
 from models.losses import denormalize_motion_features
 
@@ -99,6 +99,8 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[dict, TokenizerMo
     elif family == "residual_part_fsq":
         model = ResidualPartFSQMotionAutoencoder(**checkpoint["model_config"])
     elif family == "latent_residual_part_fsq":
+        if checkpoint.get("representation", {}).get("architecture_version") != 2:
+            raise ValueError(f"{path} is an obsolete Latent Residual Part-FSQ V1 checkpoint")
         model = LatentResidualPartFSQMotionAutoencoder(**checkpoint["model_config"])
     else:
         raise ValueError(
@@ -216,20 +218,24 @@ def complement_features(feature_index: torch.Tensor, motion_dim: int, device: to
     return torch.arange(motion_dim, device=device, dtype=torch.long)[mask]
 
 
-def _batch_metric(value: torch.Tensor) -> float:
-    return float(value.detach().mean().cpu())
-
-
 def _new_part_accumulator() -> dict[str, float]:
-    return {
+    values = {
         "target_response": 0.0,
         "non_target_leakage": 0.0,
         "leakage_ratio": 0.0,
         "source_target_reconstruction_error": 0.0,
+        "source_target_donor_error": 0.0,
         "edited_target_donor_error": 0.0,
         "target_transfer_gain": 0.0,
+        "source_residual_target_error": 0.0,
+        "edited_residual_target_error": 0.0,
+        "residual_transfer_gain": 0.0,
+        "residual_direction_cosine": 0.0,
+        "residual_target_progress": 0.0,
         "base_change": 0.0,
     }
+    values.update({f"response_{group}": 0.0 for group in FEATURE_GROUP_NAMES})
+    return values
 
 
 def _accumulate_part_metrics(
@@ -241,24 +247,59 @@ def _accumulate_part_metrics(
     target_features: torch.Tensor,
     non_target_features: torch.Tensor,
     base_change: torch.Tensor | None,
+    source_base: torch.Tensor | None,
+    donor_base: torch.Tensor | None,
+    feature_indices: dict[str, torch.Tensor],
 ) -> None:
     target_response = mean_abs_on_features(edited, source_recon, target_features)
     non_target_leakage = mean_abs_on_features(edited, source_recon, non_target_features)
     source_target_error = mean_abs_on_features(source_recon, source_target, target_features)
+    source_donor_error = mean_abs_on_features(source_recon, donor_target, target_features)
     edited_target_error = mean_abs_on_features(edited, donor_target, target_features)
-    transfer_gain = (source_target_error - edited_target_error) / source_target_error.clamp_min(1e-6)
+    transfer_gain = (source_donor_error - edited_target_error) / source_donor_error.clamp_min(1e-6)
     values = {
         "target_response": target_response,
         "non_target_leakage": non_target_leakage,
         "leakage_ratio": non_target_leakage / target_response.clamp_min(1e-6),
         "source_target_reconstruction_error": source_target_error,
+        "source_target_donor_error": source_donor_error,
         "edited_target_donor_error": edited_target_error,
         "target_transfer_gain": transfer_gain,
     }
+    for group in FEATURE_GROUP_NAMES:
+        values[f"response_{group}"] = mean_abs_on_features(
+            edited, source_recon, feature_indices[group]
+        )
     if base_change is not None:
         values["base_change"] = base_change
+    if source_base is not None and donor_base is not None:
+        residual_target = source_base.index_select(-1, target_features) + (
+            donor_target.index_select(-1, target_features)
+            - donor_base.index_select(-1, target_features)
+        )
+        source_target_values = source_recon.index_select(-1, target_features)
+        edited_target_values = edited.index_select(-1, target_features)
+        source_residual_error = (source_target_values - residual_target).abs().mean(dim=(-1, -2))
+        edited_residual_error = (edited_target_values - residual_target).abs().mean(dim=(-1, -2))
+        desired = (residual_target - source_target_values).flatten(1)
+        actual = (edited_target_values - source_target_values).flatten(1)
+        values.update(
+            {
+                "source_residual_target_error": source_residual_error,
+                "edited_residual_target_error": edited_residual_error,
+                "residual_transfer_gain": (
+                    (source_residual_error - edited_residual_error)
+                    / source_residual_error.clamp_min(1e-6)
+                ),
+                "residual_direction_cosine": torch.nn.functional.cosine_similarity(
+                    actual, desired, dim=-1, eps=1e-8
+                ),
+                "residual_target_progress": (actual * desired).sum(dim=-1)
+                / desired.square().sum(dim=-1).clamp_min(1e-8),
+            }
+        )
     for name, value in values.items():
-        accumulator[name] += _batch_metric(value)
+        accumulator[name] += float(value.detach().sum().cpu())
 
 
 def _finalize_part_metrics(accumulator: dict[str, float], count: int) -> dict[str, float]:
@@ -335,10 +376,11 @@ def evaluate_checkpoint(
             source_motion = (source_raw - checkpoint_offset.view(1, 1, -1)) / checkpoint_scale.view(1, 1, -1)
             donor_motion = (donor_raw - checkpoint_offset.view(1, 1, -1)) / checkpoint_scale.view(1, 1, -1)
 
-            if family in {"residual_part_fsq", "latent_residual_part_fsq"}:
-                encoded = model(torch.cat((source_motion, donor_motion), dim=0), decode_base=True)
+            batch_motion = torch.cat((source_motion, donor_motion), dim=0)
+            if family == "latent_residual_part_fsq":
+                encoded = model(batch_motion, decode_base=True)
             else:
-                encoded = model(torch.cat((source_motion, donor_motion), dim=0))
+                encoded = model(batch_motion)
             source_indices = encoded["indices"][:batch_size]
             donor_indices = encoded["indices"][batch_size:]
             source_recon = encoded["recon_state"][:batch_size]
@@ -350,9 +392,11 @@ def evaluate_checkpoint(
             edited = flat_edited.reshape(batch_size, len(parts), flat_edited.shape[1], flat_edited.shape[2])
 
             source_base = None
+            donor_base = None
             edited_base = None
             if family in {"residual_part_fsq", "latent_residual_part_fsq"}:
                 source_base = encoded["base_recon_state"][:batch_size]
+                donor_base = encoded["base_recon_state"][batch_size:]
                 edited_base = model.decode_base_from_indices(flat_edited_indices).reshape(
                     batch_size, len(parts), flat_edited.shape[1], flat_edited.shape[2]
                 )
@@ -376,6 +420,9 @@ def evaluate_checkpoint(
                     target_features,
                     non_target_features,
                     base_change,
+                    source_base,
+                    donor_base,
+                    feature_indices,
                 )
 
                 if save_debug and debug_saved[part] < debug_count:
@@ -432,7 +479,12 @@ def print_report(report: dict[str, object]) -> None:
             f"target_transfer_gain={metrics['target_transfer_gain']:.8f}"
         )
         if report["model_family"] in {"residual_part_fsq", "latent_residual_part_fsq"}:
-            print(f"part={part} base_change={metrics['base_change']:.8f}")
+            print(
+                f"part={part} base_change={metrics['base_change']:.8f} "
+                f"residual_transfer_gain={metrics['residual_transfer_gain']:.8f} "
+                f"residual_direction_cosine={metrics['residual_direction_cosine']:.8f} "
+                f"residual_target_progress={metrics['residual_target_progress']:.8f}"
+            )
 
 
 def main(argv=None) -> None:

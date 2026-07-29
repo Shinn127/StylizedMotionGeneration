@@ -8,6 +8,7 @@ import torch
 from datasets.feature_dataset import build_feature_store
 from Genoview import GenoView, GenoViewCompare, build_database_from_feature_array
 from models.fsq import FSQMotionAutoencoder
+from models.latent_residual_part_fsq import LatentResidualPartFSQMotionAutoencoder
 from models.part_fsq import HierarchicalPartFSQMotionAutoencoder
 from models.residual_part_fsq import ResidualPartFSQMotionAutoencoder
 from models.vqvae import CausalMotionVQVAE
@@ -55,12 +56,15 @@ def choose_device(name: str) -> torch.device:
 
 def build_model_from_checkpoint(ckpt: dict):
     family = ckpt["model_family"]
-    if family not in {"fsq", "part_fsq", "residual_part_fsq", "vqvae"}:
+    if family not in {"fsq", "part_fsq", "residual_part_fsq", "latent_residual_part_fsq", "vqvae"}:
         raise ValueError(f"Unsupported model_family: {family}")
+    if family == "latent_residual_part_fsq" and ckpt.get("representation", {}).get("architecture_version") != 2:
+        raise ValueError("Obsolete Latent Residual Part-FSQ V1 checkpoints are not supported")
     model_class = {
         "fsq": FSQMotionAutoencoder,
         "part_fsq": HierarchicalPartFSQMotionAutoencoder,
         "residual_part_fsq": ResidualPartFSQMotionAutoencoder,
+        "latent_residual_part_fsq": LatentResidualPartFSQMotionAutoencoder,
         "vqvae": CausalMotionVQVAE,
     }[family]
     model = model_class(**ckpt["model_config"])

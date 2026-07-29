@@ -1,6 +1,9 @@
 import torch
 
 from evaluate_part_editing import (
+    _accumulate_part_metrics,
+    _finalize_part_metrics,
+    _new_part_accumulator,
     build_multi_part_edits,
     edit_indices,
     model_feature_indices,
@@ -59,6 +62,53 @@ def test_multi_part_edits_keep_each_variant_independent():
         torch.testing.assert_close(edits[:, part_index, :, untouched], torch.zeros(1, 4, int(untouched.sum()), dtype=torch.long))
 
 
+def test_part_edit_metrics_use_sample_weighting_and_the_donor_baseline():
+    accumulator = _new_part_accumulator()
+    feature_index = torch.tensor([0])
+    feature_indices = {
+        group: feature_index
+        for group in ("global", "torso", "left_leg", "right_leg", "left_arm", "right_arm")
+    }
+
+    source_recon = torch.zeros(2, 1, 1)
+    source_target = torch.zeros_like(source_recon)
+    donor_target = torch.ones_like(source_recon)
+    edited = torch.full_like(source_recon, 0.5)
+    _accumulate_part_metrics(
+        accumulator,
+        source_recon,
+        edited,
+        source_target,
+        donor_target,
+        feature_index,
+        feature_index,
+        None,
+        None,
+        None,
+        feature_indices,
+    )
+
+    _accumulate_part_metrics(
+        accumulator,
+        torch.zeros(1, 1, 1),
+        torch.ones(1, 1, 1),
+        torch.zeros(1, 1, 1),
+        torch.ones(1, 1, 1),
+        feature_index,
+        feature_index,
+        None,
+        None,
+        None,
+        feature_indices,
+    )
+    metrics = _finalize_part_metrics(accumulator, 3)
+
+    assert abs(metrics["target_response"] - 2.0 / 3.0) < 1e-6
+    assert metrics["source_target_reconstruction_error"] == 0.0
+    assert metrics["source_target_donor_error"] == 1.0
+    assert abs(metrics["target_transfer_gain"] - 2.0 / 3.0) < 1e-6
+
+
 def test_part_fsq_part_edit_has_no_feature_space_leakage():
     torch.manual_seed(41)
     names, parents = _skeleton()
@@ -111,12 +161,12 @@ def test_latent_residual_part_edit_keeps_base_fixed_and_reports_soft_leakage():
         base_code_dim=32,
         base_width=32,
         part_state_dim=16,
-        latent_fusion_hidden_dim=24,
-        residual_group_dropout=0.0,
+        part_predictor_hidden_dim=24,
+        latent_projector_hidden_dim=24,
+        part_latent_dims=(10, 6, 6, 5, 5),
     ).eval()
-    for projector in model.latent_residual_fuse.values():
+    for projector in model.latent_residual_projectors.values():
         torch.nn.init.normal_(projector[-1].weight, std=0.05)
-        torch.nn.init.normal_(projector[-1].bias, std=0.01)
 
     motion = torch.randn(1, 64, model.motion_dim)
     with torch.no_grad():
