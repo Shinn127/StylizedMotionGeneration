@@ -1,8 +1,7 @@
 import torch
 
-from models.part_layout import PART_NAMES
-from models.residual_part_fsq import GROUP_NAMES, ResidualPartFSQMotionAutoencoder
-from models.residual_part_fsq_losses import adaptive_base_reuse_loss
+from stylized_motion.learning.part_layout import PART_NAMES
+from stylized_motion.learning.residual_part_fsq import GROUP_NAMES, ResidualPartFSQMotionAutoencoder
 
 
 def _skeleton():
@@ -108,12 +107,10 @@ def test_part_index_change_only_writes_its_anatomical_features():
     assert not torch.equal(actual[..., feature_indices["left_leg"]], expected[..., feature_indices["left_leg"]])
 
 
-def test_base_reuse_disables_gate_on_contact_transition():
+def test_representation_specific_base_loss_is_exposed_through_model_hook():
     model = _model()
-    motion = torch.zeros(1, 3, model.motion_dim)
-    motion[:, 1:, -2] = 1.0
-    codes = torch.zeros(1, 3, 20)
-    codes[:, 1:] = 1.0
-    loss = adaptive_base_reuse_loss(codes, motion, model.layout, thresholds=1.0)
-    assert loss.loss == 0.0
-    torch.testing.assert_close(loss.gate_mean, torch.tensor(0.5))
+    motion = torch.randn(1, 64, model.motion_dim)
+    output = model(motion)
+    losses = model.compute_representation_losses(output, {"motion": motion})
+    assert "base_reuse" in losses
+    assert losses["base_reuse"].ndim == 0

@@ -1,8 +1,8 @@
 import numpy as np
 import torch
 
-from models.fsq_generator import FSQConditionalTransformerGenerator, FSQGeneratorCache
-from realtime_fsq_controller import KeyboardTrajectoryControl, RealtimeFSQController
+from stylized_motion.learning.nets.causal_transformer_generator import FSQConditionalTransformerGenerator, FSQGeneratorCache
+from stylized_motion.anim.realtime_fsq_controller import KeyboardTrajectoryControl, RealtimeFSQController
 
 
 def test_keyboard_control_is_invalid_and_zero_when_idle():

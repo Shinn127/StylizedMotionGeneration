@@ -1,0 +1,49 @@
+representation:
+  family: latent_residual_fsq
+  variant: v2
+  config:
+    motion_dim: 230
+    base_code_dim: 128
+    base_width: 512
+    part_state_dim: 64
+    part_predictor_hidden_dim: 128
+    latent_projector_hidden_dim: 128
+    part_latent_dims: [40, 24, 24, 20, 20]
+    num_levels: 9
+    fsq_scale:
+    fsq_preserve_symmetry: false
+    fsq_noise_dropout: 0.0
+
+data:
+  feature_database: data/processed/100style_pruned/feature_database
+  split_train: train
+  split_val: val
+  split_test: test
+  window_size: 64
+
+training:
+  batch_size: 512
+  epochs: 100
+  lr: 0.0002
+  weight_decay: 0.0
+  precision: fp32
+  seed: 3407
+  deterministic: false
+  grad_clip_norm: 1.0
+  num_workers: 8
+  prefetch_factor: 4
+  persistent_workers: true
+  output_dir: outputs/latent_residual_fsq_40x9
+  latent_energy_weight: 0.01
+  delta_weight: 3.0
+  root_pos_weight: 0.1
+  root_rot_weight: 0.1
+  joint_weight: 0.5
+  contact_weight: 0.1
+  foot_slide_weight: 0.1
+  foot_height_weight: 0.1
+  contact_temperature: 10.0
+
+evaluation:
+  metrics_interval: 100
+  root_dt: 0.016666666666666666

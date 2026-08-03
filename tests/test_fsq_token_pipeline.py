@@ -1,8 +1,8 @@
 import numpy as np
 import torch
 
-from encode_fsq_database import encode_shard
-from models.fsq import FSQMotionAutoencoder
+from stylized_motion.data.encode_token_database import encode_shard
+from stylized_motion.learning.fsq import FSQMotionAutoencoder
 
 
 def test_chunked_fsq_encoding_matches_full_causal_encoding():

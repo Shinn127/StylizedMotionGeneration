@@ -1,7 +1,7 @@
 import torch
 
-from models.fsq import FSQMotionAutoencoder
-from models.losses import (
+from stylized_motion.learning.fsq import FSQMotionAutoencoder
+from stylized_motion.learning.losses import (
     compute_motion_reconstruction_losses,
     denormalize_motion_features,
     forward_kinematics,

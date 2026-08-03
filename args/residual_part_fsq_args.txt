@@ -1,0 +1,5 @@
+# Residual Part-FSQ canonical training preset.
+--mode train
+--pipeline representation
+--representation residual-part-fsq
+--config data/configs/residual_part_fsq_40x9.yaml

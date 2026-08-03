@@ -1,0 +1,5 @@
+# Hierarchical Part-FSQ canonical training preset.
+--mode train
+--pipeline representation
+--representation part-fsq
+--config data/configs/part_fsq_40x9.yaml

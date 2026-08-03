@@ -1,0 +1,5 @@
+# Flat-FSQ canonical training preset.
+--mode train
+--pipeline representation
+--representation flat-fsq
+--config data/configs/flat_fsq_40x9.yaml

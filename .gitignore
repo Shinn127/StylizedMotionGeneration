@@ -51,7 +51,13 @@ coverage.xml
 *.ipynb
 
 # ---- Data / Models (大型产物，不入库) ----
-data/
+data/*
+!data/configs/
+!data/configs/**
+!data/assets/
+!data/assets/**
+data/assets/genoview/*.bin
+data/assets/genoview/*.bvh
 raw_data/
 outputs/
 output/

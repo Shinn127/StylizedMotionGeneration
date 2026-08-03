@@ -2,11 +2,11 @@ from pathlib import Path
 
 import numpy as np
 
-from datasets.feature_dataset import build_feature_store
-from motion_features import MotionFeatureStats
-from preprocess import build_feature_database
-from preprocess.build_database import MotionDatabaseWriter
-from preprocess.build_feature_database import _normalize_motion_shard
+from stylized_motion.data.feature_dataset import build_feature_store
+from stylized_motion.anim.features import MotionFeatureStats
+from stylized_motion.data import build_feature_database
+from stylized_motion.data.build_database import MotionDatabaseWriter
+from stylized_motion.data.build_feature_database import _normalize_motion_shard
 
 
 def _motion(nframes: int) -> dict[str, np.ndarray | list[str]]:

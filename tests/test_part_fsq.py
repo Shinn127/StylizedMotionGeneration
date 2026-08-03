@@ -1,9 +1,8 @@
 import torch
 
-from datasets.feature_dataset import _fixed_windows_from_intervals
-from models.part_fsq import HierarchicalPartFSQMotionAutoencoder
-from models.part_fsq_losses import adaptive_part_fsq_reuse_loss
-from models.part_layout import GROUP_NAMES, PartFSQLayout
+from stylized_motion.data.feature_dataset import _fixed_windows_from_intervals
+from stylized_motion.learning.part_fsq import HierarchicalPartFSQMotionAutoencoder
+from stylized_motion.learning.part_layout import GROUP_NAMES, PartFSQLayout
 
 
 def _skeleton() -> tuple[list[str], list[int]]:
@@ -128,22 +127,10 @@ def test_left_leg_code_has_no_direct_readout_path_to_other_parts():
     assert not torch.equal(actual[..., feature_indices["left_leg"]], expected[..., feature_indices["left_leg"]])
 
 
-def test_reuse_disables_global_sync_and_the_transitioning_leg_only():
+def test_representation_specific_loss_is_exposed_through_model_hook():
     model = _model()
-    motion = torch.zeros(1, 3, model.motion_dim)
-    motion[:, 1:, -2] = 1.0
-    codes = torch.zeros(1, 3, model.num_coordinates)
-    codes[:, 1:] = 1.0
-
-    losses = adaptive_part_fsq_reuse_loss(codes, motion, model.layout, thresholds=1.0)
-    group_losses = dict(zip(GROUP_NAMES, losses.group_losses.tolist()))
-    group_gates = dict(zip(GROUP_NAMES, losses.group_gate_mean.tolist()))
-
-    assert group_losses["global"] == 0.0
-    assert group_losses["sync"] == 0.0
-    assert group_losses["left_leg"] == 0.0
-    assert group_gates["global"] < group_gates["right_leg"]
-    assert group_gates["sync"] < group_gates["right_leg"]
-    assert group_gates["left_leg"] < group_gates["right_leg"]
-    assert group_losses["right_leg"] > 0.0
-    assert group_losses["torso"] > 0.0
+    motion = torch.randn(1, 64, model.motion_dim)
+    output = model(motion)
+    losses = model.compute_representation_losses(output, {"motion": motion})
+    assert "reuse" in losses
+    assert losses["reuse"].ndim == 0

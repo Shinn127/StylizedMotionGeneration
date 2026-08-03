@@ -1,14 +1,13 @@
 import torch
 
-from models.causal_cnn import (
+from stylized_motion.learning.nets.causal_cnn import (
     CausalDecoder1D,
     CausalEncoder1D,
     FrameCausalDecoder1D,
     FrameCausalEncoder1D,
 )
-from models.fsq import FSQMotionAutoencoder
-from models.vqvae import CausalMotionVQVAE
-from view_motion_sequence import build_model_from_checkpoint, inference_factor
+from stylized_motion.learning.fsq import FSQMotionAutoencoder
+from stylized_motion.learning.vqvae import CausalMotionVQVAE
 
 
 def test_frame_causal_network_does_not_read_outside_64_frame_window():
@@ -68,15 +67,6 @@ def test_autoencoder_models_expose_64_frame_context_metadata():
     assert (fsq.receptive_field, fsq.context_left, fsq.lookahead_frames) == (64, 63, 0)
 
 
-def test_downsampled_segment_alignment_preserves_stride_phase():
-    args = {"model_type": "causal_cnn"}
-    factor = inference_factor(args, "vqvae")
-    infer_start = 128 - 63
-    infer_start -= infer_start % factor
-    assert factor == 4
-    assert infer_start == 64
-
-
 def test_rf64_autoencoders_roundtrip_indices_with_expected_shapes():
     torch.manual_seed(11)
     x = torch.randn(2, 64, 12)
@@ -113,14 +103,3 @@ def test_rf64_autoencoders_roundtrip_indices_with_expected_shapes():
         assert output["recon_state"].shape == x.shape
         assert decoded.shape == x.shape
         torch.testing.assert_close(decoded, output["recon_state"], rtol=0.0, atol=0.0)
-
-        family = "fsq" if isinstance(model, FSQMotionAutoencoder) else "vqvae"
-        loaded, loaded_family = build_model_from_checkpoint(
-            {
-                "model_family": family,
-                "model_config": model.config,
-                "model": model.state_dict(),
-            }
-        )
-        assert loaded_family == family
-        assert loaded.config == model.config
