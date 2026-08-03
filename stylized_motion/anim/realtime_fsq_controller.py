@@ -293,7 +293,8 @@ def encode_seed_from_feature_database(
             f"Seed [{start}, {start + seed_frames}) exceeds feature shard length {motion.shape[0]}"
         )
 
-    read_start = max(0, start - int(fsq.context_left))
+    history_frames = max(int(fsq.receptive_field) - 1 - int(fsq.lookahead_frames), 0)
+    read_start = max(0, start - history_frames)
     source_motion = np.asarray(motion[read_start : start + seed_frames], dtype=np.float32).copy()
     source_offset = torch.from_numpy(feature_store.stats.offset.astype(np.float32)).to(device)
     source_scale = torch.from_numpy(feature_store.stats.scale.astype(np.float32)).to(device)
@@ -541,7 +542,6 @@ class RealtimeFSQController:
                 shard_idx=self.source_range_idx,
                 target_start=int(target_local_frame) - 1,
                 target_frames=1,
-                context_left=0,
                 variant_idx=self.source_range_idx,
             )
             values, valid = self.trajectory_store.read_aligned(request, 1)

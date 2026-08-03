@@ -99,7 +99,7 @@ python -m stylized_motion.run \
 
 `flat_fsq` 使用 `flat:40`。`part_fsq` 的固定顺序是 `global:6, sync:4, torso:6, left_leg:7, right_leg:7, left_arm:5, right_arm:5`。`residual_part_fsq` 与 `latent_residual_fsq` 共享 `base:20, torso:6, left_leg:4, right_leg:4, left_arm:3, right_arm:3`，但属于不同 family；latent residual 强制 `architecture_version=2`。
 
-所有 representation 都要求 `temporal_downsample=1`、`receptive_field=64`、`context_left=63`、`lookahead_frames=0`。Residual Part-FSQ 的 inference decoder pass 为 2，其余为 1。
+所有 representation 都要求 `temporal_downsample=1`、`receptive_field=64`、`lookahead_frames=0`；history frames 由 receptive field contract 推导为 63。Residual Part-FSQ 的 inference decoder pass 为 2，其余为 1。
 
 ## Token database
 

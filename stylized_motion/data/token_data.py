@@ -52,7 +52,6 @@ class TokenStore:
     num_levels: int
     temporal_downsample: int
     receptive_field: int
-    context_left: int
     lookahead_frames: int
     decoder_passes_inference: int
     checkpoint_sha256: str
@@ -91,7 +90,6 @@ class TokenStore:
             "temporal_downsample": self.temporal_downsample,
             "frame_rate": self.frame_rate,
             "receptive_field": self.receptive_field,
-            "context_left": self.context_left,
             "lookahead_frames": self.lookahead_frames,
             "decoder_passes_inference": self.decoder_passes_inference,
             "feature_schema": self.feature_schema,
@@ -108,8 +106,8 @@ class TokenStore:
             raise ValueError("TokenStore must use the canonical 230D / 40x9 contract")
         if self.frame_rate != 60 or self.temporal_downsample != 1:
             raise ValueError("TokenStore frame-rate and temporal-downsample metadata are invalid")
-        if (self.receptive_field, self.context_left, self.lookahead_frames) != (64, 63, 0):
-            raise ValueError("TokenStore causal metadata must be RF=64, context_left=63, lookahead=0")
+        if (self.receptive_field, self.lookahead_frames) != (64, 0):
+            raise ValueError("TokenStore causal metadata must be RF=64 and lookahead=0")
         expected_legacy = {
             "flat_fsq": "fsq",
             "part_fsq": "part_fsq",
@@ -148,7 +146,7 @@ class TokenStore:
             for key in (
                 "family", "variant", "representation_id", "num_coordinates", "num_levels",
                 "coordinate_order", "coordinate_counts", "temporal_downsample", "receptive_field",
-                "context_left", "lookahead_frames", "decoder_passes_inference",
+                "lookahead_frames", "decoder_passes_inference",
             ):
                 expected = representation.get(key)
                 actual = self.representation_metadata.get(key)
@@ -252,6 +250,11 @@ def open_token_store(database: str | Path, *, max_open_shards: int = 32) -> Toke
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict):
         raise ValueError("Token manifest must be a JSON object")
+    if "context_left" in manifest or (
+        isinstance(manifest.get("representation"), Mapping)
+        and "context_left" in manifest["representation"]
+    ):
+        raise ValueError("TokenStore manifests must not contain context_left metadata")
     _require_manifest(manifest, "token")
     shard_files = [database / str(value) for value in manifest["shard_files"]]
     if any(not path.exists() for path in shard_files):
@@ -334,7 +337,6 @@ def open_token_store(database: str | Path, *, max_open_shards: int = 32) -> Toke
         num_levels=int(_metadata_value(manifest, "num_levels", 9)),
         temporal_downsample=int(_metadata_value(manifest, "temporal_downsample", 1)),
         receptive_field=int(_metadata_value(manifest, "receptive_field", 64)),
-        context_left=int(_metadata_value(manifest, "context_left", 63)),
         lookahead_frames=int(_metadata_value(manifest, "lookahead_frames", 0)),
         decoder_passes_inference=int(_metadata_value(manifest, "decoder_passes_inference", 1)),
         checkpoint_sha256=str(manifest.get("checkpoint_sha256", "")),
@@ -407,7 +409,6 @@ class TokenDataset(Dataset):
                 "shard_idx": int(request.shard_idx),
                 "target_start": int(request.target_start),
                 "target_frames": int(request.target_frames),
-                "context_left": int(request.context_left),
                 "variant_idx": int(request.variant_idx),
                 "range_name": self.store.range_names[int(request.variant_idx)],
             }

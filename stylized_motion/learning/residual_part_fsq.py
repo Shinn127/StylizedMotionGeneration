@@ -173,7 +173,7 @@ class ResidualPartFSQMotionAutoencoder(nn.Module):
             nn.init.zeros_(head.bias)
 
         # Both base and residual paths are encoder RF31 + decoder RF34.
-        self.receptive_field, self.context_left, self.lookahead_frames = 64, 63, 0
+        self.receptive_field, self.lookahead_frames = 64, 0
 
     @property
     def num_coordinates(self) -> int:

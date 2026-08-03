@@ -62,9 +62,9 @@ def test_autoencoder_models_expose_64_frame_context_metadata():
         num_coordinates=5,
     )
 
-    assert (frame_vq.receptive_field, frame_vq.context_left, frame_vq.lookahead_frames) == (64, 63, 0)
-    assert (downsampled_vq.receptive_field, downsampled_vq.context_left, downsampled_vq.lookahead_frames) == (64, 63, 3)
-    assert (fsq.receptive_field, fsq.context_left, fsq.lookahead_frames) == (64, 63, 0)
+    assert (frame_vq.receptive_field, frame_vq.lookahead_frames) == (64, 0)
+    assert (downsampled_vq.receptive_field, downsampled_vq.lookahead_frames) == (64, 3)
+    assert (fsq.receptive_field, fsq.lookahead_frames) == (64, 0)
 
 
 def test_rf64_autoencoders_roundtrip_indices_with_expected_shapes():

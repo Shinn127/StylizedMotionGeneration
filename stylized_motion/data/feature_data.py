@@ -256,8 +256,8 @@ class FeatureStore:
         }
 
     def _read_motion_with_cache(self, request: SampleRequest, cache: MMapShardCache) -> np.ndarray:
-        if int(request.target_frames) <= 0 or int(request.context_left) < 0:
-            raise ValueError("target_frames must be positive and context_left non-negative")
+        if int(request.target_frames) <= 0:
+            raise ValueError("target_frames must be positive")
         variant_idx = int(request.variant_idx)
         if variant_idx < 0 or variant_idx >= len(self.range_names):
             raise IndexError(f"Invalid feature range index {variant_idx}")
@@ -270,16 +270,12 @@ class FeatureStore:
         target_stop = target_start + int(request.target_frames)
         if target_start < range_start or target_stop > range_stop:
             raise IndexError("SampleRequest target exceeds its source range")
-        read_start = target_start - int(request.context_left)
-        pad = max(range_start - read_start, 0)
-        actual_start = max(read_start, range_start)
+        actual_start = target_start
         array = cache.get(shard_idx)
         if array.ndim != 2 or array.dtype != np.float32 or array.shape[1] != self.motion_dim:
             raise ValueError(f"Motion shard has dtype/shape {array.dtype}/{array.shape}, expected float32/[N,{self.motion_dim}]")
         values = np.asarray(array[actual_start:target_stop], dtype=np.float32)
-        if pad:
-            values = np.concatenate((np.zeros((pad, self.motion_dim), dtype=np.float32), values), axis=0)
-        expected = int(request.context_left) + int(request.target_frames)
+        expected = int(request.target_frames)
         if values.shape != (expected, self.motion_dim):
             raise RuntimeError(f"Feature read returned {values.shape}, expected {(expected, self.motion_dim)}")
         return np.ascontiguousarray(values, dtype=np.float32)
@@ -428,7 +424,7 @@ def open_feature_store(database: str | Path, *, max_open_shards: int = 32) -> Fe
 
 
 class FeatureDataset(Dataset):
-    """Consume sampler requests and return [B,127,230] CPU tensors."""
+    """Consume sampler requests and return [B,64,230] CPU tensors."""
 
     def __init__(
         self,
@@ -461,6 +457,8 @@ class FeatureDataset(Dataset):
             raise IndexError(f"Invalid feature range index {variant_idx}")
         if int(self.store.split_ids[variant_idx]) != _SPLIT_IDS[self.split]:
             raise ValueError(f"SampleRequest range {variant_idx} does not belong to split {self.split!r}")
+        if int(request.target_frames) != 64:
+            raise ValueError("Representation FeatureDataset requires target_frames=64")
         return request
 
     def _read_numpy(self, request: SampleRequest) -> np.ndarray:
@@ -470,19 +468,17 @@ class FeatureDataset(Dataset):
         requests = [self._request(value) for value in values]
         if not requests:
             raise ValueError("Cannot collate an empty feature batch")
-        frames = int(requests[0].context_left) + int(requests[0].target_frames)
-        if any(int(request.context_left) + int(request.target_frames) != frames for request in requests):
-            raise ValueError("A feature batch must use one context/target length")
+        frames = int(requests[0].target_frames)
+        if any(int(request.target_frames) != frames for request in requests):
+            raise ValueError("A feature batch must use one window length")
         motion = np.empty((len(requests), frames, self.store.motion_dim), dtype=np.float32)
-        loss_mask = np.zeros((len(requests), frames), dtype=bool)
+        loss_mask = np.ones((len(requests), frames), dtype=bool)
         grouped: dict[int, list[tuple[int, SampleRequest]]] = {}
         for batch_idx, request in enumerate(requests):
             grouped.setdefault(int(request.shard_idx), []).append((batch_idx, request))
         for shard_idx in sorted(grouped):
             for batch_idx, request in grouped[shard_idx]:
                 motion[batch_idx] = self._read_numpy(request)
-                left = int(request.context_left)
-                loss_mask[batch_idx, left : left + int(request.target_frames)] = True
         batch: dict[str, Any] = {
             "motion": torch.from_numpy(motion),
             "loss_mask": torch.from_numpy(loss_mask),
@@ -493,7 +489,6 @@ class FeatureDataset(Dataset):
                     "shard_idx": int(request.shard_idx),
                     "target_start": int(request.target_start),
                     "target_frames": int(request.target_frames),
-                    "context_left": int(request.context_left),
                     "variant_idx": int(request.variant_idx),
                     "range_name": self.store.range_names[int(request.variant_idx)],
                 }
@@ -506,16 +501,13 @@ class FeatureDataset(Dataset):
 
     def _item_request(self, request: SampleRequest) -> dict[str, Any]:
         motion = self._read_numpy(request)
-        mask = np.zeros((motion.shape[0],), dtype=bool)
-        left = int(request.context_left)
-        mask[left : left + int(request.target_frames)] = True
+        mask = np.ones((motion.shape[0],), dtype=bool)
         item: dict[str, Any] = {"motion": torch.from_numpy(motion), "loss_mask": torch.from_numpy(mask)}
         if self.return_metadata:
             item["metadata"] = {
                 "shard_idx": int(request.shard_idx),
                 "target_start": int(request.target_start),
                 "target_frames": int(request.target_frames),
-                "context_left": int(request.context_left),
                 "variant_idx": int(request.variant_idx),
                 "range_name": self.store.range_names[int(request.variant_idx)],
             }

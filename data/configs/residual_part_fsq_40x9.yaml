@@ -22,7 +22,6 @@ data:
 sampling:
   strategy: frame_uniform
   target_frames: 64
-  context_left: 63
   samples_per_epoch: 100000
   seed: 3407
   mirror_probability: 0.5

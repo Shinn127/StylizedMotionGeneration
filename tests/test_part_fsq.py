@@ -30,7 +30,7 @@ def _model() -> HierarchicalPartFSQMotionAutoencoder:
     return HierarchicalPartFSQMotionAutoencoder(names, parents, stream_dim=16)
 
 
-def test_interval_metadata_adapter_keeps_the_old_fixed_64_frame_contract():
+def test_interval_metadata_adapter_uses_the_fixed_64_frame_causal_contract():
     store = SimpleNamespace(
         split_ids=torch.tensor([0], dtype=torch.uint8).numpy(),
         range_shard_indices=torch.tensor([3], dtype=torch.int32).numpy(),
@@ -41,7 +41,6 @@ def test_interval_metadata_adapter_keeps_the_old_fixed_64_frame_contract():
         store,
         "train",
         target_frames=64,
-        context_left=0,
         stride=64,
         include_tail=True,
     ))
@@ -119,7 +118,7 @@ def test_part_fsq_is_strictly_causal_with_a_64_frame_receptive_field():
         expected = model(motion)["recon_state"][:, 64]
         actual = model(changed)["recon_state"][:, 64]
 
-    assert (model.receptive_field, model.context_left, model.lookahead_frames) == (64, 63, 0)
+    assert (model.receptive_field, model.lookahead_frames) == (64, 0)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 

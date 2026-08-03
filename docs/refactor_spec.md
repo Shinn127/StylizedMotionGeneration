@@ -162,7 +162,6 @@ class RepresentationProtocol(Protocol):
     num_coordinates: int
     num_levels: int
     receptive_field: int
-    context_left: int
     lookahead_frames: int
 
     def forward(self, motion: Tensor) -> dict[str, Tensor]: ...

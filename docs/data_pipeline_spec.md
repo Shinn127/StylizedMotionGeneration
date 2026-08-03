@@ -2,7 +2,7 @@
 
 ## Data Pipeline Spec
 
-状态：Draft 0.1
+状态：Draft 0.3
 日期：2026-08-03
 依赖：`docs/refactor_spec.md` Draft 0.4
 范围：offline data build、Store、Dataset、sampling、collate、DataLoader 和训练数据交付
@@ -24,7 +24,7 @@ data 必须通过 canonical preprocess 重新构建。
 
 - feature、token、trajectory 共用一个 source-clip split manifest；
 - train 使用 epoch-aware random crop，val/test 使用固定窗口；
-- causal representation 的每个 supervised frame 都具有完整 63-frame history；
+- causal representation 使用 64-frame window；每个 frame 只访问当前帧及其窗口内历史；
 - generator 每个 sample 提供 64 个 next-token target；
 - 默认 batch 只包含 contiguous tensor，不包含字符串、路径或 Python object；
 - runtime 使用 lazy mmap shard cache，不在 Store/Dataset 构造时打开或扫描全部 shard；
@@ -102,7 +102,6 @@ data layer 只要求 token encoder 满足最小注入接口，不认识具体 FS
 class TokenEncoderProtocol(Protocol):
     num_coordinates: int
     num_levels: int
-    context_left: int
 
     def encode_to_codes(self, motion: Tensor) -> tuple[Tensor, Tensor]: ...
     def representation_metadata(self) -> Mapping[str, object]: ...
@@ -199,7 +198,6 @@ coordinate_order
 coordinate_counts
 temporal_downsample: 1
 receptive_field: 64
-context_left: 63
 lookahead_frames: 0
 decoder_passes_inference
 ```
@@ -272,7 +270,7 @@ split:
 8. train stats、trajectory stats 和 sampling weights 只能读取 train split。
 
 canonical benchmark 禁止同一 source clip 的窗口跨 split。实验性 within-clip split 必须
-使用不同 policy 名称并在边界保留至少 63 frame guard，不得覆盖 canonical manifest。
+使用不同 policy 名称并保持 source clip 边界隔离，不得覆盖 canonical manifest。
 
 ## 6. Sampling Contract
 
@@ -284,7 +282,6 @@ class SampleRequest:
     shard_idx: int
     target_start: int
     target_frames: int
-    context_left: int
     variant_idx: int
 ```
 
@@ -297,7 +294,6 @@ window start。
 sampling:
   strategy: frame_uniform
   target_frames: 64
-  context_left: 63
   samples_per_epoch: 100000
   seed: 3407
   mirror_probability: 0.5
@@ -319,7 +315,7 @@ sampling:
 
 - val/test 禁止 replacement；
 - 默认 target length 64、stride 64；
-- 尾部默认丢弃；仅 `include_tail=true` 时通过 mask 纳入；
+- 尾部默认丢弃；`include_tail=true` 只纳入仍满足完整 64-frame contract 的尾部窗口；
 - 派生 index 使用紧凑 `int32/int64 [N,4]` array，不构造 Python dataclass list；
 - 相同 Store/manifest/config 必须得到相同 sample 数量和顺序；
 - training workflow 不得读取 test sampler 结果来选择 checkpoint。
@@ -329,13 +325,18 @@ sampling:
 ### 7.1 Representation
 
 ```text
-motion     float32 [B,127,230]
-loss_mask bool    [B,127]
+motion     float32 [B,64,230]
+loss_mask bool    [B,64]
 ```
 
-布局为 `[63-frame context | 64-frame target]`；`loss_mask` 仅最后 64 帧为真。
-split/clip 左边界不足 context 时左侧补零，禁止从其他 clip/split 读取。representation
-forward 可以输出全部 127 帧，loss/metric 只聚合 mask 为真的 frame。
+representation batch 不携带额外 context，64 帧全部是 supervised target，默认
+`loss_mask` 全为真。模型保持 `receptive_field=64`、`lookahead_frames=0`，第 `t` 帧
+只能访问窗口内的 `max(0,t-63)...t`。窗口外历史由模型内部 causal zero padding 提供，
+禁止从其他 clip/split 读取。
+
+representation history frames 不作为独立字段保存，由
+`receptive_field - 1 - lookahead_frames` 推导。canonical contract 的 history frames 为
+63。窗口外历史由模型内部 causal zero padding 提供。
 
 ### 7.2 Generator
 
@@ -460,7 +461,7 @@ Dataset 不绕过 typed read 直接访问内部 mmap list。
 ### 9.2 Loss 与 metric
 
 所有 representation common loss 和 representation-specific loss 必须接受 `loss_mask`。
-禁止先对完整 `[B,127]` 做 mean 再忽略 context。metric 的有效计数以 mask 中 true frame
+禁止先对完整 `[B,64]` 做 mean 再忽略无效 frame。metric 的有效计数以 mask 中 true frame
 数量为准，不以 batch 数为准。
 
 ### 9.3 Generator
@@ -522,7 +523,6 @@ data:
 sampling:
   strategy: frame_uniform
   target_frames: 64
-  context_left: 63
   samples_per_epoch: 100000
   seed: 3407
   mirror_probability: 0.5
@@ -564,7 +564,7 @@ loader:
 
 - source-clip grouped stratified split；
 - train/fixed sampler；
-- 63 context + 64 target；
+- representation 使用 64-frame causal window；generator 使用 65-frame token sample；
 - DDP rank partition 与 resume reproducibility。
 
 ### Phase 3：runtime I/O 与 loader
@@ -591,7 +591,7 @@ loader:
 - source clip/mirror 不跨 split，train/val/test source id 交集为空；
 - train request 跨 epoch 变化，相同 seed/epoch/world size 可复现；
 - request sequence 不随 num_workers 变化，不同 rank 的 global sequence ordinal 不重叠；
-- representation batch 为 `[B,127,230]`，只有最后 64 帧进入 loss/metric；
+- representation batch 为 `[B,64,230]`，64 帧全部进入 loss/metric；
 - generator batch 为 uint8 `[B,65,40]`，产生 64 个 target；
 - conditional trajectory 与 64 个 next-token target 对齐；
 - canonical batch 不包含字符串、路径或调试 object；
@@ -607,7 +607,7 @@ loader:
 2. data package 不依赖 learning；token encoder 由 composition root 注入。
 3. source clip 是 canonical split 原子，mirror 不改变 source clip sampling weight。
 4. train random crop，val/test fixed windows。
-5. representation 使用 63 context + 64 supervised target；generator 使用 65 token frame。
+5. representation 使用 64-frame causal window；generator 使用 65 token frame。
 6. default batch tensor-only；token 在 CPU 保持 uint8。
 7. DataLoader 只由 `data/loader.py` 构造，实际 device transfer 归 learning runner。
 8. 先优化 mmap pipeline，不提前引入新的 storage backend。

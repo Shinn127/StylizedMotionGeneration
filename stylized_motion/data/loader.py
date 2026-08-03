@@ -84,13 +84,11 @@ def _build_sampler(
     world_size: int,
 ) -> Sampler[SampleRequest]:
     target_frames = int(sampling.get("target_frames", 64))
-    context_left = 0 if kind != "representation" else int(sampling.get("context_left", 63))
     required_frames = target_frames + 1 if kind != "representation" else target_frames
     if split == "train":
         return TrainWindowSampler(
             store,
             target_frames=target_frames,
-            context_left=context_left,
             required_frames=required_frames,
             samples_per_epoch=int(sampling.get("samples_per_epoch", 100000)),
             seed=int(sampling.get("seed", 3407)),
@@ -104,7 +102,6 @@ def _build_sampler(
             store,
             split,
             target_frames=target_frames,
-            context_left=context_left,
             required_frames=required_frames,
             stride=int(sampling.get("stride", 64)),
             include_tail=bool(sampling.get("include_tail", False)),
@@ -117,30 +114,24 @@ def _build_sampler(
         raise
 
 
-def _validate_sampling_contract(sampling: Mapping[str, object], kind: DataKind) -> tuple[int, int]:
+def _validate_sampling_contract(sampling: Mapping[str, object], kind: DataKind) -> int:
     strategy = str(sampling.get("strategy", "frame_uniform"))
     if strategy not in {"frame_uniform", "group_balanced"}:
         raise ValueError(f"Unsupported sampling strategy: {strategy!r}")
     target_frames = int(sampling.get("target_frames", 64))
-    expected_context = 63 if kind == "representation" else 0
-    context_left = int(sampling.get("context_left", expected_context))
     if target_frames != 64:
         raise ValueError("Canonical data loaders require sampling.target_frames=64")
-    if context_left != expected_context:
-        raise ValueError(
-            f"{kind} loaders require sampling.context_left={expected_context}, got {context_left}"
-        )
     balance_key = sampling.get("balance_key")
     if balance_key is not None and balance_key not in {"style", "action"}:
         raise ValueError("sampling.balance_key must be null, style, or action")
     if strategy == "group_balanced" and balance_key is None:
         raise ValueError("group_balanced sampling requires sampling.balance_key")
-    return target_frames, context_left
+    return target_frames
 
 
 def _batch_bytes(kind: DataKind, batch_size: int, target_frames: int, motion_dim: int, trajectory_dim: int) -> int:
     if kind == "representation":
-        return int(batch_size * ((target_frames + 63) * motion_dim * 4 + (target_frames + 63)))
+        return int(batch_size * (target_frames * motion_dim * 4 + target_frames))
     value = int(batch_size * (target_frames + 1) * 40)
     if kind == "conditional_generator":
         value += int(batch_size * target_frames * trajectory_dim * 4 + batch_size * target_frames)
@@ -177,7 +168,7 @@ def build_data_loaders(
     num_workers = int(loader_config.get("num_workers", 4))
     if batch_size <= 0 or num_workers < 0:
         raise ValueError("loader batch_size must be positive and num_workers non-negative")
-    target_frames, _ = _validate_sampling_contract(sampling_config, kind)
+    target_frames = _validate_sampling_contract(sampling_config, kind)
     trajectory_dim = int(trajectory_store.trajectory_dim) if trajectory_store is not None else 0
     estimated = _batch_bytes(kind, batch_size, target_frames, int(getattr(store, "motion_dim", 230)), trajectory_dim)
     prefetch_factor = int(loader_config.get("prefetch_factor", 2))

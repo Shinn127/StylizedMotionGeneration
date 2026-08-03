@@ -27,14 +27,13 @@ class SampleRequest:
     shard_idx: int
     target_start: int
     target_frames: int
-    context_left: int
     variant_idx: int
 
     def __post_init__(self) -> None:
         if int(self.shard_idx) < 0 or int(self.target_start) < 0 or int(self.variant_idx) < 0:
             raise ValueError("SampleRequest shard, target, and variant indices must be non-negative")
-        if int(self.target_frames) <= 0 or int(self.context_left) < 0:
-            raise ValueError("SampleRequest target_frames must be positive and context_left non-negative")
+        if int(self.target_frames) <= 0:
+            raise ValueError("SampleRequest target_frames must be positive")
 
 
 @dataclass(frozen=True)
@@ -191,7 +190,6 @@ class TrainWindowSampler(Sampler[SampleRequest]):
         store: Any,
         *,
         target_frames: int = 64,
-        context_left: int = 63,
         samples_per_epoch: int = 100000,
         seed: int = 3407,
         mirror_probability: float = 0.5,
@@ -200,15 +198,14 @@ class TrainWindowSampler(Sampler[SampleRequest]):
         world_size: int = 1,
         required_frames: int | None = None,
     ) -> None:
-        if target_frames <= 0 or context_left < 0 or samples_per_epoch <= 0:
-            raise ValueError("target_frames/context_left/samples_per_epoch have invalid values")
+        if target_frames <= 0 or samples_per_epoch <= 0:
+            raise ValueError("target_frames/samples_per_epoch have invalid values")
         if not 0.0 <= mirror_probability <= 1.0:
             raise ValueError("mirror_probability must be in [0,1]")
         if rank < 0 or world_size <= 0 or rank >= world_size:
             raise ValueError("invalid rank/world_size")
         self.store = store
         self.target_frames = int(target_frames)
-        self.context_left = int(context_left)
         self.required_frames = int(required_frames if required_frames is not None else target_frames)
         if self.required_frames < self.target_frames:
             raise ValueError("required_frames cannot be smaller than target_frames")
@@ -270,7 +267,7 @@ class TrainWindowSampler(Sampler[SampleRequest]):
             max_start = stop - self.required_frames
             target_start = int(rng.integers(start, max_start + 1))
             if ordinal % self.world_size == self.rank:
-                yield SampleRequest(shard_idx, target_start, self.target_frames, self.context_left, variant_idx)
+                yield SampleRequest(shard_idx, target_start, self.target_frames, variant_idx)
 
 
 class FixedWindowSampler(Sampler[SampleRequest]):
@@ -282,20 +279,18 @@ class FixedWindowSampler(Sampler[SampleRequest]):
         split: str,
         *,
         target_frames: int = 64,
-        context_left: int = 63,
         stride: int = 64,
         include_tail: bool = False,
         rank: int = 0,
         world_size: int = 1,
         required_frames: int | None = None,
     ) -> None:
-        if target_frames <= 0 or context_left < 0 or stride <= 0:
-            raise ValueError("target_frames/context_left/stride have invalid values")
+        if target_frames <= 0 or stride <= 0:
+            raise ValueError("target_frames/stride have invalid values")
         if rank < 0 or world_size <= 0 or rank >= world_size:
             raise ValueError("invalid rank/world_size")
         self.split = split
         self.target_frames = int(target_frames)
-        self.context_left = int(context_left)
         self.required_frames = int(required_frames if required_frames is not None else target_frames)
         if self.required_frames < self.target_frames:
             raise ValueError("required_frames cannot be smaller than target_frames")
@@ -319,7 +314,7 @@ class FixedWindowSampler(Sampler[SampleRequest]):
     def __iter__(self):
         for row in self.index[self.rank :: self.world_size]:
             shard_idx, target_start, _target_stop, variant_idx = (int(value) for value in row.tolist())
-            yield SampleRequest(shard_idx, target_start, self.target_frames, self.context_left, variant_idx)
+            yield SampleRequest(shard_idx, target_start, self.target_frames, variant_idx)
 
 
 __all__ = ["FixedWindowSampler", "SampleRequest", "SplitManifest", "TrainWindowSampler", "build_split_manifest"]

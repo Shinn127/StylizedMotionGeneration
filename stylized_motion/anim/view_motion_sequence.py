@@ -18,12 +18,6 @@ def parse_args():
     parser.add_argument("--range-idx", type=int, required=True, help="Motion shard / range index from the feature manifest/index.")
     parser.add_argument("--start", type=int, required=True, help="Target segment start frame.")
     parser.add_argument("--length", type=int, required=True, help="Target segment length in frames.")
-    parser.add_argument(
-        "--context-left",
-        type=int,
-        default=None,
-        help="Left context frames used for reconstruction warmup. Defaults to the model requirement.",
-    )
     parser.add_argument("--view", choices=["source", "recon", "compare"], default="compare")
     parser.add_argument("--compare-spacing", type=float, default=2.0)
     parser.add_argument("--fps", type=int, default=60)
@@ -51,26 +45,13 @@ def choose_device(name: str) -> torch.device:
     return device
 
 
-def resolve_context_left(cli_context_left: int | None, model) -> int:
-    required = int(model.context_left)
-    if cli_context_left is None:
-        return required
-    if cli_context_left < required:
-        raise ValueError(
-            f"--context-left={cli_context_left} is smaller than the model requirement {required}"
-        )
-    return cli_context_left
-
-
-def validate_slice(range_idx: int, start: int, length: int, context_left: int, motion: np.ndarray, motion_dim: int) -> None:
+def validate_slice(range_idx: int, start: int, length: int, motion: np.ndarray, motion_dim: int) -> None:
     if range_idx < 0:
         raise ValueError(f"--range-idx must be non-negative, got {range_idx}")
     if start < 0:
         raise ValueError(f"--start must be non-negative, got {start}")
     if length <= 0:
         raise ValueError(f"--length must be positive, got {length}")
-    if context_left < 0:
-        raise ValueError(f"--context-left must be non-negative, got {context_left}")
     if motion.ndim != 2 or motion.shape[1] != motion_dim:
         raise ValueError(f"Expected motion shape [T, {motion_dim}], got {motion.shape}")
     if start + length > motion.shape[0]:
@@ -93,9 +74,9 @@ def slice_with_edge_pad(motion: np.ndarray, start: int, end: int) -> np.ndarray:
     return sliced
 
 
-def reconstruct_segment(model, family: str, motion: np.ndarray, start: int, length: int, context_left: int, device):
+def reconstruct_segment(model, family: str, motion: np.ndarray, start: int, length: int, device):
     target_end = start + length
-    infer_start = max(0, start - context_left)
+    infer_start = max(0, start - int(model.history_frames))
     alignment_factor = inference_factor(model.config, family)
     infer_start -= infer_start % alignment_factor
     infer_end = target_end
@@ -150,7 +131,6 @@ def main():
         feature_schema=store.feature_schema(),
     )
     family = model.family
-    args.context_left = resolve_context_left(args.context_left, model)
     if model.motion_dim != store.motion_dim:
         raise ValueError(f"Model motion_dim={model.motion_dim} does not match feature database motion_dim={store.motion_dim}")
     if args.range_idx >= len(store.motion_files):
@@ -158,7 +138,7 @@ def main():
 
     motion_path = store.motion_files[args.range_idx]
     motion = np.load(motion_path, mmap_mode="r")
-    validate_slice(args.range_idx, args.start, args.length, args.context_left, motion, model.motion_dim)
+    validate_slice(args.range_idx, args.start, args.length, motion, model.motion_dim)
     source_features = np.asarray(motion[args.start : args.start + args.length], dtype=np.float32).copy()
 
     device = choose_device(args.device)
@@ -170,7 +150,6 @@ def main():
         motion=motion,
         start=args.start,
         length=args.length,
-        context_left=args.context_left,
         device=device,
     )
 
@@ -187,7 +166,7 @@ def main():
         "mirror": mirror,
         "start": args.start,
         "length": args.length,
-        "context_left": args.context_left,
+        "history_frames": int(model.history_frames),
         "view": args.view,
         "device": str(device),
         **infer_meta,

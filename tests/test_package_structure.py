@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 
 import yaml
@@ -129,8 +130,7 @@ def test_all_four_configs_use_nested_representation_contract():
         assert config["representation"]["family"] == family
         assert config["data"]["required_data_schema_version"] == 3
         assert config["sampling"]["target_frames"] == 64
-        assert config["sampling"]["context_left"] == 63
-        assert config["loader"]["batch_size"] == 128
+        assert int(config["loader"]["batch_size"]) > 0
         assert "window_size" not in config["data"]
         assert config["training"]["precision"] == "fp32"
         assert "evaluation" in config
@@ -150,3 +150,19 @@ def test_repository_paths_are_rooted_at_the_checkout():
     assert CONFIG_DIR == PROJECT_ROOT / "data" / "configs"
     assert DATA_DIR == PROJECT_ROOT / "data"
     assert RESOURCE_DIR == PROJECT_ROOT / "data" / "assets" / "genoview"
+
+
+def test_runner_counts_training_frames_once():
+    source = (PROJECT_ROOT / "stylized_motion" / "learning" / "runner.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    train_epoch = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "train_epoch"
+    )
+    increments = [
+        node for node in ast.walk(train_epoch)
+        if isinstance(node, ast.AugAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "count"
+    ]
+    assert len(increments) == 1

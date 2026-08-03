@@ -75,7 +75,7 @@ def test_canonical_configs_and_specs_are_explicit():
         spec = representation_spec(_config(filename))
         assert (spec.family, spec.variant, spec.representation_id) == identity
         assert (spec.num_coordinates, spec.num_levels) == (40, 9)
-        assert (spec.receptive_field, spec.context_left, spec.lookahead_frames) == (64, 63, 0)
+        assert (spec.receptive_field, spec.lookahead_frames, spec.history_frames) == (64, 0, 63)
 
 
 def test_unindexed_cuda_request_accepts_the_current_cuda_device():

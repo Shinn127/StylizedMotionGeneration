@@ -183,6 +183,15 @@ def build_loss_fn(representation: RepresentationProtocol, context: Mapping[str, 
         motion = batch["motion"]
         if not isinstance(motion, torch.Tensor):
             raise TypeError("FeatureDataset batches must contain tensor motion")
+        if motion.ndim != 3 or motion.shape[1] != 64:
+            raise ValueError(
+                "Canonical representation training requires motion with shape [B,64,motion_dim]"
+            )
+        loss_mask = batch.get("loss_mask")
+        if not isinstance(loss_mask, torch.Tensor) or loss_mask.shape != motion.shape[:2]:
+            raise ValueError("Canonical representation batches require loss_mask with shape [B,64]")
+        if not bool(loss_mask.to(dtype=torch.bool).all()):
+            raise ValueError("Canonical 64-frame representation batches require all loss_mask values to be true")
         loss_values = compute_motion_reconstruction_losses(
             batch_motion=motion,
             output=dict(output),
@@ -202,11 +211,11 @@ def build_loss_fn(representation: RepresentationProtocol, context: Mapping[str, 
             ref_pos=context["ref_pos"],
             parents=context["parents"],
             foot_indices=context["foot_indices"],
-            loss_mask=batch.get("loss_mask"),
+            loss_mask=loss_mask,
         )
         rep_batch = dict(context)
         rep_batch["motion"] = motion
-        rep_batch["loss_mask"] = batch.get("loss_mask")
+        rep_batch["loss_mask"] = loss_mask
         specific = representation.compute_representation_losses(dict(output), rep_batch)
         result = {
             "loss": loss_values.loss + sum(specific.values(), motion.new_zeros(())),
@@ -306,6 +315,8 @@ class RepresentationRunner:
         motion = batch["motion"]
         if not isinstance(motion, torch.Tensor) or not _matches_requested_device(motion.device, self.device):
             raise ValueError("Runner expects a device batch produced by move_batch_to_device()")
+        if motion.ndim != 3 or motion.shape[1] != 64:
+            raise ValueError("Canonical representation runner requires motion with shape [B,64,motion_dim]")
         with self._autocast():
             return self.representation(motion, collect_metrics=True)
 
@@ -479,15 +490,28 @@ class RepresentationRunner:
             if _is_main_process():
                 print(f"Epoch {epoch}/{self.epochs} started", flush=True)
             train = self.train_epoch(epoch)
-            val = self.evaluate("val")["metrics"] if self.val_loader is not None else {}
+            val_result = self.evaluate("val") if self.val_loader is not None else {}
+            val = val_result.get("metrics", {})
             record = {"epoch": epoch, "train": train, "val": val}
             history.append(record)
             val_loss = float(val.get("loss", train.get("loss", float("inf"))))
             if _is_main_process():
                 train_loss = float(train.get("loss", float("nan")))
+                train_recon = float(train.get("recon", float("nan")))
+                train_samples_per_second = float(train.get("samples_per_second", float("nan")))
                 val_loss_text = f"{float(val['loss']):.6f}" if "loss" in val else "n/a"
+                val_recon_text = f"{float(val['recon']):.6f}" if "recon" in val else "n/a"
+                val_samples_per_second = (
+                    f"{float(val_result.get('samples_per_second', float('nan'))):.2f}"
+                    if val_result
+                    else "n/a"
+                )
                 print(
-                    f"Epoch {epoch}/{self.epochs} complete | train_loss={train_loss:.6f} | val_loss={val_loss_text}",
+                    f"Epoch {epoch}/{self.epochs} complete | "
+                    f"train_loss={train_loss:.6f} | train_recon={train_recon:.6f} | "
+                    f"train_samples/s={train_samples_per_second:.2f} | "
+                    f"val_loss={val_loss_text} | val_recon={val_recon_text} | "
+                    f"val_samples/s={val_samples_per_second}",
                     flush=True,
                 )
             is_best = self.best_val is None or val_loss < self.best_val

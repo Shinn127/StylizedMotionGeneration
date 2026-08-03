@@ -58,8 +58,8 @@ class RepresentationProtocol(Protocol):
     num_coordinates: int
     num_levels: int
     receptive_field: int
-    context_left: int
     lookahead_frames: int
+    history_frames: int
 
     def forward(self, motion: torch.Tensor) -> dict[str, Any]: ...
 
@@ -78,6 +78,15 @@ class RepresentationProtocol(Protocol):
     ) -> dict[str, torch.Tensor]: ...
 
 
+def required_history_frames(receptive_field: int, lookahead_frames: int = 0) -> int:
+    """Derive causal history from the temporal receptive-field contract."""
+    receptive_field = int(receptive_field)
+    lookahead_frames = int(lookahead_frames)
+    if receptive_field <= 0 or lookahead_frames < 0 or lookahead_frames >= receptive_field:
+        raise ValueError("Invalid receptive_field/lookahead_frames contract")
+    return receptive_field - 1 - lookahead_frames
+
+
 @dataclass(frozen=True)
 class RepresentationSpec:
     family: str
@@ -90,7 +99,6 @@ class RepresentationSpec:
     temporal_downsample: int = 1
     frame_rate: int = 60
     receptive_field: int = 64
-    context_left: int = 63
     lookahead_frames: int = 0
     decoder_passes_inference: int = 1
     architecture_version: int | None = None
@@ -98,6 +106,10 @@ class RepresentationSpec:
     @property
     def coordinate_layout(self) -> dict[str, int]:
         return dict(self.coordinate_counts)
+
+    @property
+    def history_frames(self) -> int:
+        return required_history_frames(self.receptive_field, self.lookahead_frames)
 
     def as_dict(self) -> dict[str, object]:
         result: dict[str, object] = {
@@ -111,7 +123,6 @@ class RepresentationSpec:
             "temporal_downsample": self.temporal_downsample,
             "frame_rate": self.frame_rate,
             "receptive_field": self.receptive_field,
-            "context_left": self.context_left,
             "lookahead_frames": self.lookahead_frames,
             "decoder_passes_inference": self.decoder_passes_inference,
         }
@@ -230,8 +241,9 @@ def _spec_from_values(
     temporal_downsample = int(metadata.get("temporal_downsample", 1))
     frame_rate = int(metadata.get("frame_rate", 60))
     receptive_field = int(metadata.get("receptive_field", 64))
-    context_left = int(metadata.get("context_left", 63))
     lookahead_frames = int(metadata.get("lookahead_frames", 0))
+    if "context_left" in metadata:
+        raise ValueError("context_left is not part of the canonical representation metadata")
     decoder_passes = int(
         metadata.get(
             "decoder_passes_inference",
@@ -242,8 +254,8 @@ def _spec_from_values(
         raise ValueError("Canonical FSQ representations cannot temporally downsample")
     if frame_rate <= 0:
         raise ValueError("frame_rate must be positive")
-    if (receptive_field, context_left, lookahead_frames) != (64, 63, 0):
-        raise ValueError("Canonical FSQ representations require RF=64, context_left=63, lookahead=0")
+    if (receptive_field, lookahead_frames) != (64, 0):
+        raise ValueError("Canonical FSQ representations require RF=64 and lookahead=0")
     expected_decoder_passes = 2 if family == RESIDUAL_PART_FSQ_FAMILY else 1
     if decoder_passes != expected_decoder_passes:
         raise ValueError(
@@ -260,7 +272,6 @@ def _spec_from_values(
         temporal_downsample=temporal_downsample,
         frame_rate=frame_rate,
         receptive_field=receptive_field,
-        context_left=context_left,
         lookahead_frames=lookahead_frames,
         decoder_passes_inference=decoder_passes,
         architecture_version=architecture_version,
@@ -294,9 +305,12 @@ class RepresentationAdapter(nn.Module):
         self.num_coordinates = spec.num_coordinates
         self.num_levels = spec.num_levels
         self.receptive_field = spec.receptive_field
-        self.context_left = spec.context_left
         self.lookahead_frames = spec.lookahead_frames
         self.config = dict(getattr(module, "config", {}))
+
+    @property
+    def history_frames(self) -> int:
+        return required_history_frames(self.receptive_field, self.lookahead_frames)
 
     def forward(self, motion: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
         output = self.module(motion, **kwargs)
@@ -377,7 +391,7 @@ def build_representation(
     model_config.pop("architecture_version", None)
     for metadata_key in (
         "family", "variant", "representation_id", "coordinate_order", "coordinate_counts",
-        "temporal_downsample", "frame_rate", "receptive_field", "context_left",
+        "temporal_downsample", "frame_rate", "receptive_field",
         "lookahead_frames", "decoder_passes_inference",
     ):
         model_config.pop(metadata_key, None)
@@ -449,6 +463,8 @@ def load_representation_checkpoint(
         or not isinstance(model_config, Mapping)
     ):
         raise ValueError("Checkpoint must contain representation and model_config mappings")
+    if "context_left" in representation_metadata_value:
+        raise ValueError("Checkpoints containing removed context_left metadata are not supported")
     configured_representation = dict(config["representation"])
     if configured_representation.get("family") != representation_metadata_value.get("family"):
         raise ValueError("Checkpoint config and representation metadata have different families")
@@ -465,7 +481,7 @@ def load_representation_checkpoint(
     for key in (
         "family", "variant", "representation_id", "num_coordinates", "num_levels",
         "coordinate_order", "coordinate_counts", "temporal_downsample", "lookahead_frames",
-        "receptive_field", "context_left", "decoder_passes_inference", "architecture_version",
+        "receptive_field", "decoder_passes_inference", "architecture_version",
     ):
         if representation_metadata_value.get(key) != expected.get(key):
             raise ValueError(f"Checkpoint representation metadata mismatch at {key!r}")
@@ -500,6 +516,7 @@ __all__ = [
     "build_representation",
     "checkpoint_metadata",
     "load_representation_checkpoint",
+    "required_history_frames",
     "representation_metadata",
     "representation_spec",
 ]

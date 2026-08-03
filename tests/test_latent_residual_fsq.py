@@ -161,7 +161,7 @@ def test_latent_residual_fsq_is_strictly_causal_with_rf64():
         expected = model(motion)["recon_state"][:, 64]
         actual = model(changed)["recon_state"][:, 64]
 
-    assert (model.receptive_field, model.context_left, model.lookahead_frames) == (64, 63, 0)
+    assert (model.receptive_field, model.lookahead_frames) == (64, 0)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 

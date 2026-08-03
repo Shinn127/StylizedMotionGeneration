@@ -123,7 +123,7 @@ class HierarchicalPartFSQMotionAutoencoder(nn.Module):
         )
         # Frame encoder RF=31 and frame decoder RF=34; their composition has
         # RF=64, left context=63, and no future access.
-        self.receptive_field, self.context_left, self.lookahead_frames = 64, 63, 0
+        self.receptive_field, self.lookahead_frames = 64, 0
 
     @property
     def num_coordinates(self) -> int:

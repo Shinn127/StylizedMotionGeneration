@@ -144,19 +144,20 @@ def test_save_motion_shard_creates_directory_under_output(tmp_path: Path):
     assert (tmp_path / "staging" / relative).exists()
 
 
-def test_schema_v3_feature_store_returns_masked_batch(tmp_path: Path):
+def test_schema_v3_feature_store_returns_64_frame_causal_batch(tmp_path: Path):
     _write_feature_store(tmp_path)
     store = open_feature_store(tmp_path)
     try:
-        request = SampleRequest(0, 63, 64, 63, 0)
+        request = SampleRequest(0, 63, 64, 0)
         dataset = FeatureDataset("train", store, requests=[request])
         item = dataset[0]
         batch = dataset.__getitems__([request])
-        assert item["motion"].shape == (127, 230)
-        assert item["loss_mask"].shape == (127,)
+        assert item["motion"].shape == (64, 230)
+        assert item["loss_mask"].shape == (64,)
         assert int(item["loss_mask"].sum()) == 64
+        assert bool(item["loss_mask"].all())
         assert batch["motion"].is_contiguous()
-        assert batch["motion"].shape == (1, 127, 230)
+        assert batch["motion"].shape == (1, 64, 230)
         assert validate_data(feature_database=tmp_path, full=True) == {
             "feature": True,
             "token": False,

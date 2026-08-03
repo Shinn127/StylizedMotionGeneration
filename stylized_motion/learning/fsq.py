@@ -186,7 +186,7 @@ class FSQMotionAutoencoder(nn.Module):
             activation=activation,
             norm=norm,
         )
-        self.receptive_field, self.context_left, self.lookahead_frames = 64, 63, 0
+        self.receptive_field, self.lookahead_frames = 64, 0
         self.num_coordinates = int(num_coordinates)
         self.num_levels = int(num_levels)
 

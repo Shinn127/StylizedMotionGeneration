@@ -100,12 +100,11 @@ class CausalMotionVQVAE(nn.Module):
             )
 
         if model_type == "frame_causal_cnn":
-            self.receptive_field, self.context_left, self.lookahead_frames = 64, 63, 0
+            self.receptive_field, self.lookahead_frames = 64, 0
         elif model_type == "causal_cnn":
-            self.receptive_field, self.context_left, self.lookahead_frames = 64, 63, 3
+            self.receptive_field, self.lookahead_frames = 64, 3
         else:
             self.receptive_field = None
-            self.context_left = context_len - 1
             self.lookahead_frames = None
 
     def _encode_input(self, x):

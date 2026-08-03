@@ -688,11 +688,15 @@ def _encode_feature_shard(
     num_coordinates = int(encoder.num_coordinates)
     indices_out = np.empty((num_frames, num_coordinates), dtype=np.uint8)
     codes_out = np.empty((num_frames, num_coordinates), dtype=np.float16)
-    context_left = int(encoder.context_left)
+    receptive_field = int(getattr(encoder, "receptive_field"))
+    lookahead_frames = int(getattr(encoder, "lookahead_frames"))
+    if receptive_field <= 0 or lookahead_frames < 0 or lookahead_frames >= receptive_field:
+        raise ValueError("Token encoder has invalid receptive_field/lookahead_frames metadata")
+    history_frames = receptive_field - 1 - lookahead_frames
     with torch.inference_mode():
         for start in range(0, num_frames, int(chunk_size)):
             stop = min(num_frames, start + int(chunk_size))
-            read_start = max(0, start - context_left)
+            read_start = max(0, start - history_frames)
             values = torch.from_numpy(np.asarray(motion[read_start:stop], dtype=np.float32).copy()).unsqueeze(0).to(device)
             values = input_adapter(values) if input_adapter is not None else values
             codes, indices = encoder.encode_to_codes(values)
@@ -724,7 +728,12 @@ def build_token_database(
     metadata = encoder.representation_metadata()
     if not isinstance(metadata, Mapping):
         raise ValueError("Token encoder representation_metadata() must return a mapping")
-    if int(encoder.num_coordinates) != 40 or int(encoder.num_levels) != 9 or int(encoder.context_left) != 63:
+    if (
+        int(encoder.num_coordinates) != 40
+        or int(encoder.num_levels) != 9
+        or int(encoder.receptive_field) != 64
+        or int(encoder.lookahead_frames) != 0
+    ):
         raise ValueError("Token encoder does not satisfy the canonical 40x9 causal contract")
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -805,7 +814,6 @@ def build_token_database(
             "coordinate_counts": dict(representation.get("coordinate_counts", {})),
             "temporal_downsample": int(representation.get("temporal_downsample", 1)),
             "receptive_field": int(representation.get("receptive_field", 64)),
-            "context_left": int(representation.get("context_left", 63)),
             "lookahead_frames": int(representation.get("lookahead_frames", 0)),
             "decoder_passes_inference": int(representation.get("decoder_passes_inference", 1)),
         }

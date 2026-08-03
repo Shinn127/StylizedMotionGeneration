@@ -42,7 +42,6 @@ def _write_store(tmp_path, *, token_value: int = 0):
         "num_levels": 9,
         "temporal_downsample": 1,
         "receptive_field": 64,
-        "context_left": 63,
         "lookahead_frames": 0,
         "decoder_passes_inference": 1,
         "coordinate_order": ["flat"],
@@ -69,7 +68,7 @@ def test_token_store_opens_and_dataset_reads_schema_v3(tmp_path):
     _write_store(tmp_path)
     store = open_token_store(tmp_path)
     try:
-        request = SampleRequest(0, 0, 64, 0, 0)
+        request = SampleRequest(0, 0, 64, 0)
         dataset = TokenDataset("train", store, requests=[request])
         item = dataset[0]
         assert item["indices"].shape == (65, 40)
