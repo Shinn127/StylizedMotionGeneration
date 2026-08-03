@@ -15,7 +15,11 @@ from stylized_motion.learning.representation import (
     load_representation_checkpoint,
     representation_spec,
 )
-from stylized_motion.learning.runner import RepresentationRunner, load_experiment_config
+from stylized_motion.learning.runner import (
+    RepresentationRunner,
+    _matches_requested_device,
+    load_experiment_config,
+)
 from stylized_motion.learning.checkpoint import CheckpointManager
 
 
@@ -72,6 +76,11 @@ def test_canonical_configs_and_specs_are_explicit():
         assert (spec.family, spec.variant, spec.representation_id) == identity
         assert (spec.num_coordinates, spec.num_levels) == (40, 9)
         assert (spec.receptive_field, spec.context_left, spec.lookahead_frames) == (64, 63, 0)
+
+
+def test_unindexed_cuda_request_accepts_the_current_cuda_device():
+    assert _matches_requested_device(torch.device("cuda:0"), torch.device("cuda"))
+    assert not _matches_requested_device(torch.device("cuda:1"), torch.device("cuda:0"))
 
 
 def test_builder_roundtrip_contract_for_all_four_lines():

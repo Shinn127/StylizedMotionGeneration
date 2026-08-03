@@ -75,6 +75,11 @@ def move_batch_to_device(batch: Batch, device: torch.device) -> dict[str, Any]:
     return moved
 
 
+def _matches_requested_device(actual: torch.device, requested: torch.device) -> bool:
+    """Treat an unindexed CUDA request as the current CUDA device."""
+    return actual.type == requested.type and (requested.index is None or actual.index == requested.index)
+
+
 def load_experiment_config(path: str | Path) -> dict[str, object]:
     path = Path(path)
     value = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -299,7 +304,7 @@ class RepresentationRunner:
 
     def _forward(self, batch: Batch) -> dict[str, Any]:
         motion = batch["motion"]
-        if not isinstance(motion, torch.Tensor) or motion.device != self.device:
+        if not isinstance(motion, torch.Tensor) or not _matches_requested_device(motion.device, self.device):
             raise ValueError("Runner expects a device batch produced by move_batch_to_device()")
         with self._autocast():
             return self.representation(motion, collect_metrics=True)
@@ -471,11 +476,20 @@ class RepresentationRunner:
     def fit(self) -> dict[str, Any]:
         history: list[dict[str, Any]] = []
         for epoch in range(1, self.epochs + 1):
+            if _is_main_process():
+                print(f"Epoch {epoch}/{self.epochs} started", flush=True)
             train = self.train_epoch(epoch)
             val = self.evaluate("val")["metrics"] if self.val_loader is not None else {}
             record = {"epoch": epoch, "train": train, "val": val}
             history.append(record)
             val_loss = float(val.get("loss", train.get("loss", float("inf"))))
+            if _is_main_process():
+                train_loss = float(train.get("loss", float("nan")))
+                val_loss_text = f"{float(val['loss']):.6f}" if "loss" in val else "n/a"
+                print(
+                    f"Epoch {epoch}/{self.epochs} complete | train_loss={train_loss:.6f} | val_loss={val_loss_text}",
+                    flush=True,
+                )
             is_best = self.best_val is None or val_loss < self.best_val
             if is_best:
                 self.best_val = val_loss
