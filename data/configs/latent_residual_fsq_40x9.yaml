@@ -8,14 +8,14 @@ representation:
     part_state_dim: 64
     part_predictor_hidden_dim: 128
     latent_projector_hidden_dim: 128
-    part_latent_dims: [40, 24, 24, 20, 20]
+    part_latent_dims: [20, 27, 27, 27, 27]
     num_levels: 9
     fsq_scale:
     fsq_preserve_symmetry: false
     fsq_noise_dropout: 0.0
 
 data:
-  feature_database: data/processed/100style_pruned/feature_database
+  feature_database: data/processed/100style_pruned_90/feature_database
   required_data_schema_version: 3
 
 sampling:
@@ -27,7 +27,7 @@ sampling:
 
 training:
   epochs: 100
-  lr: 0.0002
+  lr: 0.0005
   weight_decay: 0.0
   precision: fp32
   seed: 3407
@@ -49,7 +49,7 @@ evaluation:
   root_dt: 0.016666666666666666
 
 loader:
-  batch_size: 128
+  batch_size: 512
   num_workers: 4
   pin_memory: auto
   persistent_workers: true

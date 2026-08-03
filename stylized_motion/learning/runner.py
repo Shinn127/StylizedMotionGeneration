@@ -36,6 +36,16 @@ from stylized_motion.learning.representation import (
 
 Batch = Mapping[str, Any]
 MetricFn = Callable[[Mapping[str, Any], Batch], torch.Tensor | float]
+LOSS_COMPONENTS = (
+    "recon",
+    "delta",
+    "root_pos",
+    "root_rot",
+    "joint",
+    "contact",
+    "foot_slide",
+    "foot_height",
+)
 
 
 def choose_device(name: str = "auto") -> torch.device:
@@ -524,8 +534,14 @@ class RepresentationRunner:
                     self.checkpoint_manager.save(payload, "best.pt")
             if self.writer is not None and _is_main_process():
                 self.writer.add_scalar("epoch/train_loss", train.get("loss", 0.0), epoch)
+                for name in LOSS_COMPONENTS:
+                    if name in train:
+                        self.writer.add_scalar(f"epoch/train_{name}", train[name], epoch)
                 if val:
                     self.writer.add_scalar("epoch/val_loss", val.get("loss", 0.0), epoch)
+                    for name in LOSS_COMPONENTS:
+                        if name in val:
+                            self.writer.add_scalar(f"epoch/val_{name}", val[name], epoch)
         return {"mode": "train", "global_step": self.global_step, "history": history}
 
     def run(self, mode: str, split: str | None = None) -> dict[str, Any]:
