@@ -1,65 +1,82 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import numpy as np
 import pytest
+import torch
 
-from stylized_motion.data.token_store import TokenDataset, build_token_store
+from stylized_motion.data.preprocess import validate_data
+from stylized_motion.data.sampling import SampleRequest
+from stylized_motion.data.token_data import TokenDataset, open_token_store
 
 
 def _write_store(tmp_path, *, token_value: int = 0):
-    (tmp_path / "indices").mkdir()
-    np.save(tmp_path / "indices" / "indices_00000.npy", np.full((64, 40), token_value, dtype=np.uint8))
-    layout = {"flat": 40}
-    windows = np.asarray([[0, 0, 64, 0]], dtype=np.int32)
+    shard_dir = tmp_path / "indices"
+    shard_dir.mkdir()
+    shard = shard_dir / "shard_00000.npy"
+    np.save(shard, np.full((65, 40), token_value, dtype=np.uint8))
+    shard_hash = hashlib.sha256(shard.read_bytes()).hexdigest()
+    manifest = {
+        "data_schema_version": 3,
+        "store_type": "token",
+        "frame_rate": 60,
+        "num_shards": 1,
+        "shard_files": ["indices/shard_00000.npy"],
+        "shard_sha256": [shard_hash],
+        "split_manifest_hash": "split-hash",
+        "feature_schema_hash": "feature-hash",
+        "created_by": "tests",
+        "range_names": ["style_action"],
+        "source_clip_names": ["style_action"],
+        "style_names": ["style"],
+        "action_names": ["action"],
+        "representation_family": "flat_fsq",
+        "representation_variant": "flat",
+        "representation_id": "flat_fsq_40x9",
+        "model_family_legacy": "fsq",
+        "checkpoint_sha256": "checkpoint-hash",
+        "motion_dim": 230,
+        "num_coordinates": 40,
+        "num_levels": 9,
+        "temporal_downsample": 1,
+        "receptive_field": 64,
+        "context_left": 63,
+        "lookahead_frames": 0,
+        "decoder_passes_inference": 1,
+        "coordinate_order": ["flat"],
+        "coordinate_counts": {"flat": 40},
+        "feature_schema": {"name": "motion_feature_v2", "motion_dim": 230},
+    }
     np.savez(
-        tmp_path / "metadata.npz",
-        token_files=np.asarray(["indices/indices_00000.npy"], dtype=object),
-        code_files=np.asarray([""], dtype=object),
-        num_frames=np.asarray([64], dtype=np.int32),
-        range_names=np.asarray(["style_action"], dtype=object),
+        tmp_path / "index.npz",
+        shard_num_frames=np.asarray([65], dtype=np.int64),
+        clip_ids=np.asarray([0], dtype=np.int32),
+        source_clip_ids=np.asarray([0], dtype=np.int32),
+        range_shard_indices=np.asarray([0], dtype=np.int32),
+        range_starts=np.asarray([0], dtype=np.int64),
+        range_stops=np.asarray([65], dtype=np.int64),
         range_mirror=np.asarray([False], dtype=bool),
-        style_names=np.asarray(["style"], dtype=object),
-        action_names=np.asarray(["action"], dtype=object),
+        split_ids=np.asarray([0], dtype=np.uint8),
         style_ids=np.asarray([0], dtype=np.int32),
         action_ids=np.asarray([0], dtype=np.int32),
-        train_windows=windows,
-        val_windows=windows,
-        test_windows=windows,
-        schema_version=np.asarray(2, dtype=np.int32),
-        motion_dim=np.asarray(230, dtype=np.int32),
-        window_size=np.asarray(64, dtype=np.int32),
-        frame_rate=np.asarray(60, dtype=np.int32),
-        temporal_downsample=np.asarray(1, dtype=np.int32),
-        receptive_field=np.asarray(64, dtype=np.int32),
-        context_left=np.asarray(63, dtype=np.int32),
-        lookahead_frames=np.asarray(0, dtype=np.int32),
-        decoder_passes_inference=np.asarray(1, dtype=np.int32),
-        num_coordinates=np.asarray(40, dtype=np.int32),
-        num_levels=np.asarray(9, dtype=np.int32),
-        checkpoint_path=np.asarray("checkpoint.pt", dtype=object),
-        checkpoint_sha256=np.asarray("checkpoint-hash", dtype=object),
-        feature_database=np.asarray("feature-database", dtype=object),
-        feature_schema_hash=np.asarray("feature-hash", dtype=object),
-        names_sha256=np.asarray("names-hash", dtype=object),
-        stats_sha256=np.asarray("stats-hash", dtype=object),
-        joint_subset=np.asarray("pruned", dtype=object),
-        representation_family=np.asarray("flat_fsq", dtype=object),
-        representation_variant=np.asarray("flat", dtype=object),
-        representation_id=np.asarray("flat_fsq_40x9", dtype=object),
-        model_family_legacy=np.asarray("fsq", dtype=object),
-        coordinate_order=np.asarray(["flat"], dtype=object),
-        coordinate_counts=np.asarray(json.dumps(layout), dtype=object),
     )
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
 
-def test_token_store_opens_and_dataset_validates_shards(tmp_path):
+def test_token_store_opens_and_dataset_reads_schema_v3(tmp_path):
     _write_store(tmp_path)
-    store = build_token_store(tmp_path)
-    item = TokenDataset("train", store)[0]
-    assert item["indices"].shape == (64, 40)
-    assert int(item["indices"].max()) == 0
+    store = open_token_store(tmp_path)
+    try:
+        request = SampleRequest(0, 0, 64, 0, 0)
+        dataset = TokenDataset("train", store, requests=[request])
+        item = dataset[0]
+        assert item["indices"].shape == (65, 40)
+        assert item["indices"].dtype == torch.uint8
+        assert int(item["indices"].max()) == 0
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize(
@@ -67,17 +84,20 @@ def test_token_store_opens_and_dataset_validates_shards(tmp_path):
     [
         {"checkpoint_sha256": "wrong"},
         {"representation": {"family": "part_fsq"}},
-        {"feature_schema": {"names_sha256": "wrong"}},
+        {"feature_schema": {"feature_schema_hash": "wrong"}},
     ],
 )
 def test_token_store_rejects_contract_mismatches(tmp_path, kwargs):
     _write_store(tmp_path)
-    with pytest.raises(ValueError):
-        build_token_store(tmp_path, **kwargs)
+    store = open_token_store(tmp_path)
+    try:
+        with pytest.raises(ValueError):
+            store.validate_contract(**kwargs)
+    finally:
+        store.close()
 
 
-def test_token_dataset_rejects_out_of_range_indices_at_open(tmp_path):
+def test_token_values_are_range_checked_by_full_validation(tmp_path):
     _write_store(tmp_path, token_value=9)
-    store = build_token_store(tmp_path)
-    with pytest.raises(ValueError, match="outside"):
-        TokenDataset("train", store)
+    with pytest.raises(ValueError, match="out-of-range"):
+        validate_data(token_database=tmp_path, full=True)

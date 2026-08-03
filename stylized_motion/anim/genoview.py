@@ -11,6 +11,7 @@ from raylib.defines import *
 
 from stylized_motion.anim.features import deserialize_motion_feature_stats, reconstruct_motion_state_from_features
 from stylized_motion.anim import quat
+from stylized_motion.data import open_feature_store
 from stylized_motion.util.paths import RESOURCE_DIR
 
 
@@ -461,16 +462,24 @@ def load_feature_array(path: Path, key: str) -> np.ndarray:
 
 def load_feature_stats(stats_source: Path):
     if stats_source.is_dir():
-        stats_source = stats_source / "metadata.npz"
-
-    if stats_source.suffix == ".npz":
-        payload_npz = np.load(stats_source, allow_pickle=True)
-        payload = {key: payload_npz[key] for key in payload_npz.files}
-    else:
-        checkpoint = torch.load(stats_source, map_location="cpu", weights_only=False)
-        if "stats" not in checkpoint:
-            raise KeyError(f"Checkpoint {stats_source} does not contain stats")
-        payload = checkpoint["stats"]
+        store = open_feature_store(stats_source)
+        try:
+            metadata = {
+                "names": list(store.names),
+                "parents": store.parents.astype(np.int32, copy=True),
+                "joint_subset": store.joint_subset,
+            }
+            return store.stats, metadata
+        finally:
+            store.close()
+    if stats_source.suffix != ".pt":
+        raise ValueError("stats_source must be a schema-v3 feature database or checkpoint .pt")
+    checkpoint = torch.load(stats_source, map_location="cpu", weights_only=False)
+    if "feature_stats" not in checkpoint:
+        raise KeyError(f"Checkpoint {stats_source} does not contain feature_stats")
+    payload = dict(checkpoint["feature_stats"])
+    if "dist" not in payload:
+        payload["dist"] = np.ones_like(np.asarray(payload["offset"], dtype=np.float32))
 
     stats, metadata = deserialize_motion_feature_stats(payload)
     for key in ("names", "parents", "joint_subset"):
@@ -1203,7 +1212,7 @@ def main():
     parser.add_argument("--database", type=Path, default=None, help="Path to database.npz")
     parser.add_argument("--features", type=Path, default=None, help="Path to .npy or .npz containing 230D features with shape [T, D].")
     parser.add_argument("--feature-key", type=str, default="motion", help="Array key for .npz feature input.")
-    parser.add_argument("--stats-source", type=Path, default=None, help="Checkpoint .pt, metadata.npz, or feature_database directory containing feature stats.")
+    parser.add_argument("--stats-source", type=Path, default=None, help="Checkpoint .pt or schema-v3 feature_database directory containing feature stats.")
     parser.add_argument("--normalized", action="store_true", help="Treat --features as normalized feature values.")
     parser.add_argument("--range-name", type=str, default="features", help="Range name used in feature visualization mode.")
     parser.add_argument("--root-position0", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"))

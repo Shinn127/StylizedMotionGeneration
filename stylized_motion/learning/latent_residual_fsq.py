@@ -279,7 +279,9 @@ class LatentResidualPartFSQMotionAutoencoder(ResidualPartFSQMotionAutoencoder):
         decoded_by_name = {
             name: value for (name, _), value in zip(latent_batches, decoded.split(base.shape[0], dim=0))
         }
-        residual_energy = torch.stack([value.square().mean() for value in residuals.values()]).mean()
+        residual_energy = torch.stack(
+            [value.square().mean(dim=-1) for value in residuals.values()], dim=0
+        ).mean(dim=0)
         base_rms = base.square().mean().sqrt().clamp_min(1e-7)
         latent_to_base_ratio = total_residual.square().mean().sqrt() / base_rms
         return (

@@ -1,6 +1,8 @@
 import torch
 
-from stylized_motion.data.feature_dataset import _fixed_windows_from_intervals
+from types import SimpleNamespace
+
+from stylized_motion.data.sampling import FixedWindowSampler
 from stylized_motion.learning.part_fsq import HierarchicalPartFSQMotionAutoencoder
 from stylized_motion.learning.part_layout import GROUP_NAMES, PartFSQLayout
 
@@ -29,13 +31,25 @@ def _model() -> HierarchicalPartFSQMotionAutoencoder:
 
 
 def test_interval_metadata_adapter_keeps_the_old_fixed_64_frame_contract():
-    intervals = torch.tensor([[3, 10, 154, 7]], dtype=torch.int32).numpy()
-    windows = _fixed_windows_from_intervals(intervals, window_size=64)
+    store = SimpleNamespace(
+        split_ids=torch.tensor([0], dtype=torch.uint8).numpy(),
+        range_shard_indices=torch.tensor([3], dtype=torch.int32).numpy(),
+        range_starts=torch.tensor([10], dtype=torch.int64).numpy(),
+        range_stops=torch.tensor([154], dtype=torch.int64).numpy(),
+    )
+    windows = list(FixedWindowSampler(
+        store,
+        "train",
+        target_frames=64,
+        context_left=0,
+        stride=64,
+        include_tail=True,
+    ))
 
-    assert [(window.shard_idx, window.start_idx, window.end_idx, window.range_idx) for window in windows] == [
-        (3, 10, 74, 7),
-        (3, 74, 138, 7),
-        (3, 90, 154, 7),
+    assert [(window.shard_idx, window.target_start, window.target_frames, window.variant_idx) for window in windows] == [
+        (3, 10, 64, 0),
+        (3, 74, 64, 0),
+        (3, 90, 64, 0),
     ]
 
 

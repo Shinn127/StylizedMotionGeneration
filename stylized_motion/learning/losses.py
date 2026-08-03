@@ -259,14 +259,31 @@ def compute_motion_reconstruction_losses(
     parents: Sequence[int] | torch.Tensor | None = None,
     joint_weights: torch.Tensor | None = None,
     foot_indices: tuple[int, int] | None = None,
+    loss_mask: torch.Tensor | None = None,
 ) -> MotionReconstructionLosses:
     recon = output["recon_state"]
+    if loss_mask is None:
+        loss_mask = torch.ones(batch_motion.shape[:2], device=batch_motion.device, dtype=torch.bool)
+    if loss_mask.shape != batch_motion.shape[:2]:
+        raise ValueError(f"loss_mask must have shape {tuple(batch_motion.shape[:2])}, got {tuple(loss_mask.shape)}")
+    loss_mask = loss_mask.to(device=batch_motion.device, dtype=torch.bool)
+
+    def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        while mask.ndim < values.ndim:
+            mask = mask.unsqueeze(-1)
+        mask = mask.to(dtype=values.dtype)
+        return (values * mask).sum() / mask.sum().clamp_min(1.0)
+
     feature_weights = feature_weights.view(1, 1, -1).to(batch_motion.device)
     feature_offset = feature_offset.to(batch_motion.device, dtype=batch_motion.dtype)
     feature_scale = feature_scale.to(batch_motion.device, dtype=batch_motion.dtype)
 
-    recon_loss = torch.mean(feature_weights * torch.abs(recon - batch_motion))
-    delta_loss = F.l1_loss(recon[:, 1:] - recon[:, :-1], batch_motion[:, 1:] - batch_motion[:, :-1])
+    recon_loss = masked_mean(feature_weights * torch.abs(recon - batch_motion), loss_mask)
+    pair_mask = loss_mask[:, 1:] & loss_mask[:, :-1]
+    delta_loss = masked_mean(
+        torch.abs((recon[:, 1:] - recon[:, :-1]) - (batch_motion[:, 1:] - batch_motion[:, :-1])),
+        pair_mask,
+    )
     commit_loss = output["commit_loss"]
     motion_raw_pred = denormalize_motion_features(recon, feature_offset, feature_scale)
     motion_raw_target = denormalize_motion_features(batch_motion, feature_offset, feature_scale)
@@ -297,10 +314,12 @@ def compute_motion_reconstruction_losses(
                 return_rotations=need_root_rotations,
             )
         root_pos_loss = (
-            F.l1_loss(pred_root_positions[:, 1:], target_root_positions[:, 1:]) if compute_root_pos else recon.new_zeros(())
+            masked_mean(torch.abs(pred_root_positions[:, 1:] - target_root_positions[:, 1:]), loss_mask[:, 1:])
+            if compute_root_pos
+            else recon.new_zeros(())
         )
         root_rot_loss = (
-            quat.torch_quat_angle(pred_root_rotations[:, 1:], target_root_rotations[:, 1:]).mean()
+            masked_mean(quat.torch_quat_angle(pred_root_rotations[:, 1:], target_root_rotations[:, 1:]), loss_mask[:, 1:])
             if compute_root_rot
             else recon.new_zeros(())
         )
@@ -334,15 +353,15 @@ def compute_motion_reconstruction_losses(
             weights = joint_weights.to(batch_motion.device, dtype=batch_motion.dtype).clone()
         weights[0] = 0.0
         joint_error = F.smooth_l1_loss(pred_joint_positions, target_joint_positions, reduction="none").sum(dim=-1)
-        joint_loss = (joint_error * weights.view(1, 1, -1)).sum() / (
-            weights.sum().clamp_min(1.0) * batch_motion.shape[0] * batch_motion.shape[1]
-        )
+        joint_loss = masked_mean(joint_error * weights.view(1, 1, -1), loss_mask)
     else:
         joint_loss = recon.new_zeros(())
 
     if contact_weight > 0.0:
         contact_logits = float(contact_temperature) * (motion_raw_pred[..., -2:] - 0.5)
-        contact_loss = F.binary_cross_entropy_with_logits(contact_logits, target_contact)
+        contact_loss = masked_mean(
+            F.binary_cross_entropy_with_logits(contact_logits, target_contact, reduction="none"), loss_mask
+        )
     else:
         contact_loss = recon.new_zeros(())
 
@@ -360,9 +379,11 @@ def compute_motion_reconstruction_losses(
         contact_gate = target_contact[:, 1:] * target_contact[:, :-1]
         foot_velocity = (pred_feet[:, 1:] - pred_feet[:, :-1]) / float(root_dt)
         horizontal_speed = foot_velocity[..., (0, 2)].abs().sum(dim=-1)
-        foot_slide_loss = (horizontal_speed * contact_gate).sum() / contact_gate.sum().clamp_min(1.0)
+        valid_contact_gate = contact_gate * pair_mask.unsqueeze(-1).to(contact_gate.dtype)
+        foot_slide_loss = (horizontal_speed * valid_contact_gate).sum() / valid_contact_gate.sum().clamp_min(1.0)
         foot_height_error = (pred_feet[..., 1] - target_feet[..., 1]).abs()
-        foot_height_loss = (foot_height_error * target_contact).sum() / target_contact.sum().clamp_min(1.0)
+        valid_target_contact = target_contact * loss_mask.unsqueeze(-1).to(target_contact.dtype)
+        foot_height_loss = (foot_height_error * valid_target_contact).sum() / valid_target_contact.sum().clamp_min(1.0)
     else:
         foot_slide_loss = recon.new_zeros(())
         foot_height_loss = recon.new_zeros(())
@@ -409,7 +430,8 @@ def _code_reuse_loss(codes: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         return codes.new_zeros(())
     changes = codes[:, 1:] - codes[:, :-1]
     penalty = torch.sqrt(changes.square() + 1e-6) - 1e-3
-    return (penalty.mean(dim=-1) * gate).mean()
+    weighted = penalty.mean(dim=-1) * gate
+    return weighted.sum() / gate.sum().clamp_min(1.0)
 
 
 def compute_part_representation_losses(
@@ -424,6 +446,9 @@ def compute_part_representation_losses(
     if codes.shape[-1] != layout.num_coordinates:
         raise ValueError("Part representation codes do not match the coordinate layout")
     gate = _quiet_gate(motion, float(batch.get("reuse_threshold", 1.0)))
+    loss_mask = batch.get("loss_mask")
+    if isinstance(loss_mask, torch.Tensor):
+        gate = gate * (loss_mask[:, 1:] & loss_mask[:, :-1]).to(gate.dtype)
     return {"reuse": _code_reuse_loss(codes, gate) * float(batch.get("reuse_weight", 0.01))}
 
 
@@ -437,6 +462,9 @@ def compute_residual_representation_losses(
     if not isinstance(base_codes, torch.Tensor) or not isinstance(motion, torch.Tensor):
         raise TypeError("Residual representation loss requires base codes and motion")
     gate = _quiet_gate(motion, float(batch.get("base_reuse_threshold", 1.0)))
+    loss_mask = batch.get("loss_mask")
+    if isinstance(loss_mask, torch.Tensor):
+        gate = gate * (loss_mask[:, 1:] & loss_mask[:, :-1]).to(gate.dtype)
     return {
         "base_reuse": _code_reuse_loss(base_codes, gate) * float(batch.get("base_reuse_weight", 0.0025)),
     }
@@ -450,6 +478,16 @@ def compute_latent_residual_representation_losses(
     residual_energy = output.get("latent_residual_energy")
     if not isinstance(residual_energy, torch.Tensor):
         raise TypeError("Latent Residual representation output is missing latent_residual_energy")
+    loss_mask = batch.get("loss_mask")
+    if isinstance(loss_mask, torch.Tensor):
+        if residual_energy.shape != loss_mask.shape:
+            raise ValueError(
+                "latent_residual_energy must have shape [B,T] when loss_mask is provided"
+            )
+        mask = loss_mask.to(device=residual_energy.device, dtype=residual_energy.dtype)
+        residual_energy = (residual_energy * mask).sum() / mask.sum().clamp_min(1.0)
+    elif residual_energy.ndim != 0:
+        residual_energy = residual_energy.mean()
     return {
         "latent_energy": residual_energy * float(batch.get("latent_energy_weight", 0.01)),
     }

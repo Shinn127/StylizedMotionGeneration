@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-from stylized_motion.data.encode_token_database import encode_shard
+from stylized_motion.data.preprocess import _encode_feature_shard
 from stylized_motion.learning.fsq import FSQMotionAutoencoder
 
 
@@ -16,16 +16,9 @@ def test_chunked_fsq_encoding_matches_full_causal_encoding():
     )
     model.eval()
     motion = np.random.default_rng(5).standard_normal((96, 12), dtype=np.float32)
-    offset = torch.zeros(12)
-    scale = torch.ones(12)
-
-    indices, codes = encode_shard(
+    indices, codes = _encode_feature_shard(
         model,
         motion,
-        offset,
-        scale,
-        offset,
-        scale,
         chunk_size=24,
         device=torch.device("cpu"),
     )

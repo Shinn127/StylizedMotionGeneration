@@ -2,14 +2,18 @@
 
 ## FSQ 主线重构 Spec
 
-状态：Draft 0.3  
-日期：2026-08-02  
-范围：representation、checkpoint、token database、generator、评估和统一命令入口
+状态：Draft 0.4
+日期：2026-08-03
+范围：representation、checkpoint、generator、评估、统一命令入口和跨层集成
 
-执行口径：本轮实现只注册和读取 canonical schema v2。迁移表中的旧
+执行口径：representation checkpoint 只注册和读取 canonical schema v2。迁移表中的旧
 `model_family` 值只作为 `model_family_legacy` 序列化字段保留，不提供旧
 checkpoint、旧参数名或旧命令 alias 的读取路径；所有 workflow 必须通过
 canonical representation spec 构造和校验。
+
+数据管线的 schema、sampling、batch、loader 和离线构建规范已独立到
+[`data_pipeline_spec.md`](data_pipeline_spec.md)。该文件是数据侧唯一权威来源；本文件
+只定义 representation/learning 与 data 的跨层接口。checkpoint schema 继续使用 v2。
 
 ## 1. 目标
 
@@ -28,6 +32,7 @@ canonical representation spec 构造和校验。
 - checkpoint、token database 和 generator 能通过显式 metadata 校验 contract；
 - 四条 FSQ representation 均能走同一个 representation API；
 - 四条 representation 的训练、验证、测试共用同一个 runner、metric suite、checkpoint manager 和数据 contract；
+- representation、runner 和 generator 只通过独立 data spec 的 public API 消费 tensor batch；
 - 根目录继续保持 MimicKit 风格：配置在 `data/`，预设在 `args/`，实现代码在 `stylized_motion/`，应用流程由 `run.py` 调度；
 - 不为历史 checkpoint、历史命令名或历史模块路径保留兼容入口；历史实验产物不属于当前代码 API。
 
@@ -46,16 +51,24 @@ canonical representation spec 构造和校验。
 
 四条主线都进入新的 representation registry。`vqvae` 保留为 legacy baseline，不纳入新的 FSQ representation contract。
 
-### 2.2 已确认的不一致
+### 2.2 Draft 0.3 已建立的基线
 
-- `data/configs/fsq_pruned_frame_causal_cnn.yaml` 当前配置是 `40 x 9`，输出目录也是 `fsq_pruned_frame_causal_cnn_40x9`；README 和旧 generator 路径中仍有 `20 x 9` 表述。
-- `MotionFSQ` 和 `FSQMotionAutoencoder` 的默认 `num_coordinates=20` 是历史默认值，不能覆盖显式配置。
-- `encode_fsq_database.py` 当前硬编码 `FSQMotionAutoencoder` 和 `model_family == "fsq"`，不能编码 Part/Residual checkpoint。
-- 当前旧实现的 `FSQTokenStore` 只保存 token 数量、level 数量和 checkpoint hash，没有保存 representation family、variant、coordinate order 或 feature schema；该 API 已删除。
-- generator、conditional generator 和 realtime controller 仍以 Flat-FSQ 的坐标语义为前提，不能仅凭 `num_coordinates` 判断 Part/Residual token 的语义。
-- `model_builder.py` 已经集中构造模型，但 workflow 仍直接导入具体实现类，representation builder 和应用层边界还没有完全建立。
+当前实现已经完成以下 canonical 收口，Draft 0.4 不重新设计这些边界：
 
-本 spec 将当前显式配置和 checkpoint 输出中的 `40 x 9` 作为 Flat-FSQ 的唯一基准；历史 `20 x 9` 数据不属于当前 TokenStore contract。
+- 四条 FSQ family 统一注册在 `learning/representation.py`，并使用 `40 x 9` token contract；
+- checkpoint schema v2 已包含 family、variant、coordinate layout、causal metadata 和 feature schema；
+- TokenStore、FeatureStore 和 TrajectoryStore 均由独立 data spec 定义为 schema v3，并校验 representation/checkpoint/feature contract；
+- representation train/validate/test 已共用 `learning/runner.py`；
+- generator 已从 TokenStore metadata 获取 `K/L/layout`，不直接导入具体 representation class；
+- 旧 checkpoint、旧命令 alias 和旧模块路径不属于 canonical API。
+
+Draft 0.4 保持 `40 x 9` representation/checkpoint 语义不变，替换其下方的 runtime
+data、sampling 和 DataLoader contract。
+
+### 2.3 Data pipeline 状态
+
+Draft 0.3 data pipeline 的问题、目标设计和迁移方案由独立
+[`data_pipeline_spec.md`](data_pipeline_spec.md) 维护。主 spec 不复制这些实现细节。
 
 ## 3. 四条主线定义
 
@@ -163,7 +176,8 @@ class RepresentationProtocol(Protocol):
 
 输入/输出约束：
 
-- motion 输入形状为 `[B, T, motion_dim]`，训练阶段 `T=64`；
+- motion 输入形状为 `[B, T, motion_dim]`；模型 forward 不写死序列长度；
+- 训练 batch shape、context 和 mask 由 data spec 定义；common loss 和 representation-specific loss 必须正确消费其 `loss_mask`；
 - `indices` 形状为 `[B, T, K]`，dtype 为整数，取值范围 `[0, num_levels)`；
 - `codes` 形状为 `[B, T, K]`，dtype 为 float；
 - `K`、`num_levels`、coordinate order 只从 representation metadata 获取；
@@ -242,43 +256,34 @@ feature_schema:
 `model_family_legacy` 作为来源记录。loader 只接受完整 schema v2 checkpoint，
 不会根据旧字段猜测 representation。
 
-## 6. Token Database Contract
+## 6. Data Pipeline Integration Boundary
 
-`TokenStore` 是四条 FSQ 线共用的唯一 token database API。`metadata.npz` 必须包含：
+数据侧完整 contract 见 [`data_pipeline_spec.md`](data_pipeline_spec.md)。跨层边界固定为：
 
-```text
-schema_version
-representation_family
-representation_variant
-representation_id
-model_family_legacy
-checkpoint_path
-checkpoint_sha256
-feature_database
-feature_schema_hash
-num_coordinates
-num_levels
-coordinate_order
-coordinate_counts
-window_size
-frame_rate
-token_files
-code_files
-split windows
-```
+- `stylized_motion.data` 禁止导入 `stylized_motion.learning`；
+- `stylized_motion.run` 是 composition root，负责构造 representation 并向 data preprocess 注入 token encoder；
+- data loader 只返回 CPU tensor batch，不执行 device transfer；
+- learning runner 每 step 只执行一次 device transfer，model、loss 和 metrics 共用同一个 device batch；
+- representation common loss 与 family-specific loss 必须消费 data batch 提供的 `loss_mask`；
+- generator 只消费 TokenStore/Dataset/Loader public API，不解释 split index 或直接打开 shard；
+- FeatureStore、TokenStore、TrajectoryStore 的 data schema 和兼容策略完全由独立 data spec 决定；
+- checkpoint schema、representation metadata 和 coordinate layout 仍由本文件定义。
 
-写入 token database 时由 representation builder 负责加载 checkpoint；数据库构建器不得直接实例化 `FSQMotionAutoencoder`。读取时至少校验：
+## 7. Data Contract Reference
 
-1. checkpoint hash；
-2. representation id/family/variant；
-3. `num_coordinates` 和 `num_levels`；
-4. coordinate order/counts；
-5. feature schema 和 skeleton names；
-6. window size、frame rate 和 causal context。
+以下内容不得在本文件重复定义：
 
-任何一项不匹配都应在打开 dataset 时失败，而不是在 generator 训练或 realtime 播放中才暴露。
+- Store 物理布局与 data schema；
+- split manifest 与 source-clip policy；
+- train/val/test sampling；
+- representation/generator/conditional batch shape 与 dtype；
+- mmap cache、collate、worker、prefetch 和 DataLoader policy；
+- data preprocess、public exports、实施阶段和 data acceptance tests。
 
-## 7. 目标目录结构
+发生冲突时，数据侧行为以 [`data_pipeline_spec.md`](data_pipeline_spec.md) 为准；
+representation/checkpoint 行为以本文件为准。
+
+## 8. 目标目录结构
 
 延续 MimicKit 的组织风格，同时保持当前项目的领域边界：
 
@@ -304,14 +309,7 @@ data/
 
 stylized_motion/
   anim/
-  data/
-    feature_dataset.py
-    token_store.py
-    trajectory_store.py
-    build_data.py
-    build_database.py
-    build_feature_database.py
-    encode_token_database.py
+  data/                       # 见 data_pipeline_spec.md
   learning/
     representation.py
     fsq.py
@@ -340,6 +338,7 @@ docs/
 迁移原则：
 
 - 不为每条 FSQ 复制一套 data loader、checkpoint loader 或 token store；
+- data 目录和迁移规则以 [`data_pipeline_spec.md`](data_pipeline_spec.md) 为准；
 - `learning/representation.py` 负责公共接口、representation spec、builder 和 metadata；
 - 四个 representation 实现与 `part_layout.py` 平铺在 `learning/`，保持 MimicKit 的 direct-module taste；
 - `learning/nets` 放 causal CNN、Transformer、ResNet、quantizer 等可复用网络；
@@ -349,7 +348,7 @@ docs/
 - generator 只依赖 `TokenStore` 和 representation metadata，不导入具体 representation class；
 - `vqvae.py` 保留在 `learning/`，但从主线 representation builder 中隔离并标记为 legacy。
 
-### 7.1 与 MimicKit 的对应关系
+### 8.1 与 MimicKit 的对应关系
 
 | MimicKit | 本项目 |
 | --- | --- |
@@ -359,11 +358,11 @@ docs/
 | agent train/test mode | `runner.py` 的 `run(mode="train"/"validate"/"test")` |
 | `run.py` config dispatch | `stylized_motion/run.py` + `build_representation()` |
 
-MimicKit 的 taste 是“builder 选择具体实现，base class 定义公共生命周期，nets 和 util 提供共享能力”。本项目对应为“representation builder 选择 FSQ 主线，单一 runner 定义 train/validate/test 生命周期，representation-specific loss 只保留在表征实现内部”。
+MimicKit 的 taste 是“直接模块承载清晰领域对象、builder 选择具体实现、base class 定义公共生命周期”。本项目对应为“representation builder 选择 FSQ 主线，单一 runner 定义 train/validate/test 生命周期”；data 侧的对应关系在独立 spec 中定义。
 
-## 8. 统一 Train / Validate / Test
+## 9. 统一 Train / Validate / Test
 
-### 8.1 单一 Runner 生命周期
+### 9.1 单一 Runner 生命周期
 
 四条 FSQ 都进入同一套生命周期：
 
@@ -381,7 +380,7 @@ config + representation family
 
 `runner.py` 内部用同一套 `fit()` / `evaluate(split, report)` 逻辑完成训练、验证和测试。训练每个 epoch 自动执行 validation；独立 validate/test 只改变 split 和报告策略。验证和测试都不能更新模型参数或 normalization stats。
 
-### 8.2 统一 Runner API
+### 9.2 统一 Runner API
 
 ```python
 runner = RepresentationRunner(
@@ -401,25 +400,24 @@ runner.run(mode="test", split="test")
 
 `RepresentationRunner` 统一处理：device、DataParallel、seed、AMP/FP32 policy、optimizer、scheduler、gradient clipping、logging、TensorBoard、resume、best/last checkpoint 和吞吐量统计。四个 representation 只提供模型构造、forward 输出和 representation-specific loss/metric hooks。
 
-### 8.3 统一配置
+### 9.3 统一配置
 
 训练配置使用同一层级：
 
 ```yaml
 representation:
   family: part_fsq
-  variant: default
-  config: data/configs/part_fsq_40x9.yaml
+  variant: hierarchical
+  config: {...}
 
 data:
   feature_database: data/processed/100style_pruned/feature_database
-  split_train: train
-  split_val: val
-  split_test: test
-  window_size: 64
+  required_data_schema_version: 3
+
+sampling: {...}  # defined by data_pipeline_spec.md
+loader: {...}    # defined by data_pipeline_spec.md
 
 training:
-  batch_size: 512
   epochs: 100
   lr: 0.0002
   precision: fp32
@@ -429,9 +427,11 @@ evaluation:
   root_dt: 0.016666666666666666
 ```
 
-旧配置不属于当前 runner API；新配置必须显式提供 representation family/variant，不通过文件名推断语义。
+旧配置不属于当前 runner API；新配置必须显式提供 representation family/variant，
+不通过文件名推断语义。`data/sampling/loader` 三个配置区块由 data spec 定义，本文件
+只要求 runner 透传并消费构造结果。
 
-## 9. 统一入口设计
+## 10. 统一入口设计
 
 当前 `stylized_motion.run` 的 `--mode/--pipeline` 继续保留，新增统一 representation workflow：
 
@@ -443,6 +443,7 @@ train       + representation   --representation latent-residual-fsq
 validate    + representation   --representation <family>
 test        + representation   --representation <family>
 preprocess  + token-database
+preprocess  + validate-data --full
 train       + generator
 generate    + motion
 visualize   + motion
@@ -450,77 +451,53 @@ visualize   + motion
 
 每次 dispatch 前先解析 representation spec，再把 `--config`、`--checkpoint` 和 workflow 参数转发给统一 runner。workflow 不应再通过文件名猜 family。
 
-## 10. 分阶段实施计划
+## 11. Draft 0.4 实施计划
 
-### Phase 0：冻结 contract 和命名
+Draft 0.3 的 representation、checkpoint、TokenStore 和统一 runner 主线视为既有基础。
+数据侧按照 [`data_pipeline_spec.md`](data_pipeline_spec.md) 的实施顺序独立落地；本文件
+只跟踪以下跨层工作：
 
-- 将本文件从 Draft 标记为 accepted；
-- 确认 Flat-FSQ 唯一使用 `40 x 9`，拒绝 `20 x 9` token database；
-- 定义 `representation` metadata、feature schema hash 和 coordinate layout 序列化格式；
-- 增加四条主线的 synthetic checkpoint fixture；
-- 修正 README/config 中的 20/40 命名不一致。
+1. `run.py` 成为 data/learning composition root，并注入 token encoder；
+2. representation loss 与 metric 接受 data batch 的 mask contract；
+3. runner 只消费统一 loader 输出，并保证每 step 单次 device transfer；
+4. generator 只消费 TokenStore/Dataset/Loader public API；
+5. checkpoint、representation metadata 与 data Store contract 做集成校验；
+6. README、args 和 config 同时引用两份 spec 的各自配置边界。
 
-### Phase 1：Representation builder / registry
+验收：data package 与 learning package 依赖方向正确，四条 representation 和 generator
+都通过统一 data public API 完成真实数据 smoke workflow。
 
-- 新增 `learning/representation.py` 中的 `build_representation()`；
-- 删除 `model_builder.py`，canonical builder 只放在 `learning/representation.py`；
-- 为四条主线注册 canonical family/variant 和能力集合；
-- 把 checkpoint metadata 生成集中到 `learning/representation.py`；
-
-验收：四条主线都能通过同一个 `load_representation_checkpoint()` 构造、加载、encode、decode；不完整或非 schema v2 checkpoint 必须失败。
-
-### Phase 2：统一 token database
-
-- 把 `encode_fsq_database.py` 改成 registry-driven `encode_token_database.py`；
-- 扩展 `TokenStore` metadata；
-- 让四条主线都能生成/读取 token shards；
-- 对 checkpoint/token database mismatch 增加 fail-fast 错误。
-
-验收：使用同一个 synthetic feature database，四条线各生成一份 token database，shape、metadata、hash 校验全部通过。
-
-### Phase 3：统一 generator 和 decode consumer
-
-- generator 以 `TokenStore` 的 `K/L/layout` 动态构建 embedding/output head；
-- Flat/Part/Residual/Latent-Residual 的 token semantic layout 通过 metadata 传递；
-- decoder loading 统一走 representation builder；
-- visualize、offline rollout、realtime controller 使用统一 adapter；
-- 对尚未支持的能力用 capability error 明确拒绝，不再默默当作 Flat-FSQ。
-
-验收：generator 至少能够训练/评估 Flat-FSQ；Part、Residual、Latent-Residual 在 metadata 和 decoder 路径打通后逐条启用。
-
-### Phase 4：目录与 legacy 收口
-
-- 将四条 representation 实现平铺到 `learning/`，公共接口和 builder 收敛到 `learning/representation.py`；
-- 将训练/验证/测试入口收敛到 `learning/runner.py`，由 `stylized_motion/run.py` 统一装配；
-- 将 token/trajectory store 和 builder 保持在 `stylized_motion/data/`，不再拆出 builder 子目录；
-- `vqvae` 移入 legacy namespace；
-- 删除旧 alias、旧 workflow 和旧根目录模块；当前代码树不保留迁移 wrapper。
-
-## 11. 测试与验收标准
+## 12. 测试与验收标准
 
 必须新增或改造以下测试：
 
 - representation builder 覆盖四条 canonical FSQ 主线；
-- 四条主线的 `[B, 64, 230] -> [B, 64, K] -> [B, 64, 230]` roundtrip；
+- 四条主线的 `[B, 64, 230] -> [B, 64, K] -> [B, 64, 230]` functional roundtrip；
 - 四条主线均验证 `lookahead_frames == 0` 和 receptive field；
 - 四条主线 checkpoint metadata 的 family、variant、layout、feature schema 完整；
 - canonical `model_family_legacy` 字段与 family 的序列化一致性；
 - token database 与 checkpoint hash/family/layout 不匹配时 fail fast；
 - generator 不硬编码 20 或 40 坐标；
 - `run.py` 的 train/validate/test canonical pipeline 都能 dispatch 到同一个 runner；
-- 任何核心模块不再从根目录旧路径或具体 legacy wrapper 导入。
+- 任何核心模块不再从根目录旧路径或具体 legacy wrapper 导入；
+- data package 不导入 learning，token encoder 只通过 `run.py` 注入；
+- runner 和 generator 能消费 data spec 定义的 canonical batch，不重新解释 Store/split；
+- loss/metric 正确消费 mask，metric 聚合不依赖 batch size，每个 tensor 每 step 恰好一次 device transfer；
+- data 内部验收完整通过 [`data_pipeline_spec.md`](data_pipeline_spec.md) 第 14 节。
 
-## 12. 暂不做的事情
+## 13. 暂不做的事情
 
 - 不在本阶段重新设计 motion feature 230D schema；
 - 不把四条 FSQ 强行合并为一个内部网络；
 - 不在没有 token metadata contract 的情况下接入新的 generator architecture；
 - 不删除已有 output、processed data 或旧 checkpoint；
-- 不把 VQ-VAE 扩展成新的 FSQ representation 主线。
+- 不把 VQ-VAE 扩展成新的 FSQ representation 主线；
+- data pipeline 非目标见 [`data_pipeline_spec.md`](data_pipeline_spec.md) 第 2 节。
 
-## 13. 已确认决策
+## 14. 已确认决策
 
 1. Flat-FSQ、Residual Part-FSQ 和 Latent Residual-FSQ 都固定使用 `40 x 9`；`20 x 9` 不进入当前 TokenStore contract。
-2. 四条 FSQ 统一使用 `T=64`、`temporal_downsample=1`、`receptive_field=64`、`lookahead_frames=0`。
-3. generator 通过 TokenStore metadata 动态构造 autoregressive token model；trajectory conditioning 不属于当前 generic generator workflow，必须显式报 capability error。
+2. 四条 FSQ 统一使用 `temporal_downsample=1`、`receptive_field=64`、`lookahead_frames=0`；训练 window/supervision 由 data spec 定义。
+3. generator 通过 TokenStore metadata 动态构造 autoregressive token model；conditional generator 通过 TrajectoryStore 与统一 conditional batch contract 接入 trajectory conditioning。
 4. VQ-VAE baseline 配置继续留在 `data/configs/`，但不进入 FSQ representation builder；canonical generator 配置独立于 representation 训练配置。
+5. data schema、sampling、batch、loader、目录和兼容策略以 [`data_pipeline_spec.md`](data_pipeline_spec.md) 为唯一权威来源。

@@ -11,7 +11,29 @@ def test_canonical_workflows_dispatch_to_single_runner():
     assert COMMANDS[("train", "representation")] == "stylized_motion.learning.runner"
     assert COMMANDS[("validate", "representation")] == "stylized_motion.learning.runner"
     assert COMMANDS[("test", "representation")] == "stylized_motion.learning.runner"
-    assert COMMANDS[("preprocess", "token-database")] == "stylized_motion.data.encode_token_database"
+    assert COMMANDS[("preprocess", "token-database")] == "stylized_motion.data.preprocess"
+
+
+def test_module_dispatch_preserves_importable_module_identity(monkeypatch):
+    captured = {}
+
+    class FakeModule:
+        def main(self):
+            captured["argv"] = list(__import__("sys").argv)
+
+    monkeypatch.setattr(run.importlib, "import_module", lambda name: FakeModule())
+    run._run_module("example.workflow", ["--workers", "8"])
+
+    assert captured["argv"] == ["example.workflow", "--workers", "8"]
+
+
+def test_preprocess_worker_has_stable_importable_module_identity():
+    import pickle
+
+    from stylized_motion.data.preprocess import _process_motion_pair
+
+    assert _process_motion_pair.__module__ == "stylized_motion.data.preprocess_worker"
+    pickle.dumps(_process_motion_pair)
 
 
 def test_representation_dispatch_validates_spec_and_strips_outer_options(monkeypatch):
@@ -40,11 +62,10 @@ def test_representation_dispatch_validates_spec_and_strips_outer_options(monkeyp
 def test_preprocess_dispatch_strips_outer_options(monkeypatch):
     captured = {}
 
-    def fake_run(module_name, forwarded_args):
-        captured["module"] = module_name
+    def fake_run(forwarded_args):
         captured["args"] = forwarded_args
 
-    monkeypatch.setattr(run, "_run_module", fake_run)
+    monkeypatch.setattr(run, "_run_token_database", fake_run)
     run.main(
         [
             "--mode", "preprocess",
@@ -54,7 +75,6 @@ def test_preprocess_dispatch_strips_outer_options(monkeypatch):
             "--output", "tokens",
         ]
     )
-    assert captured["module"] == "stylized_motion.data.encode_token_database"
     assert captured["args"] == [
         "--checkpoint", "checkpoint.pt", "--feature-database", "features", "--output", "tokens",
     ]
@@ -71,8 +91,13 @@ def test_canonical_tree_is_present_and_old_workflow_modules_are_absent():
         CONFIG_DIR / "part_fsq_40x9.yaml",
         CONFIG_DIR / "residual_part_fsq_40x9.yaml",
         CONFIG_DIR / "latent_residual_fsq_40x9.yaml",
-        root / "data" / "token_store.py",
-        root / "data" / "trajectory_store.py",
+        root / "data" / "__init__.py",
+        root / "data" / "feature_data.py",
+        root / "data" / "token_data.py",
+        root / "data" / "trajectory_data.py",
+        root / "data" / "sampling.py",
+        root / "data" / "loader.py",
+        root / "data" / "preprocess.py",
         root / "learning" / "nets" / "causal_cnn.py",
         root / "learning" / "nets" / "causal_transformer.py",
         root / "learning" / "nets" / "resnet.py",
@@ -84,6 +109,16 @@ def test_canonical_tree_is_present_and_old_workflow_modules_are_absent():
         root / "learning" / "train_fsq.py",
         root / "learning" / "evaluate_fsq.py",
         root / "data" / "fsq_token_dataset.py",
+        root / "data" / "feature_dataset.py",
+        root / "data" / "token_store.py",
+        root / "data" / "trajectory_store.py",
+        root / "data" / "build_data.py",
+        root / "data" / "build_database.py",
+        root / "data" / "build_feature_database.py",
+        root / "data" / "build_trajectory_database.py",
+        root / "data" / "build_trajectory_inputs.py",
+        root / "data" / "encode_token_database.py",
+        root / "data" / "features_to_database.py",
     ):
         assert not path.exists(), path
 
@@ -92,7 +127,11 @@ def test_all_four_configs_use_nested_representation_contract():
     for family in ("flat_fsq", "part_fsq", "residual_part_fsq", "latent_residual_fsq"):
         config = yaml.safe_load((CONFIG_DIR / f"{family}_40x9.yaml").read_text(encoding="utf-8"))
         assert config["representation"]["family"] == family
-        assert config["data"]["window_size"] == 64
+        assert config["data"]["required_data_schema_version"] == 3
+        assert config["sampling"]["target_frames"] == 64
+        assert config["sampling"]["context_left"] == 63
+        assert config["loader"]["batch_size"] == 128
+        assert "window_size" not in config["data"]
         assert config["training"]["precision"] == "fp32"
         assert "evaluation" in config
 

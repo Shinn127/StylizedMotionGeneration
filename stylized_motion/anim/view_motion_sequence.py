@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from stylized_motion.data.feature_dataset import build_feature_store
+from stylized_motion.data import open_feature_store
 from stylized_motion.anim.genoview import GenoView, GenoViewCompare, build_database_from_feature_array
 from stylized_motion.learning.representation import load_representation_checkpoint
 from stylized_motion.util.paths import RESOURCE_DIR
@@ -15,7 +15,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="View a motion segment through a canonical FSQ representation checkpoint.")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Path to a schema v2 representation checkpoint.")
     parser.add_argument("--feature-database", type=Path, required=True, help="Path to feature_database.")
-    parser.add_argument("--range-idx", type=int, required=True, help="Motion shard / range index in feature_database metadata.")
+    parser.add_argument("--range-idx", type=int, required=True, help="Motion shard / range index from the feature manifest/index.")
     parser.add_argument("--start", type=int, required=True, help="Target segment start frame.")
     parser.add_argument("--length", type=int, required=True, help="Target segment length in frames.")
     parser.add_argument(
@@ -143,7 +143,7 @@ def save_debug(args, source_features, recon_features, indices, meta):
 def main():
     args = parse_args()
     feature_database = args.feature_database
-    store = build_feature_store(feature_database)
+    store = open_feature_store(feature_database)
     ckpt, model = load_representation_checkpoint(
         args.checkpoint,
         torch.device("cpu"),

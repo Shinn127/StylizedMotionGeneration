@@ -313,7 +313,8 @@ class RepresentationAdapter(nn.Module):
                 "recon_state", "indices", "codes", "fsq_codes", "commit_loss",
                 "group_codes", "group_indices", "base_codes", "base_indices",
                 "part_codes", "part_indices", "base_recon_state", "edit_recon_state",
-                "part_residuals", "part_latent_residuals",
+                "part_residuals", "part_latent_residuals", "latent_residual_energy",
+                "group_coordinate_change_rates",
             }
             metrics = {key: value for key, value in result.items() if key not in standard}
         result["representation_metrics"] = metrics

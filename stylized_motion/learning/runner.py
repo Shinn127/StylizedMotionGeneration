@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import random
 import time
 from collections.abc import Mapping
@@ -13,12 +14,13 @@ from typing import Any, Callable
 
 import numpy as np
 import torch
+import torch.distributed as distributed
 import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from stylized_motion.data.feature_dataset import FeatureDataset, FeatureStore, build_feature_store
+from stylized_motion.data import FeatureStore, build_data_loaders, open_feature_store
 from stylized_motion.learning.checkpoint import CheckpointManager
 from stylized_motion.learning.losses import compute_motion_reconstruction_losses
 from stylized_motion.learning.representation import (
@@ -62,12 +64,23 @@ def set_seed(seed: int, deterministic: bool) -> None:
         torch.backends.cudnn.benchmark = False
 
 
+def move_batch_to_device(batch: Batch, device: torch.device) -> dict[str, Any]:
+    """Transfer each tensor exactly once; token uint8 remains uint8 on device."""
+    moved: dict[str, Any] = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            moved[key] = value.to(device, non_blocking=True)
+        else:
+            moved[key] = value
+    return moved
+
+
 def load_experiment_config(path: str | Path) -> dict[str, object]:
     path = Path(path)
     value = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(value, Mapping):
         raise ValueError(f"Experiment config must contain a mapping: {path}")
-    required = {"representation", "data", "training", "evaluation"}
+    required = {"representation", "data", "training", "evaluation", "sampling", "loader"}
     missing = sorted(required - set(value))
     if missing:
         raise ValueError(f"Experiment config is missing required sections: {missing}")
@@ -78,6 +91,9 @@ def load_experiment_config(path: str | Path) -> dict[str, object]:
     variant = representation.get("variant")
     if family not in REPRESENTATION_FAMILIES or not isinstance(variant, str):
         raise ValueError("representation.family/variant are invalid")
+    data = value["data"]
+    if not isinstance(data, Mapping) or int(data.get("required_data_schema_version", 0)) != 3:
+        raise ValueError("representation workflows require data.required_data_schema_version=3")
     resolved = json.loads(json.dumps(value))
     model_config = representation.get("config")
     if isinstance(model_config, str):
@@ -102,34 +118,21 @@ def _config_family(config: Mapping[str, object]) -> str:
     return str(family)
 
 
-def build_dataloaders(config: Mapping[str, object], store: FeatureStore) -> tuple[dict[str, DataLoader], dict[str, FeatureDataset]]:
+def build_dataloaders(config: Mapping[str, object], store: FeatureStore) -> tuple[dict[str, DataLoader], dict[str, object]]:
     data = config["data"]
     training = config["training"]
     assert isinstance(data, Mapping) and isinstance(training, Mapping)
-    window_size = int(data.get("window_size", 64))
-    if window_size != 64 or store.window_size != 64:
-        raise ValueError("Canonical FSQ training requires a 64-frame feature window")
-    batch_size = int(training.get("batch_size", 512))
-    num_workers = int(training.get("num_workers", 0))
-    kwargs: dict[str, object] = {
-        "batch_size": batch_size,
-        "num_workers": num_workers,
-        "pin_memory": bool(training.get("pin_memory", torch.cuda.is_available())),
-    }
-    if num_workers > 0:
-        kwargs["persistent_workers"] = bool(training.get("persistent_workers", True))
-        kwargs["prefetch_factor"] = int(training.get("prefetch_factor", 2))
-    datasets = {
-        "train": FeatureDataset(str(data.get("split_train", "train")), store),
-        "val": FeatureDataset(str(data.get("split_val", "val")), store),
-        "test": FeatureDataset(str(data.get("split_test", "test")), store),
-    }
-    loaders = {
-        "train": DataLoader(datasets["train"], shuffle=True, **kwargs),
-        "val": DataLoader(datasets["val"], shuffle=False, **kwargs),
-        "test": DataLoader(datasets["test"], shuffle=False, **kwargs),
-    }
-    return loaders, datasets
+    sampling = config.get("sampling", {})
+    loader = config.get("loader", {})
+    if not isinstance(sampling, Mapping) or not isinstance(loader, Mapping):
+        raise ValueError("sampling and loader must be mappings")
+    assembled = build_data_loaders(
+        "representation",
+        store,
+        sampling_config=sampling,
+        loader_config=loader,
+    )
+    return assembled.loaders, {"prefetch_bytes": assembled.prefetch_bytes}
 
 
 def _foot_indices(store: FeatureStore) -> tuple[int, int] | None:
@@ -194,9 +197,11 @@ def build_loss_fn(representation: RepresentationProtocol, context: Mapping[str, 
             ref_pos=context["ref_pos"],
             parents=context["parents"],
             foot_indices=context["foot_indices"],
+            loss_mask=batch.get("loss_mask"),
         )
         rep_batch = dict(context)
         rep_batch["motion"] = motion
+        rep_batch["loss_mask"] = batch.get("loss_mask")
         specific = representation.compute_representation_losses(dict(output), rep_batch)
         result = {
             "loss": loss_values.loss + sum(specific.values(), motion.new_zeros(())),
@@ -224,7 +229,11 @@ def _scalar(value: Any) -> float:
 
 
 def _unwrap(model: nn.Module) -> nn.Module:
-    return model.module if isinstance(model, nn.DataParallel) else model
+    return model.module if isinstance(model, (nn.DataParallel, nn.parallel.DistributedDataParallel)) else model
+
+
+def _is_main_process() -> bool:
+    return not distributed.is_available() or not distributed.is_initialized() or distributed.get_rank() == 0
 
 
 class RepresentationRunner:
@@ -289,7 +298,9 @@ class RepresentationRunner:
             yield
 
     def _forward(self, batch: Batch) -> dict[str, Any]:
-        motion = batch["motion"].to(self.device, non_blocking=True)
+        motion = batch["motion"]
+        if not isinstance(motion, torch.Tensor) or motion.device != self.device:
+            raise ValueError("Runner expects a device batch produced by move_batch_to_device()")
         with self._autocast():
             return self.representation(motion, collect_metrics=True)
 
@@ -305,8 +316,26 @@ class RepresentationRunner:
         return result
 
     @staticmethod
-    def _average(total: dict[str, float], count: int) -> dict[str, float]:
-        return {name: value / max(count, 1) for name, value in total.items()}
+    def _reduce_totals(
+        total: dict[str, float],
+        count: int,
+        device: torch.device,
+    ) -> tuple[dict[str, float], float]:
+        if not distributed.is_available() or not distributed.is_initialized():
+            return total, float(count)
+        names = sorted(total)
+        reduce_device = device if device.type in {"cpu", "cuda"} else torch.device("cpu")
+        values = torch.tensor(
+            [float(count), *(float(total[name]) for name in names)],
+            dtype=torch.float64,
+            device=reduce_device,
+        )
+        distributed.all_reduce(values, op=distributed.ReduceOp.SUM)
+        return {name: float(values[index + 1].item()) for index, name in enumerate(names)}, float(values[0].item())
+
+    @staticmethod
+    def _average(total: dict[str, float], count: float) -> dict[str, float]:
+        return {name: value / max(count, 1.0) for name, value in total.items()}
 
     def evaluate(self, split: str) -> dict[str, Any]:
         if split not in {"val", "test"}:
@@ -317,15 +346,41 @@ class RepresentationRunner:
         self.representation.eval()
         total: dict[str, float] = {}
         count = 0
+        sample_count = 0
+        data_wait = 0.0
+        step_time = 0.0
+        iterator = iter(loader)
         with torch.inference_mode():
-            for batch in loader:
-                output = self._forward(batch)
-                values = self.loss_fn(output, {"motion": batch["motion"].to(self.device)})
-                record = self._record(output, batch, values)
+            while True:
+                wait_started = time.perf_counter()
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    break
+                data_wait += time.perf_counter() - wait_started
+                step_started = time.perf_counter()
+                device_batch = move_batch_to_device(batch, self.device)
+                output = self._forward(device_batch)
+                values = self.loss_fn(output, device_batch)
+                record = self._record(output, device_batch, values)
+                batch_count = int(device_batch.get("loss_mask", torch.ones(device_batch["motion"].shape[:2], dtype=torch.bool, device=self.device)).sum())
+                sample_count += int(device_batch["motion"].shape[0])
                 for name, value in record.items():
-                    total[name] = total.get(name, 0.0) + value
-                count += int(batch["motion"].shape[0])
-        return {"mode": split, "metrics": self._average(total, count)}
+                    total[name] = total.get(name, 0.0) + value * batch_count
+                count += batch_count
+                step_time += time.perf_counter() - step_started
+        total, reduced_count = self._reduce_totals(total, count, self.device)
+        elapsed = max(data_wait + step_time, 1e-8)
+        return {
+            "mode": split,
+            "metrics": self._average(total, reduced_count),
+            "valid_frames": reduced_count,
+            "samples": float(sample_count),
+            "data_wait_seconds": data_wait,
+            "step_time_seconds": step_time,
+            "target_frames_per_second": reduced_count / elapsed,
+            "samples_per_second": sample_count / max(elapsed, 1e-8),
+        }
 
     def train_epoch(self, epoch: int) -> dict[str, float]:
         if self.train_loader is None or self.optimizer is None:
@@ -333,11 +388,26 @@ class RepresentationRunner:
         self.representation.train()
         total: dict[str, float] = {}
         count = 0
+        sample_count = 0
+        data_wait = 0.0
+        step_time = 0.0
         started = time.perf_counter()
-        for batch in self.train_loader:
+        sampler = getattr(self.train_loader, "sampler", None)
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
+        iterator = iter(self.train_loader)
+        while True:
+            wait_started = time.perf_counter()
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                break
+            data_wait += time.perf_counter() - wait_started
+            step_started = time.perf_counter()
             self.optimizer.zero_grad(set_to_none=True)
-            output = self._forward(batch)
-            values = self.loss_fn(output, {"motion": batch["motion"].to(self.device)})
+            device_batch = move_batch_to_device(batch, self.device)
+            output = self._forward(device_batch)
+            values = self.loss_fn(output, device_batch)
             loss = values["loss"]
             if self.precision == "amp":
                 self.scaler.scale(loss).backward()
@@ -352,16 +422,26 @@ class RepresentationRunner:
                     nn.utils.clip_grad_norm_(self.representation.parameters(), self.grad_clip_norm)
                 self.optimizer.step()
             self.global_step += 1
-            record = self._record(output, batch, values)
+            record = self._record(output, device_batch, values)
+            batch_count = int(device_batch.get("loss_mask", torch.ones(device_batch["motion"].shape[:2], dtype=torch.bool, device=self.device)).sum())
+            sample_count += int(device_batch["motion"].shape[0])
             for name, value in record.items():
-                total[name] = total.get(name, 0.0) + value
-            count += int(batch["motion"].shape[0])
+                total[name] = total.get(name, 0.0) + value * batch_count
+            count += batch_count
+            step_time += time.perf_counter() - step_started
             if self.writer is not None:
                 self.writer.add_scalar("train/step_loss", record["loss"], self.global_step)
         if self.scheduler is not None:
             self.scheduler.step()
-        result = self._average(total, count)
-        result["samples_per_second"] = count / max(time.perf_counter() - started, 1e-8)
+        total, reduced_count = self._reduce_totals(total, count, self.device)
+        result = self._average(total, reduced_count)
+        elapsed = max(time.perf_counter() - started, 1e-8)
+        result["valid_frames"] = reduced_count
+        result["samples"] = float(sample_count)
+        result["data_wait_seconds"] = data_wait
+        result["step_time_seconds"] = step_time
+        result["target_frames_per_second"] = reduced_count / elapsed
+        result["samples_per_second"] = sample_count / elapsed
         return result
 
     def checkpoint_payload(self, epoch: int, metrics: Mapping[str, Any]) -> dict[str, object]:
@@ -400,10 +480,11 @@ class RepresentationRunner:
             if is_best:
                 self.best_val = val_loss
             payload = self.checkpoint_payload(epoch, record)
-            self.checkpoint_manager.save(payload, "last.pt")
-            if is_best:
-                self.checkpoint_manager.save(payload, "best.pt")
-            if self.writer is not None:
+            if _is_main_process():
+                self.checkpoint_manager.save(payload, "last.pt")
+                if is_best:
+                    self.checkpoint_manager.save(payload, "best.pt")
+            if self.writer is not None and _is_main_process():
                 self.writer.add_scalar("epoch/train_loss", train.get("loss", 0.0), epoch)
                 if val:
                     self.writer.add_scalar("epoch/val_loss", val.get("loss", 0.0), epoch)
@@ -423,6 +504,7 @@ def _feature_stats_payload(store: FeatureStore) -> dict[str, object]:
     return {
         "offset": store.stats.offset.astype(np.float32),
         "scale": store.stats.scale.astype(np.float32),
+        "dist": store.stats.dist.astype(np.float32),
         "weights": store.stats.weights.astype(np.float32),
         "ref_pos": store.stats.ref_pos.astype(np.float32),
         "names": list(store.names),
@@ -465,13 +547,38 @@ def main(argv: list[str] | None = None) -> None:
     data = config["data"]
     assert isinstance(training, Mapping) and isinstance(data, Mapping)
     set_seed(int(training.get("seed", 3407)), bool(training.get("deterministic", False)))
+    requested_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if requested_world_size > 1 and not distributed.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        distributed.init_process_group(backend=backend, init_method="env://")
+    if distributed.is_initialized():
+        if torch.cuda.is_available() and args.device in {"auto", "cuda"}:
+            torch.cuda.set_device(local_rank)
+        rank = distributed.get_rank()
+        world_size = distributed.get_world_size()
+    else:
+        rank = 0
+        world_size = 1
     device = choose_device(args.device)
     feature_database = data.get("feature_database")
     if feature_database is None:
         raise ValueError("data.feature_database is required")
-    store = build_feature_store(feature_database)
+    store = open_feature_store(feature_database)
     feature_schema = store.feature_schema()
-    loaders, datasets = build_dataloaders(config, store)
+    sampling = config.get("sampling", {})
+    loader_config = config.get("loader", {})
+    if not isinstance(sampling, Mapping) or not isinstance(loader_config, Mapping):
+        raise ValueError("sampling and loader must be mappings")
+    assembled_loaders = build_data_loaders(
+        "representation",
+        store,
+        sampling_config=sampling,
+        loader_config=loader_config,
+        rank=rank,
+        world_size=world_size,
+    )
+    loaders = assembled_loaders.loaders
     if args.workflow_mode in {"validate", "test"} and args.checkpoint is None:
         raise ValueError("--checkpoint is required for validate/test")
     if args.checkpoint is not None:
@@ -482,7 +589,13 @@ def main(argv: list[str] | None = None) -> None:
     if representation.family != family:
         raise ValueError("Checkpoint/config representation family mismatch")
     data_parallel = bool(training.get("data_parallel", False))
-    if data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
+    if world_size > 1:
+        representation = nn.parallel.DistributedDataParallel(
+            representation,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            output_device=local_rank if device.type == "cuda" else None,
+        )
+    elif data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         representation = nn.DataParallel(representation)
     context = build_loss_context(config, store, device)
     loss_fn = build_loss_fn(_unwrap(representation), context, config)
@@ -496,7 +609,7 @@ def main(argv: list[str] | None = None) -> None:
             if scheduler is not None and "scheduler" in checkpoint:
                 scheduler.load_state_dict(checkpoint["scheduler"])
     output = args.output or Path(training.get("output_dir", f"outputs/{family}_40x9"))
-    writer = SummaryWriter(output / "tensorboard") if args.workflow_mode == "train" else None
+    writer = SummaryWriter(output / "tensorboard") if args.workflow_mode == "train" and _is_main_process() else None
     runner = RepresentationRunner(
         representation,
         family=family,
@@ -522,7 +635,9 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         if writer is not None:
             writer.close()
-    print(json.dumps(result, indent=2, default=str))
+        store.close()
+    if _is_main_process():
+        print(json.dumps(result, indent=2, default=str))
 
 
 __all__ = ["RepresentationRunner", "build_cli_parser", "build_representation", "load_experiment_config", "main"]

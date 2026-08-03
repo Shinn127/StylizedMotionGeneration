@@ -7,9 +7,11 @@ inside the package, while one small dispatcher selects the requested workflow.
 from __future__ import annotations
 
 import argparse
-import runpy
+import importlib
 import sys
 from pathlib import Path
+
+import torch
 
 if __package__ in {None, ""}:
     # Support both ``python -m stylized_motion.run`` and the MimicKit-style
@@ -22,11 +24,12 @@ from stylized_motion.util.arg_parser import load_arg_file
 
 
 COMMANDS: dict[tuple[str, str], str] = {
-    ("preprocess", "build-data"): "stylized_motion.data.build_data",
-    ("preprocess", "trajectory-inputs"): "stylized_motion.data.build_trajectory_inputs",
-    ("preprocess", "trajectory-database"): "stylized_motion.data.build_trajectory_database",
-    ("preprocess", "features-to-database"): "stylized_motion.data.features_to_database",
-    ("preprocess", "token-database"): "stylized_motion.data.encode_token_database",
+    ("preprocess", "motion-database"): "stylized_motion.data.preprocess",
+    ("preprocess", "feature-database"): "stylized_motion.data.preprocess",
+    ("preprocess", "token-database"): "stylized_motion.data.preprocess",
+    ("preprocess", "trajectory-inputs"): "stylized_motion.data.preprocess",
+    ("preprocess", "trajectory-database"): "stylized_motion.data.preprocess",
+    ("preprocess", "validate-data"): "stylized_motion.data.preprocess",
     ("train", "representation"): "stylized_motion.learning.runner",
     ("validate", "representation"): "stylized_motion.learning.runner",
     ("test", "representation"): "stylized_motion.learning.runner",
@@ -43,7 +46,10 @@ def _run_module(module_name: str, forwarded_args: list[str]) -> None:
     previous_argv = sys.argv
     sys.argv = [module_name, *forwarded_args]
     try:
-        runpy.run_module(module_name, run_name="__main__")
+        # Import the workflow normally so multiprocessing workers can resolve
+        # functions by their real module path instead of ``__main__``.
+        module = importlib.import_module(module_name)
+        module.main()
     finally:
         sys.argv = previous_argv
 
@@ -72,6 +78,59 @@ def _without_dispatch_options(argv: list[str]) -> list[str]:
             continue
         filtered.append(item)
     return filtered
+
+
+def _run_token_database(forwarded_args: list[str]) -> None:
+    """Load the checkpoint in the composition root and inject its encoder."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--feature-database", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--chunk-size", type=int, default=1024)
+    parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
+    parser.add_argument("--save-codes", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    args = parser.parse_args(forwarded_args)
+    from stylized_motion.data import open_feature_store
+    from stylized_motion.data.preprocess import build_token_database
+    from stylized_motion.data.feature_data import sha256_file
+    from stylized_motion.learning.representation import load_representation_checkpoint
+    from stylized_motion.learning.runner import choose_device
+
+    device = choose_device(args.device)
+    feature_store = open_feature_store(args.feature_database)
+    try:
+        checkpoint, encoder = load_representation_checkpoint(
+            args.checkpoint,
+            device,
+            feature_schema=feature_store.feature_schema(),
+        )
+        checkpoint_stats = checkpoint.get("feature_stats")
+        if not isinstance(checkpoint_stats, dict):
+            raise ValueError("Representation checkpoint is missing feature_stats")
+        source_offset = torch.from_numpy(feature_store.stats.offset.astype("float32")).to(device)
+        source_scale = torch.from_numpy(feature_store.stats.scale.astype("float32")).to(device)
+        checkpoint_offset = torch.as_tensor(checkpoint_stats["offset"], dtype=torch.float32, device=device)
+        checkpoint_scale = torch.as_tensor(checkpoint_stats["scale"], dtype=torch.float32, device=device)
+
+        def input_adapter(values: torch.Tensor) -> torch.Tensor:
+            raw = values * source_scale.view(1, 1, -1) + source_offset.view(1, 1, -1)
+            return (raw - checkpoint_offset.view(1, 1, -1)) / checkpoint_scale.view(1, 1, -1)
+
+        build_token_database(
+            args.feature_database,
+            args.output,
+            encoder=encoder,
+            checkpoint_sha256=sha256_file(args.checkpoint),
+            model_family_legacy=str(checkpoint.get("model_family", "")),
+            device=device,
+            chunk_size=args.chunk_size,
+            save_codes=args.save_codes,
+            input_adapter=input_adapter,
+            overwrite=args.overwrite,
+        )
+    finally:
+        feature_store.close()
 
 
 def _validate_representation_dispatch(raw_args: list[str], parser: argparse.ArgumentParser) -> None:
@@ -144,6 +203,8 @@ def main(argv: list[str] | None = None) -> None:
     if module_name is None:
         parser.error(f"pipeline {args.pipeline!r} is not available in mode {args.mode!r}")
     forwarded_args = _without_dispatch_options(forwarded_args)
+    if args.mode == "preprocess":
+        forwarded_args = [args.pipeline, *forwarded_args]
     if module_name == "stylized_motion.learning.runner":
         _validate_representation_dispatch(raw_args, parser)
         forwarded_args = ["--workflow-mode", args.mode, *forwarded_args]
@@ -153,7 +214,10 @@ def main(argv: list[str] | None = None) -> None:
             "train" if args.mode == "train" else "generate",
             *forwarded_args,
         ]
-    _run_module(module_name, forwarded_args)
+    if args.mode == "preprocess" and args.pipeline == "token-database":
+        _run_token_database(forwarded_args[1:])
+    else:
+        _run_module(module_name, forwarded_args)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,14 @@
 data:
   token_database: data/processed/100style_pruned/flat_fsq_40x9
+  required_data_schema_version: 3
+
+sampling:
+  strategy: frame_uniform
+  target_frames: 64
+  context_left: 0
+  samples_per_epoch: 100000
+  seed: 3407
+  mirror_probability: 0.5
 
 model:
   coordinate_embedding_dim: 16
@@ -15,13 +24,21 @@ model:
   norm_eps: 0.00001
 
 training:
-  batch_size: 512
   epochs: 100
   lr: 0.0003
   weight_decay: 0.01
   grad_clip_norm: 1.0
   seed: 3407
   deterministic: false
-  num_workers: 8
   device: auto
   output_dir: outputs/generator_flat_fsq_40x9
+
+loader:
+  batch_size: 128
+  num_workers: 4
+  pin_memory: auto
+  persistent_workers: true
+  prefetch_factor: 2
+  drop_last_train: true
+  max_open_shards: 32
+  prefetch_memory_limit_mb: 512

@@ -5,17 +5,18 @@ import hashlib
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 from raylib import IsKeyDown, IsKeyPressed, KEY_A, KEY_D, KEY_E, KEY_J, KEY_K, KEY_Q, KEY_R, KEY_S, KEY_W
 
-from stylized_motion.data.feature_dataset import build_feature_store
-from stylized_motion.data.token_store import build_token_store
-from stylized_motion.data.trajectory_store import (
+from stylized_motion.data import (
+    SampleRequest,
     TrajectoryStore,
-    TrajectoryNormalization,
-    build_trajectory_store,
+    open_feature_store,
+    open_token_store,
+    open_trajectory_store,
 )
 from stylized_motion.anim.genoview import GenoView, PlaybackController, load_feature_stats
 from stylized_motion.learning.nets.causal_transformer_generator import (
@@ -73,7 +74,7 @@ def parse_args() -> argparse.Namespace:
         "--feature-database",
         type=Path,
         default=None,
-        help="Feature database for --seed-source reencode; defaults to token metadata's feature_database.",
+        help="Schema-v3 feature database for --seed-source reencode.",
     )
     parser.add_argument(
         "--initial-capacity",
@@ -151,7 +152,12 @@ def load_generator(path: Path, store, device: torch.device):
     state_dict = checkpoint.get("model")
     if not isinstance(model_config, dict) or not isinstance(state_dict, dict):
         raise ValueError("Generator checkpoint requires model_config and model state_dict")
-    model = FSQCausalTransformerGenerator(**model_config).to(device)
+    model_class = (
+        FSQConditionalTransformerGenerator
+        if "trajectory_dim" in model_config and "num_styles" in model_config
+        else FSQCausalTransformerGenerator
+    )
+    model = model_class(**model_config).to(device)
     model.load_state_dict(state_dict)
     model.eval()
     if (model.num_coordinates, model.num_levels) != (store.num_coordinates, store.num_levels):
@@ -197,11 +203,20 @@ def resolve_style_id(
     style_id: int,
     style_name: str | None,
 ) -> int | None:
-    if style_name is not None or style_id != 0:
-        raise ValueError("The canonical generator has no style-conditioning capability")
-    if not hasattr(generator, "num_styles"):
+    if not isinstance(generator, FSQConditionalTransformerGenerator):
+        if style_name is not None or style_id != 0:
+            raise ValueError("The unconditional generator has no style-conditioning capability")
         return None
-    return None
+    names = [str(name) for name in generator_checkpoint.get("style_names", token_store.style_names)]
+    if len(names) != generator.num_styles:
+        raise ValueError("Conditional generator style_names do not match num_styles")
+    if style_name is not None:
+        if style_name not in names:
+            raise ValueError(f"Unknown style name {style_name!r}; expected one of {names}")
+        style_id = names.index(style_name)
+    if style_id < 0 or style_id >= generator.num_styles:
+        raise ValueError(f"style_id must be in [0, {generator.num_styles}), got {style_id}")
+    return int(style_id)
 
 
 def resolve_trajectory_conditioning(
@@ -209,25 +224,26 @@ def resolve_trajectory_conditioning(
     generator_checkpoint: dict,
     token_store,
     trajectory_database: Path | None,
-) -> tuple[TrajectoryStore | None, TrajectoryNormalization | None]:
+) -> tuple[TrajectoryStore | None, Any | None]:
     if trajectory_database is None:
         return None, None
-    raise ValueError("The canonical generator does not expose trajectory-conditioning capability")
+    if not isinstance(generator, FSQConditionalTransformerGenerator):
+        raise ValueError("Trajectory conditioning requires FSQConditionalTransformerGenerator")
+    store = open_trajectory_store(trajectory_database, token_store=token_store)
+    if store.trajectory_dim != generator.trajectory_dim:
+        raise ValueError("TrajectoryStore dimension does not match the conditional generator")
+    return store, store.normalization
 
 
-def resolve_feature_database(override: Path | None, token_store) -> Path:
-    if override is not None:
-        candidates = [override]
-    else:
-        configured = Path(token_store.feature_database)
-        candidates = [configured]
-        if not configured.is_absolute():
-            candidates.append(token_store.database.parent / configured)
+def resolve_feature_database(override: Path | None) -> Path:
+    if override is None:
+        raise ValueError("--feature-database is required for seed-source=feature; schema-v3 manifests do not store build-machine paths")
+    candidates = [override]
     for candidate in candidates:
-        if (candidate / "metadata.npz").exists():
+        if (candidate / "manifest.json").exists():
             return candidate
     attempted = ", ".join(str(candidate) for candidate in candidates)
-    raise FileNotFoundError(f"Could not find feature database metadata.npz. Tried: {attempted}")
+    raise FileNotFoundError(f"Could not find feature database manifest.json. Tried: {attempted}")
 
 
 def encode_seed_from_feature_database(
@@ -245,10 +261,10 @@ def encode_seed_from_feature_database(
     Source feature shards are normalized with their own dataset statistics, so
     convert through raw feature space before applying the checkpoint statistics.
     The left receptive-field context makes this numerically consistent with
-    ``stylized_motion.data.encode_token_database`` for a seed that starts in the
+    ``stylized_motion.data.preprocess`` token builder for a seed that starts in the
     middle of a clip.
     """
-    feature_store = build_feature_store(feature_database)
+    feature_store = open_feature_store(feature_database)
     if len(feature_store.motion_files) != len(token_store.token_files):
         raise ValueError("Feature database and token metadata have different numbers of motion ranges")
     if str(feature_store.range_names[range_idx]) != str(token_store.range_names[range_idx]):
@@ -391,7 +407,7 @@ class RealtimeFSQController:
         style_names: list[str] | None = None,
         trajectory_future_frames: tuple[int, ...] = (20, 40, 60),
         trajectory_store: TrajectoryStore | None = None,
-        trajectory_normalization: TrajectoryNormalization | None = None,
+        trajectory_normalization: Any | None = None,
     ) -> None:
         if seed_indices.ndim != 3 or seed_indices.shape[0] != 1:
             raise ValueError(f"seed_indices must have shape [1,T,K], got {tuple(seed_indices.shape)}")
@@ -403,7 +419,7 @@ class RealtimeFSQController:
             raise ValueError("initial_capacity must be at least seed length")
         if temperature <= 0.0:
             raise ValueError("temperature must be positive")
-        conditional = False
+        conditional = isinstance(generator, FSQConditionalTransformerGenerator)
         if conditional and style_id is None:
             raise ValueError("A conditional generator requires a style_id")
         if not conditional and (trajectory_store is not None or trajectory_normalization is not None):
@@ -521,12 +537,14 @@ class RealtimeFSQController:
         if self.trajectory_store is None or self.trajectory_normalization is None:
             return self._zero_control()
         try:
-            values, valid = self.trajectory_store.normalized_window(
-                self.source_range_idx,
-                int(target_local_frame),
-                int(target_local_frame) + 1,
-                self.trajectory_normalization,
+            request = SampleRequest(
+                shard_idx=self.source_range_idx,
+                target_start=int(target_local_frame) - 1,
+                target_frames=1,
+                context_left=0,
+                variant_idx=self.source_range_idx,
             )
+            values, valid = self.trajectory_store.read_aligned(request, 1)
         except IndexError:
             # A reference clip may end before an open-ended rollout.  The model
             # still runs with the explicit invalid-condition embedding.
@@ -958,7 +976,7 @@ def main() -> None:
     if args.move_speed <= 0.0 or args.turn_speed <= 0.0:
         raise ValueError("move-speed and turn-speed must be positive")
     device = choose_device(args.device)
-    store = build_token_store(args.token_database)
+    store = open_token_store(args.token_database)
     generator_checkpoint, generator = load_generator(args.generator_checkpoint, store, device)
     style_id = resolve_style_id(
         generator,
@@ -998,7 +1016,7 @@ def main() -> None:
     )
     feature_database = None
     if args.seed_source == "reencode":
-        feature_database = resolve_feature_database(args.feature_database, store)
+        feature_database = resolve_feature_database(args.feature_database)
         seed_indices = encode_seed_from_feature_database(
             fsq=fsq,
             fsq_checkpoint=fsq_checkpoint,

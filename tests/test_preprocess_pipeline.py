@@ -1,12 +1,25 @@
+from __future__ import annotations
+
+import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
 
-from stylized_motion.data.feature_dataset import build_feature_store
 from stylized_motion.anim.features import MotionFeatureStats
-from stylized_motion.data import build_feature_database
-from stylized_motion.data.build_database import MotionDatabaseWriter
-from stylized_motion.data.build_feature_database import _normalize_motion_shard
+from stylized_motion.data.feature_data import (
+    FeatureDataset,
+    _stats_sha256,
+    canonical_json_bytes,
+    open_feature_store,
+)
+from stylized_motion.data.preprocess import (
+    MotionDatabaseWriter,
+    _normalize_motion_shard,
+    _save_motion_shard,
+    validate_data,
+)
+from stylized_motion.data.sampling import SampleRequest
 
 
 def _motion(nframes: int) -> dict[str, np.ndarray | list[str]]:
@@ -19,6 +32,68 @@ def _motion(nframes: int) -> dict[str, np.ndarray | list[str]]:
         "parents": np.asarray([-1, 0], dtype=np.int32),
         "names": ["Simulation", "Hips"],
     }
+
+
+def _write_feature_store(tmp_path: Path) -> None:
+    shard_dir = tmp_path / "motion"
+    shard_dir.mkdir()
+    motion = np.arange(128 * 230, dtype=np.float32).reshape(128, 230)
+    shard = shard_dir / "shard_00000.npy"
+    np.save(shard, motion)
+    stats = MotionFeatureStats(
+        offset=np.zeros(230, dtype=np.float32),
+        scale=np.ones(230, dtype=np.float32),
+        dist=np.ones(230, dtype=np.float32),
+        weights=np.ones(230, dtype=np.float32),
+        ref_pos=np.zeros((2, 3), dtype=np.float32),
+    )
+    names = ["Simulation", "Hips"]
+    parents = [-1, 0]
+    schema_payload = {
+        "name": "motion_feature_v2",
+        "motion_dim": 230,
+        "joint_subset": "full",
+        "names_sha256": hashlib.sha256(canonical_json_bytes(names)).hexdigest(),
+        "stats_sha256": _stats_sha256(stats),
+    }
+    schema_hash = hashlib.sha256(canonical_json_bytes(schema_payload)).hexdigest()
+    manifest = {
+        "data_schema_version": 3,
+        "store_type": "feature",
+        "frame_rate": 60,
+        "num_shards": 1,
+        "shard_files": ["motion/shard_00000.npy"],
+        "shard_sha256": [hashlib.sha256(shard.read_bytes()).hexdigest()],
+        "split_manifest_hash": "split-hash",
+        "feature_schema_hash": schema_hash,
+        "created_by": "tests",
+        "motion_dim": 230,
+        "range_names": ["style_action"],
+        "source_clip_names": ["style_action"],
+        "style_names": ["style"],
+        "action_names": ["action"],
+        "feature_schema": {**schema_payload, "names": names, "parents": parents},
+        "normalization_train_frames": 128,
+    }
+    np.savez(
+        tmp_path / "index.npz",
+        shard_num_frames=np.asarray([128], dtype=np.int64),
+        clip_ids=np.asarray([0], dtype=np.int32),
+        source_clip_ids=np.asarray([0], dtype=np.int32),
+        range_shard_indices=np.asarray([0], dtype=np.int32),
+        range_starts=np.asarray([0], dtype=np.int64),
+        range_stops=np.asarray([128], dtype=np.int64),
+        range_mirror=np.asarray([False], dtype=bool),
+        split_ids=np.asarray([0], dtype=np.uint8),
+        style_ids=np.asarray([0], dtype=np.int32),
+        action_ids=np.asarray([0], dtype=np.int32),
+        offset=stats.offset,
+        scale=stats.scale,
+        dist=stats.dist,
+        weights=stats.weights,
+        ref_pos=stats.ref_pos,
+    )
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
 
 def test_database_writer_preserves_ranges_and_clips_tags(tmp_path: Path):
@@ -60,37 +135,33 @@ def test_normalize_motion_shard_updates_file_in_chunks(tmp_path: Path):
     np.testing.assert_allclose(np.load(path), (raw - stats.offset) / stats.scale)
 
 
-def test_build_processed_data_writes_both_outputs_in_one_stream(tmp_path: Path, monkeypatch):
-    specs = [{"range_name": "clip", "mirror": mirror, "nframes": 6} for mirror in [False, True]]
-    tags = [("clip", "all", 0, None)]
-    calls = []
+def test_save_motion_shard_creates_directory_under_output(tmp_path: Path):
+    motion = np.zeros((4, 230), dtype=np.float32)
 
-    monkeypatch.setattr(
-        build_feature_database,
-        "_build_shard_specs",
-        lambda **_kwargs: (specs, tags, [Path("clip.bvh")]),
-    )
+    relative = _save_motion_shard(tmp_path / "staging", 3, motion)
 
-    def fake_motion_pairs(*_args, **_kwargs):
-        calls.append("processed")
-        yield "clip", [(False, _motion(6)), (True, _motion(6))]
+    assert relative == "motion/shard_00003.npy"
+    assert (tmp_path / "staging" / relative).exists()
 
-    monkeypatch.setattr(build_feature_database, "iter_motion_pairs", fake_motion_pairs)
-    output_dir = tmp_path / "processed"
-    feature_dir = output_dir / "feature_database"
-    database_path = output_dir / "database.npz"
 
-    build_feature_database.build_processed_data(
-        dataset_name="100style",
-        output_dir=output_dir,
-        window_size=2,
-        workers=4,
-    )
-
-    assert calls == ["processed"]
-    assert database_path.exists()
-    store = build_feature_store(feature_dir)
-    assert len(store.motion_files) == 2
-    assert store.motion_dim == 23
-    assert len(store.split_windows["train"]) == 2
-    assert all(np.isfinite(np.load(path)).all() for path in store.motion_files)
+def test_schema_v3_feature_store_returns_masked_batch(tmp_path: Path):
+    _write_feature_store(tmp_path)
+    store = open_feature_store(tmp_path)
+    try:
+        request = SampleRequest(0, 63, 64, 63, 0)
+        dataset = FeatureDataset("train", store, requests=[request])
+        item = dataset[0]
+        batch = dataset.__getitems__([request])
+        assert item["motion"].shape == (127, 230)
+        assert item["loss_mask"].shape == (127,)
+        assert int(item["loss_mask"].sum()) == 64
+        assert batch["motion"].is_contiguous()
+        assert batch["motion"].shape == (1, 127, 230)
+        assert validate_data(feature_database=tmp_path, full=True) == {
+            "feature": True,
+            "token": False,
+            "trajectory": False,
+            "full": True,
+        }
+    finally:
+        store.close()

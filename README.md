@@ -7,25 +7,29 @@
 - `residual_part_fsq`：holistic base + feature-space local residual，`default` variant；
 - `latent_residual_fsq`：holistic base + disjoint latent residual，`v2` variant。
 
-四条主线都使用 `motion [B,T,230]`、`T=64`、`K=40`、`L=9`、frame-level causal contract。模型构造、checkpoint、token database、训练验证测试和下游解码均通过 representation metadata 连接，应用层不导入具体 tokenizer 类。
+四条主线都使用 `motion [B,T,230]`、`K=40`、`L=9`、frame-level causal contract。representation 的模型和 checkpoint 规则见 [主线重构 spec](docs/refactor_spec.md)，数据侧的 split、采样、batch 和 loader 规则见 [Data Pipeline Spec](docs/data_pipeline_spec.md)。
 
 ## 目录
 
 ```text
 args/                          MimicKit 风格命令预设
 data/configs/                  representation、generator、VQ-VAE 配置
-stylized_motion/data/          feature、token、trajectory store 与构建流程
+stylized_motion/data/          flat feature、token、trajectory data modules
 stylized_motion/learning/      representation、统一 runner、loss、metrics
 stylized_motion/learning/nets/ 可复用 causal CNN/Transformer/quantizer
 stylized_motion/anim/          BVH、motion feature、GenoView 和可视化
 stylized_motion/run.py         唯一应用级 dispatch 入口
 tests/                         contract 与回归测试
-docs/                          Draft 0.3 设计文档
+docs/refactor_spec.md           FSQ representation 与跨层集成 spec
+docs/data_pipeline_spec.md     data schema、sampling、batch、loader spec
 ```
 
 `learning/vqvae.py` 和 `data/configs/vqvae_*.yaml` 是隔离的 baseline，不属于 FSQ representation registry。
 
 ## 环境与数据
+
+数据侧严格使用 Draft 0.1 的 schema v3 contract；旧 `metadata.npz` 数据不再读取，已有
+数据需要重新构建。canonical output 为 `manifest.json + index.npz + mmap shards`。
 
 ```bash
 cd /Users/shinn/Documents/Projects/StylizedMotionGeneration
@@ -37,16 +41,15 @@ pip install -r requirements.txt
 
 ```bash
 python -m stylized_motion.run \
-  --mode preprocess --pipeline build-data \
+  --mode preprocess --pipeline feature-database \
   --dataset 100style \
   --max-styles 5 \
   --prune-ends-and-fingers \
-  --window-size 64 \
   --workers 8 \
-  --output data/processed/100style_pruned_test5
+  --output data/processed/100style_pruned_test5/feature_database
 ```
 
-feature database 必须提供 `metadata.npz` 和 motion shards，并包含 `motion_feature_v2` 的 joint names、parents、normalization stats、`230D` schema hash 以及 train/val/test windows。
+feature database 使用 data schema v3 的 `manifest.json + index.npz + mmap motion shards`，并包含 `motion_feature_v2` 的 joint names、parents、normalization stats、`230D` schema hash、source-clip split manifest 和 intervals。
 
 ## Representation 训练
 
@@ -90,7 +93,7 @@ python -m stylized_motion.run \
   --checkpoint outputs/part_fsq_40x9/best.pt
 ```
 
-统一 runner 负责 DataLoader、device、FP32/AMP policy、optimizer、scheduler、gradient clipping、TensorBoard、best/last checkpoint 和吞吐量统计。每个 checkpoint 必须包含 schema v2、canonical `representation`、top-level `feature_schema`、model config 和 state dict。
+统一 runner 负责 device、FP32/AMP policy、optimizer、scheduler、gradient clipping、TensorBoard、best/last checkpoint 和吞吐量统计；DataLoader 由 data spec 规定的统一 data loader 负责。每个 checkpoint 必须包含 schema v2、canonical `representation`、top-level `feature_schema`、model config 和 state dict。
 
 ## 坐标布局
 
@@ -111,7 +114,7 @@ python -m stylized_motion.run \
   --save-codes
 ```
 
-`TokenStore` 只接受 schema v2，并在 dataset 创建时校验 checkpoint SHA256、family/variant/id、`K/L`、coordinate order/counts、feature schema、window/fps 和 causal metadata。任何不匹配都会立即失败。
+`TokenStore` 只接受 data schema v3，并校验 checkpoint SHA256、family/variant/id、`K/L`、coordinate order/counts、feature schema、split manifest、frame rate 和 causal metadata。完整 shard value 校验由 preprocess full validation 执行，训练启动只做 runtime contract 校验。
 
 trajectory database 由 token database 派生，并保留相同的 shard、representation 和 feature schema contract：
 
@@ -140,7 +143,7 @@ python -m stylized_motion.run \
   --output outputs/generated_indices.npy
 ```
 
-当前 generator autoregressive training 和 realtime consumer 仅对无条件 token generator 提供能力；若输入 trajectory conditioning，consumer 会明确抛出 capability error，不会把 Part/Residual token 当作 Flat token 解释。representation decoder、motion viewer 和 realtime loader 都通过 `load_representation_checkpoint()` 构造统一 adapter。
+generator autoregressive training、trajectory conditioning 和 realtime consumer 都通过统一 TokenStore/TrajectoryStore public API 读取数据；不会把 Part/Residual token 当作 Flat token 解释。representation decoder、motion viewer 和 realtime loader 都通过 `load_representation_checkpoint()` 构造统一 adapter。
 
 ## 命令预设与测试
 
