@@ -6,6 +6,11 @@ import numpy as np
 import torch
 
 from stylized_motion.data import open_feature_store
+from stylized_motion.anim.features import (
+    denormalize_motion_features,
+    deserialize_motion_feature_stats,
+    normalize_motion_features,
+)
 from stylized_motion.anim.genoview import GenoView, GenoViewCompare, build_database_from_feature_array
 from stylized_motion.learning.representation import load_representation_checkpoint
 from stylized_motion.util.paths import RESOURCE_DIR
@@ -74,7 +79,7 @@ def slice_with_edge_pad(motion: np.ndarray, start: int, end: int) -> np.ndarray:
     return sliced
 
 
-def reconstruct_segment(model, family: str, motion: np.ndarray, start: int, length: int, device):
+def reconstruct_segment(model, family: str, motion: np.ndarray, start: int, length: int, device, source_stats, model_stats):
     target_end = start + length
     infer_start = max(0, start - int(model.history_frames))
     alignment_factor = inference_factor(model.config, family)
@@ -83,6 +88,10 @@ def reconstruct_segment(model, family: str, motion: np.ndarray, start: int, leng
     infer_len = infer_end - infer_start
     pad_right = (-infer_len) % alignment_factor
     infer_features = slice_with_edge_pad(motion, infer_start, infer_end + pad_right)
+    infer_features = normalize_motion_features(
+        denormalize_motion_features(infer_features, source_stats),
+        model_stats,
+    )
 
     x = torch.from_numpy(np.asarray(infer_features, dtype=np.float32)).unsqueeze(0).to(device)
     with torch.no_grad():
@@ -128,18 +137,37 @@ def main():
     ckpt, model = load_representation_checkpoint(
         args.checkpoint,
         torch.device("cpu"),
-        feature_schema=store.feature_schema(),
     )
     family = model.family
     if model.motion_dim != store.motion_dim:
         raise ValueError(f"Model motion_dim={model.motion_dim} does not match feature database motion_dim={store.motion_dim}")
+    checkpoint_schema = ckpt["feature_schema"]
+    store_schema = store.feature_schema()
+    for key in ("name", "motion_dim", "joint_subset", "names_sha256"):
+        if checkpoint_schema.get(key) != store_schema.get(key):
+            raise ValueError(f"Checkpoint and feature database structural schema mismatch at {key!r}")
+    feature_stats = ckpt.get("feature_stats")
+    if not isinstance(feature_stats, dict):
+        raise ValueError("Checkpoint is missing feature_stats")
+    model_stats, checkpoint_stats_metadata = deserialize_motion_feature_stats(feature_stats)
+    checkpoint_names = checkpoint_stats_metadata.get("names")
+    checkpoint_parents = checkpoint_stats_metadata.get("parents")
+    if not isinstance(checkpoint_names, list) or not isinstance(checkpoint_parents, np.ndarray):
+        raise ValueError("Checkpoint feature_stats is missing skeleton names or parents")
+    if checkpoint_names != store.names:
+        raise ValueError("Checkpoint and feature database skeleton names differ")
+    if not np.array_equal(checkpoint_parents, store.parents):
+        raise ValueError("Checkpoint and feature database skeleton parents differ")
     if args.range_idx >= len(store.motion_files):
         raise ValueError(f"--range-idx {args.range_idx} exceeds range count {len(store.motion_files)}")
 
     motion_path = store.motion_files[args.range_idx]
     motion = np.load(motion_path, mmap_mode="r")
     validate_slice(args.range_idx, args.start, args.length, motion, model.motion_dim)
-    source_features = np.asarray(motion[args.start : args.start + args.length], dtype=np.float32).copy()
+    source_features = denormalize_motion_features(
+        np.asarray(motion[args.start : args.start + args.length], dtype=np.float32).copy(),
+        store.stats,
+    )
 
     device = choose_device(args.device)
     model = model.to(device)
@@ -151,7 +179,10 @@ def main():
         start=args.start,
         length=args.length,
         device=device,
+        source_stats=store.stats,
+        model_stats=model_stats,
     )
+    recon_features = denormalize_motion_features(recon_features, model_stats)
 
     range_name = args.range_name or str(store.range_names[args.range_idx])
     mirror = bool(store.range_mirror[args.range_idx])
@@ -177,14 +208,14 @@ def main():
         save_debug(args, source_features, recon_features, indices, meta)
 
     if args.view == "source":
-        database = build_database_from_feature_array(source_features, args.checkpoint, True, f"{display_name}_source")
+        database = build_database_from_feature_array(source_features, args.checkpoint, False, f"{display_name}_source")
         viewer = GenoView(database=database, trajectory_path=None, resources_root=args.resources_root, fps=args.fps)
     elif args.view == "recon":
-        database = build_database_from_feature_array(recon_features, args.checkpoint, True, f"{display_name}_{family}_recon")
+        database = build_database_from_feature_array(recon_features, args.checkpoint, False, f"{display_name}_{family}_recon")
         viewer = GenoView(database=database, trajectory_path=None, resources_root=args.resources_root, fps=args.fps)
     else:
-        source_database = build_database_from_feature_array(source_features, args.checkpoint, True, f"{display_name}_source")
-        recon_database = build_database_from_feature_array(recon_features, args.checkpoint, True, f"{display_name}_{family}_recon")
+        source_database = build_database_from_feature_array(source_features, args.checkpoint, False, f"{display_name}_source")
+        recon_database = build_database_from_feature_array(recon_features, args.checkpoint, False, f"{display_name}_{family}_recon")
         viewer = GenoViewCompare(
             left_database=source_database,
             right_database=recon_database,
