@@ -88,10 +88,12 @@ def test_canonical_tree_is_present_and_old_workflow_modules_are_absent():
         PROJECT_ROOT / "args" / "part_fsq_args.txt",
         PROJECT_ROOT / "args" / "residual_part_fsq_args.txt",
         PROJECT_ROOT / "args" / "latent_residual_fsq_args.txt",
+        PROJECT_ROOT / "args" / "latent_residual_fsq_v2_args.txt",
         CONFIG_DIR / "flat_fsq_40x9.yaml",
         CONFIG_DIR / "part_fsq_40x9.yaml",
         CONFIG_DIR / "residual_part_fsq_40x9.yaml",
         CONFIG_DIR / "latent_residual_fsq_40x9.yaml",
+        CONFIG_DIR / "latent_residual_fsq_v2_40x9.yaml",
         root / "data" / "__init__.py",
         root / "data" / "feature_data.py",
         root / "data" / "token_data.py",
@@ -125,7 +127,7 @@ def test_canonical_tree_is_present_and_old_workflow_modules_are_absent():
 
 
 def test_all_four_configs_use_nested_representation_contract():
-    for family in ("flat_fsq", "part_fsq", "residual_part_fsq", "latent_residual_fsq"):
+    for family in ("flat_fsq", "part_fsq", "residual_part_fsq", "latent_residual_fsq", "latent_residual_fsq_v2"):
         config = yaml.safe_load((CONFIG_DIR / f"{family}_40x9.yaml").read_text(encoding="utf-8"))
         assert config["representation"]["family"] == family
         assert config["data"]["required_data_schema_version"] == 3
@@ -143,6 +145,12 @@ def test_mimickit_style_presets_expand_to_canonical_workflow():
         "--representation", "part-fsq", "--config", "data/configs/part_fsq_40x9.yaml",
     ]
     assert expanded[-2:] == ["--epochs", "1"]
+
+
+def test_latent_residual_v2_preset_expands_to_its_independent_family():
+    expanded = expand_arg_file(["--arg-file", "args/latent_residual_fsq_v2_args.txt"])
+    assert "latent-residual-fsq-v2" in expanded
+    assert "data/configs/latent_residual_fsq_v2_40x9.yaml" in expanded
 
 
 def test_repository_paths_are_rooted_at_the_checkout():

@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from stylized_motion.learning.representation import (
     FLAT_FSQ_FAMILY,
     LATENT_RESIDUAL_FSQ_FAMILY,
+    LATENT_RESIDUAL_FSQ_V2_FAMILY,
     PART_FSQ_FAMILY,
     RESIDUAL_PART_FSQ_FAMILY,
     build_representation,
@@ -59,6 +60,8 @@ def _config(name: str, *, small: bool = True) -> dict[str, object]:
                 model_config.update({"residual_decoder_dim": 16, "residual_decoder_width": 16, "residual_hidden_dim": 8})
             if representation["family"] == LATENT_RESIDUAL_FSQ_FAMILY:
                 model_config.update({"part_predictor_hidden_dim": 8, "latent_projector_hidden_dim": 8, "part_latent_dims": [4, 3, 3, 3, 3]})
+            if representation["family"] == LATENT_RESIDUAL_FSQ_V2_FAMILY:
+                model_config.update({"part_predictor_hidden_dim": 8, "part_encoder_width": 8})
     representation["config"] = model_config
     config["representation"] = representation
     return config
@@ -70,6 +73,7 @@ def test_canonical_configs_and_specs_are_explicit():
         "part_fsq_40x9.yaml": (PART_FSQ_FAMILY, "hierarchical", "part_fsq_40x9"),
         "residual_part_fsq_40x9.yaml": (RESIDUAL_PART_FSQ_FAMILY, "default", "residual_part_fsq_40x9"),
         "latent_residual_fsq_40x9.yaml": (LATENT_RESIDUAL_FSQ_FAMILY, "v2", "latent_residual_fsq_40x9"),
+        "latent_residual_fsq_v2_40x9.yaml": (LATENT_RESIDUAL_FSQ_V2_FAMILY, "v2", "latent_residual_fsq_v2_40x9"),
     }
     for filename, identity in expected.items():
         spec = representation_spec(_config(filename))
@@ -91,6 +95,7 @@ def test_builder_roundtrip_contract_for_all_four_lines():
         "part_fsq_40x9.yaml",
         "residual_part_fsq_40x9.yaml",
         "latent_residual_fsq_40x9.yaml",
+        "latent_residual_fsq_v2_40x9.yaml",
     ):
         representation = build_representation(_config(filename))
         output = representation(motion, collect_metrics=False)

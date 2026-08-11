@@ -19,6 +19,7 @@ import yaml
 
 from .fsq import FSQMotionAutoencoder
 from .latent_residual_fsq import LatentResidualPartFSQMotionAutoencoder
+from .latent_residual_fsq_v2 import LatentResidualPartFSQV2MotionAutoencoder
 from .part_fsq import HierarchicalPartFSQMotionAutoencoder
 from .part_layout import GROUP_COORDINATES as PART_GROUP_COORDINATES
 from .part_layout import GROUP_NAMES as PART_GROUP_NAMES
@@ -33,12 +34,14 @@ FLAT_FSQ_FAMILY = "flat_fsq"
 PART_FSQ_FAMILY = "part_fsq"
 RESIDUAL_PART_FSQ_FAMILY = "residual_part_fsq"
 LATENT_RESIDUAL_FSQ_FAMILY = "latent_residual_fsq"
+LATENT_RESIDUAL_FSQ_V2_FAMILY = "latent_residual_fsq_v2"
 REPRESENTATION_FAMILIES = frozenset(
     {
         FLAT_FSQ_FAMILY,
         PART_FSQ_FAMILY,
         RESIDUAL_PART_FSQ_FAMILY,
         LATENT_RESIDUAL_FSQ_FAMILY,
+        LATENT_RESIDUAL_FSQ_V2_FAMILY,
     }
 )
 
@@ -47,6 +50,7 @@ LEGACY_MODEL_FAMILY = {
     PART_FSQ_FAMILY: "part_fsq",
     RESIDUAL_PART_FSQ_FAMILY: "residual_part_fsq",
     LATENT_RESIDUAL_FSQ_FAMILY: "latent_residual_part_fsq",
+    LATENT_RESIDUAL_FSQ_V2_FAMILY: "latent_residual_part_fsq_v2",
 }
 
 
@@ -138,7 +142,7 @@ def _default_layout(family: str, coordinates: int) -> tuple[tuple[str, ...], tup
         return tuple(PART_GROUP_NAMES), tuple(
             (name, int(PART_GROUP_COORDINATES[name])) for name in PART_GROUP_NAMES
         )
-    if family in {RESIDUAL_PART_FSQ_FAMILY, LATENT_RESIDUAL_FSQ_FAMILY}:
+    if family in {RESIDUAL_PART_FSQ_FAMILY, LATENT_RESIDUAL_FSQ_FAMILY, LATENT_RESIDUAL_FSQ_V2_FAMILY}:
         return tuple(RESIDUAL_GROUP_NAMES), tuple(
             (name, int(RESIDUAL_GROUP_COORDINATES[name])) for name in RESIDUAL_GROUP_NAMES
         )
@@ -223,11 +227,16 @@ def _spec_from_values(
         architecture_version = 2 if architecture_version is None else int(architecture_version)
         if architecture_version != 2:
             raise ValueError("Latent Residual-FSQ requires architecture_version=2")
+    if family == LATENT_RESIDUAL_FSQ_V2_FAMILY:
+        architecture_version = 3 if architecture_version is None else int(architecture_version)
+        if architecture_version != 3:
+            raise ValueError("Latent Residual-FSQ V2 requires architecture_version=3")
     expected_variant = {
         FLAT_FSQ_FAMILY: "flat",
         PART_FSQ_FAMILY: "hierarchical",
         RESIDUAL_PART_FSQ_FAMILY: "default",
         LATENT_RESIDUAL_FSQ_FAMILY: "v2",
+        LATENT_RESIDUAL_FSQ_V2_FAMILY: "v2",
     }[family]
     if variant != expected_variant:
         raise ValueError(f"{family} requires variant={expected_variant!r}")
@@ -328,7 +337,7 @@ class RepresentationAdapter(nn.Module):
                 "group_codes", "group_indices", "base_codes", "base_indices",
                 "part_codes", "part_indices", "base_recon_state", "edit_recon_state",
                 "part_residuals", "part_latent_residuals", "latent_residual_energy",
-                "group_coordinate_change_rates",
+                "group_coordinate_change_rates", "edit_part", "donor_permutation",
             }
             metrics = {key: value for key, value in result.items() if key not in standard}
         result["representation_metrics"] = metrics
@@ -387,6 +396,8 @@ def build_representation(
     model_config.setdefault("num_levels", 9)
     if family == LATENT_RESIDUAL_FSQ_FAMILY:
         model_config.setdefault("architecture_version", 2)
+    if family == LATENT_RESIDUAL_FSQ_V2_FAMILY:
+        model_config.setdefault("architecture_version", 3)
     spec = _spec_from_values(family, variant, model_config, config["representation"])
     model_config.pop("architecture_version", None)
     for metadata_key in (
@@ -400,6 +411,7 @@ def build_representation(
         PART_FSQ_FAMILY: HierarchicalPartFSQMotionAutoencoder,
         RESIDUAL_PART_FSQ_FAMILY: ResidualPartFSQMotionAutoencoder,
         LATENT_RESIDUAL_FSQ_FAMILY: LatentResidualPartFSQMotionAutoencoder,
+        LATENT_RESIDUAL_FSQ_V2_FAMILY: LatentResidualPartFSQV2MotionAutoencoder,
     }
     model = classes[family](**model_config)
     if int(getattr(model, "motion_dim")) != int(model_config["motion_dim"]):
@@ -509,6 +521,7 @@ __all__ = [
     "PART_FSQ_FAMILY",
     "RESIDUAL_PART_FSQ_FAMILY",
     "LATENT_RESIDUAL_FSQ_FAMILY",
+    "LATENT_RESIDUAL_FSQ_V2_FAMILY",
     "REPRESENTATION_FAMILIES",
     "RepresentationAdapter",
     "RepresentationProtocol",

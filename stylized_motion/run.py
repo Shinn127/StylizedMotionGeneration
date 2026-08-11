@@ -143,6 +143,7 @@ def _validate_representation_dispatch(raw_args: list[str], parser: argparse.Argu
         "part-fsq": "part_fsq",
         "residual-part-fsq": "residual_part_fsq",
         "latent-residual-fsq": "latent_residual_fsq",
+        "latent-residual-fsq-v2": "latent_residual_fsq_v2",
     }.get(representation_cli)
     if expected is None:
         parser.error(f"Unsupported canonical representation {representation_cli!r}")

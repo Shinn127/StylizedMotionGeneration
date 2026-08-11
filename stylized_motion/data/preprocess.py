@@ -785,6 +785,7 @@ def build_token_database(
             "part_fsq": "part_fsq",
             "residual_part_fsq": "residual_part_fsq",
             "latent_residual_fsq": "latent_residual_part_fsq",
+            "latent_residual_fsq_v2": "latent_residual_part_fsq_v2",
         }.get(str(representation.get("family", "")), "")
         manifest = {
             "data_schema_version": 3,

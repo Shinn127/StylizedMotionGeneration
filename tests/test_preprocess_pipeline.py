@@ -153,6 +153,7 @@ def test_schema_v3_feature_store_returns_64_frame_causal_batch(tmp_path: Path):
         item = dataset[0]
         batch = dataset.__getitems__([request])
         assert item["motion"].shape == (64, 230)
+        assert item["motion"].is_contiguous()
         assert item["loss_mask"].shape == (64,)
         assert int(item["loss_mask"].sum()) == 64
         assert bool(item["loss_mask"].all())

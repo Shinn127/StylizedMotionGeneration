@@ -1,0 +1,5 @@
+# Latent Residual Part-FSQ V2 canonical training preset.
+--mode train
+--pipeline representation
+--representation latent-residual-fsq-v2
+--config data/configs/latent_residual_fsq_v2_40x9.yaml

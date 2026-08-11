@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from stylized_motion.anim import quat
-from stylized_motion.learning.part_layout import FEATURE_GROUP_NAMES, GROUP_NAMES, PartFSQLayout
+from stylized_motion.learning.part_layout import FEATURE_GROUP_NAMES, GROUP_NAMES, PART_NAMES, PartFSQLayout
 
 
 @dataclass
@@ -491,3 +491,44 @@ def compute_latent_residual_representation_losses(
     return {
         "latent_energy": residual_energy * float(batch.get("latent_energy_weight", 0.01)),
     }
+
+
+def compute_latent_residual_v2_representation_losses(
+    output: Mapping[str, object],
+    batch: Mapping[str, object],
+    layout: PartFSQLayout,
+) -> dict[str, torch.Tensor]:
+    motion = batch.get("motion")
+    base_recon = output.get("base_recon_state")
+    edit_recon = output.get("edit_recon_state")
+    edit_part = output.get("edit_part")
+    donor_permutation = output.get("donor_permutation")
+    if not isinstance(motion, torch.Tensor) or not isinstance(base_recon, torch.Tensor):
+        raise TypeError("Latent Residual-FSQ V2 training requires motion and base_recon_state")
+    feature_weights = batch.get("feature_weights")
+    if not isinstance(feature_weights, torch.Tensor):
+        feature_weights = torch.ones(motion.shape[-1], device=motion.device, dtype=motion.dtype)
+    feature_weights = feature_weights.to(device=motion.device, dtype=motion.dtype)
+    base_loss = (torch.abs(base_recon - motion) * feature_weights.view(1, 1, -1)).mean()
+    losses = {"base_recon": base_loss * float(batch.get("base_recon_weight", 0.1))}
+
+    if edit_recon is None:
+        return losses
+    if (
+        not isinstance(edit_recon, torch.Tensor)
+        or not isinstance(edit_part, str)
+        or not isinstance(donor_permutation, torch.Tensor)
+    ):
+        raise TypeError("V2 edit output is incomplete")
+    if edit_part not in PART_NAMES:
+        raise ValueError(f"Unknown V2 edit part {edit_part!r}")
+    donor = motion.index_select(0, donor_permutation.to(device=motion.device, dtype=torch.long))
+    part_index = layout.feature_indices(motion.shape[-1])[edit_part].to(motion.device)
+    part_mask = torch.zeros(motion.shape[-1], device=motion.device, dtype=torch.bool)
+    part_mask[part_index] = True
+    transfer = torch.abs(edit_recon[..., part_mask] - donor[..., part_mask]).mean()
+    preserve = torch.abs(edit_recon[..., ~part_mask] - motion[..., ~part_mask]).mean()
+    edit_weight = float(batch.get("edit_weight", 0.25))
+    losses["part_edit_transfer"] = transfer * edit_weight
+    losses["part_edit_preserve"] = preserve * edit_weight * float(batch.get("edit_preserve_weight", 1.0))
+    return losses

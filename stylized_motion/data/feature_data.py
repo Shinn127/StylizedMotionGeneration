@@ -500,7 +500,9 @@ class FeatureDataset(Dataset):
         return self._item_request(self._request(index))
 
     def _item_request(self, request: SampleRequest) -> dict[str, Any]:
-        motion = self._read_numpy(request)
+        # MMapShardCache opens shards read-only. PyTorch tensors must not share
+        # that storage because writes through the tensor would be undefined.
+        motion = np.array(self._read_numpy(request), dtype=np.float32, copy=True, order="C")
         mask = np.ones((motion.shape[0],), dtype=bool)
         item: dict[str, Any] = {"motion": torch.from_numpy(motion), "loss_mask": torch.from_numpy(mask)}
         if self.return_metadata:

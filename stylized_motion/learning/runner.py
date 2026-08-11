@@ -23,6 +23,7 @@ from torch.utils.tensorboard import SummaryWriter
 from stylized_motion.data import FeatureStore, build_data_loaders, open_feature_store
 from stylized_motion.learning.checkpoint import CheckpointManager
 from stylized_motion.learning.losses import compute_motion_reconstruction_losses
+from stylized_motion.learning.part_layout import PART_NAMES
 from stylized_motion.learning.representation import (
     FLAT_FSQ_FAMILY,
     LEGACY_MODEL_FAMILY,
@@ -182,6 +183,9 @@ def build_loss_context(config: Mapping[str, object], store: FeatureStore, device
         "base_reuse_weight": float(training.get("base_reuse_weight", 0.0025)),
         "base_reuse_threshold": float(training.get("base_reuse_threshold", 1.0)),
         "latent_energy_weight": float(training.get("latent_energy_weight", 0.01)),
+        "base_recon_weight": float(training.get("base_recon_weight", 0.1)),
+        "edit_weight": float(training.get("edit_weight", 0.25)),
+        "edit_preserve_weight": float(training.get("edit_preserve_weight", 1.0)),
     }
     if context["joint_weight"] > 0.0 and context["foot_indices"] is None:
         raise ValueError("joint/foot losses require LeftToeBase and RightToeBase in the feature schema")
@@ -328,6 +332,15 @@ class RepresentationRunner:
         if motion.ndim != 3 or motion.shape[1] != 64:
             raise ValueError("Canonical representation runner requires motion with shape [B,64,motion_dim]")
         with self._autocast():
+            if self.family == "latent_residual_fsq_v2":
+                kwargs: dict[str, Any] = {"collect_metrics": True, "decode_base": True}
+                if self.representation.training and motion.shape[0] > 1:
+                    part_index = self.global_step % len(PART_NAMES)
+                    kwargs["edit_part"] = PART_NAMES[part_index]
+                    kwargs["donor_permutation"] = torch.roll(
+                        torch.arange(motion.shape[0], device=motion.device), shifts=1
+                    )
+                return self.representation(motion, **kwargs)
             return self.representation(motion, collect_metrics=True)
 
     def _record(self, output: Mapping[str, Any], batch: Batch, loss_values: Mapping[str, torch.Tensor]) -> dict[str, float]:
@@ -573,6 +586,7 @@ def _family_cli(value: str) -> str:
         "part-fsq": "part_fsq",
         "residual-part-fsq": "residual_part_fsq",
         "latent-residual-fsq": "latent_residual_fsq",
+        "latent-residual-fsq-v2": "latent_residual_fsq_v2",
     }
     if value not in mapping:
         raise ValueError(f"Unsupported --representation {value!r}")
@@ -582,7 +596,7 @@ def _family_cli(value: str) -> str:
 def build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train, validate, or test one canonical FSQ representation.")
     parser.add_argument("--workflow-mode", choices=["train", "validate", "test"], required=True)
-    parser.add_argument("--representation", choices=["flat-fsq", "part-fsq", "residual-part-fsq", "latent-residual-fsq"], required=True)
+    parser.add_argument("--representation", choices=["flat-fsq", "part-fsq", "residual-part-fsq", "latent-residual-fsq", "latent-residual-fsq-v2"], required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")

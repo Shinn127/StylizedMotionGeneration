@@ -113,18 +113,21 @@ class TokenStore:
             "part_fsq": "part_fsq",
             "residual_part_fsq": "residual_part_fsq",
             "latent_residual_fsq": "latent_residual_part_fsq",
+            "latent_residual_fsq_v2": "latent_residual_part_fsq_v2",
         }
         expected_variant = {
             "flat_fsq": "flat",
             "part_fsq": "hierarchical",
             "residual_part_fsq": "default",
             "latent_residual_fsq": "v2",
+            "latent_residual_fsq_v2": "v2",
         }
         expected_layout = {
             "flat_fsq": (("flat",), {"flat": 40}),
             "part_fsq": (("global", "sync", "torso", "left_leg", "right_leg", "left_arm", "right_arm"), {"global": 6, "sync": 4, "torso": 6, "left_leg": 7, "right_leg": 7, "left_arm": 5, "right_arm": 5}),
             "residual_part_fsq": (("base", "torso", "left_leg", "right_leg", "left_arm", "right_arm"), {"base": 20, "torso": 6, "left_leg": 4, "right_leg": 4, "left_arm": 3, "right_arm": 3}),
             "latent_residual_fsq": (("base", "torso", "left_leg", "right_leg", "left_arm", "right_arm"), {"base": 20, "torso": 6, "left_leg": 4, "right_leg": 4, "left_arm": 3, "right_arm": 3}),
+            "latent_residual_fsq_v2": (("base", "torso", "left_leg", "right_leg", "left_arm", "right_arm"), {"base": 20, "torso": 6, "left_leg": 4, "right_leg": 4, "left_arm": 3, "right_arm": 3}),
         }
         if self.representation_family not in expected_legacy:
             raise ValueError(f"Unsupported TokenStore representation family: {self.representation_family!r}")
@@ -400,10 +403,21 @@ class TokenDataset(Dataset):
         return request
 
     def _item(self, request: SampleRequest) -> dict[str, Any]:
-        indices = self.store.read_indices(request, self.sequence_frames)
+        indices = np.array(
+            self.store.read_indices(request, self.sequence_frames),
+            dtype=np.uint8,
+            copy=True,
+            order="C",
+        )
         item: dict[str, Any] = {"indices": torch.from_numpy(indices)}
         if self.include_codes:
-            item["codes"] = torch.from_numpy(self.store.read_codes(request, self.sequence_frames))
+            codes = np.array(
+                self.store.read_codes(request, self.sequence_frames),
+                dtype=np.float32,
+                copy=True,
+                order="C",
+            )
+            item["codes"] = torch.from_numpy(codes)
         if self.return_metadata:
             item["metadata"] = {
                 "shard_idx": int(request.shard_idx),
