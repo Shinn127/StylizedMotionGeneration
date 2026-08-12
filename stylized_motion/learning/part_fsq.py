@@ -196,7 +196,9 @@ class HierarchicalPartFSQMotionAutoencoder(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
         quantizer = self.group_quantizers[self._quantizer_key(group)]
         quantized, codes, indices, _, *stats = quantizer(
-            state.permute(0, 2, 1).contiguous(), collect_stats=collect_metrics
+            state.permute(0, 2, 1).contiguous(),
+            collect_stats=collect_metrics,
+            collect_sequence_stats=False,
         )
         return quantized.permute(0, 2, 1).contiguous(), codes, indices, tuple(stats)
 

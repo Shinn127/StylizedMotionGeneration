@@ -1,17 +1,18 @@
 # Stylized Motion Generation
 
-面向风格化角色动作的离散 motion representation 与生成实验项目。当前主线是四种共享数据、模型、训练和 checkpoint contract 的 FSQ representation：
+面向风格化角色动作的离散 motion representation 与生成实验项目。当前主线是五种共享数据、训练、checkpoint 和生成接口的 canonical FSQ representation：
 
 | CLI | family / variant | 语义 |
 | --- | --- | --- |
 | `flat-fsq` | `flat_fsq / flat` | 所有 motion feature 进入一个 flat stream |
 | `part-fsq` | `part_fsq / hierarchical` | global、sync、torso、双腿、双臂的层次化 stream |
 | `residual-part-fsq` | `residual_part_fsq / default` | holistic base 加 feature-space local residual |
-| `latent-residual-fsq` | `latent_residual_fsq / v2` | holistic base 加互斥 latent residual |
+| `latent-residual-fsq` | `latent_residual_fsq / v2` | holistic base 加显式互斥子空间中的 latent residual（旧实现，用于对照） |
+| `latent-residual-fsq-v2` | `latent_residual_fsq_v2 / v2` | 非结构化 base latent 加全维 part residual projection，支持 compensated part edit |
 
-四条 representation 使用同一 canonical contract：`motion_dim=230`、`40` 个 FSQ coordinate、每个 coordinate `9` 个 level、`frame_rate=60`、`receptive_field=64`、`lookahead_frames=0`。训练窗口长度为 64 帧，窗口内每一帧只访问当前帧及其历史，不再携带 `context_left`。
+五条 representation 使用同一 canonical contract：`motion_dim=230`、`40` 个 FSQ coordinate、每个 coordinate `9` 个 level、`frame_rate=60`、`receptive_field=64`、`lookahead_frames=0`。训练窗口长度为 64 帧，窗口内每一帧只访问当前帧及其历史，不再携带 `context_left`。
 
-数据侧唯一规范是 [docs/data_pipeline_spec.md](/Users/shinn/Documents/Projects/StylizedMotionGeneration/docs/data_pipeline_spec.md)，representation 和 learning 的跨层规范是 [docs/refactor_spec.md](/Users/shinn/Documents/Projects/StylizedMotionGeneration/docs/refactor_spec.md)。当前只读取 data schema v3 和 checkpoint schema v2，不提供旧数据兼容层。
+数据侧规范见 [data_pipeline_spec.md](docs/data_pipeline_spec.md)，representation 和 learning 的跨层规范见 [refactor_spec.md](docs/refactor_spec.md)。当前只读取 data schema v3 和 checkpoint schema v2，不提供旧数据兼容层。
 
 ## 1. 目录
 
@@ -21,7 +22,7 @@ data/configs/                 representation、generator、legacy VQ-VAE 配置
 stylized_motion/
   run.py                      唯一应用级 dispatch 入口
   data/                       Store、Dataset、sampling、loader、preprocess
-  learning/                   四类 FSQ、统一 runner、loss、generator
+  learning/                   五类 FSQ、统一 runner、loss、generator
     nets/                     causal CNN、Transformer、quantizer
   anim/                       BVH/feature、GenoView、序列和实时可视化
   util/                       参数文件和路径工具
@@ -79,8 +80,8 @@ representation 训练直接消费 FeatureStore。构建过程会读取 BVH、计
 python -m stylized_motion.run \
   --mode preprocess --pipeline feature-database \
   --dataset 100style \
-  --output data/processed/100style_pruned/feature_database \
-  --max-styles 5 \
+  --output data/processed/100style_pruned_90/feature_database \
+  --max-styles 90 \
   --prune-ends-and-fingers \
   --workers 8 \
   --overwrite
@@ -104,7 +105,7 @@ manifest 保存 data schema、相对 shard 路径、split manifest、feature sch
 ```bash
 python -m stylized_motion.run \
   --mode preprocess --pipeline validate-data \
-  --feature-database data/processed/100style_pruned/feature_database \
+  --feature-database data/processed/100style_pruned_90/feature_database \
   --full
 ```
 
@@ -161,22 +162,31 @@ loader:
   prefetch_memory_limit_mb: 512
 ```
 
-## 5. 四类 FSQ
+## 5. 五类 FSQ
 
-四类模型均由 [representation.py](/Users/shinn/Documents/Projects/StylizedMotionGeneration/stylized_motion/learning/representation.py) registry 构造。训练、验证、测试、checkpoint 和 decoder 不直接依赖具体模型类。
+五类模型均由 `stylized_motion/learning/representation.py` registry 构造。训练、验证、测试和 checkpoint 流程通过 `RepresentationAdapter` 使用统一接口，不在 workflow 中直接实例化具体模型类。
 
 | family | coordinate layout |
 | --- | --- |
 | `flat_fsq` | `flat:40` |
 | `part_fsq` | `global:6, sync:4, torso:6, left_leg:7, right_leg:7, left_arm:5, right_arm:5` |
 | `residual_part_fsq` | `base:20, torso:6, left_leg:4, right_leg:4, left_arm:3, right_arm:3` |
-| `latent_residual_fsq` | 与 residual part 相同，latent fusion 固定 `architecture_version=2` |
+| `latent_residual_fsq` | 与 residual part 相同；互斥 latent slice，`architecture_version=2` |
+| `latent_residual_fsq_v2` | 与 residual part 相同；全维 latent projection，`architecture_version=3` |
 
-模型差异在 representation encoder、quantizer、decoder 和 representation-specific loss 内部；共同 loss 由统一层计算：feature reconstruction、temporal delta、root trajectory、FK joint、contact、foot slide、foot height。
+各模型的核心差异如下：
+
+- Flat-FSQ 使用一个完整 motion encoder、一个 40-coordinate quantizer 和一个 decoder。
+- Part-FSQ 将 feature 划分为 global 与五个 body part，并额外学习 sync stream；每个 part 具有独立的 code group 和解码写入区域。
+- Residual Part-FSQ 先通过 base code 重建完整 motion，再把五个 part decoder 产生的 feature residual 加到对应 feature 区域。
+- Latent Residual-FSQ 旧实现从局部 feature state 与 base predictor 的差中量化 part residual，将五个 residual 投影到互斥的 base-latent slice 后求和，只调用共享 decoder。
+- Latent Residual-FSQ V2 保持 base latent 和 decoder 输入为非结构化 128D latent。每个 part residual 投影到完整 128D latent，最终使用 `base + sum(part_delta)` 解码；迁移 donor part 时根据 donor base 恢复 donor part state，再相对 target base 做 compensation。
+
+后四类使用固定的 body-part 集合：`torso`、`left_leg`、`right_leg`、`left_arm`、`right_arm`。模型差异封装在 encoder、quantizer、decoder 和 representation-specific loss 内部；共同 loss 由统一层计算 feature reconstruction、temporal delta、root trajectory、FK joint、contact、foot slide 和 foot height。
 
 ## 6. 训练、验证、测试
 
-四条主线共用 `RepresentationRunner`。每个训练 batch 执行一次 forward、一次 loss 计算和一次 backward/update；同一个 device batch 被 model 和 loss 复用。
+五条主线共用 `RepresentationRunner`。每个训练 batch 执行一次 forward、一次 loss 计算和一次 backward/update；同一个 device batch 被 model 和 loss 复用。
 
 ### 6.1 训练
 
@@ -195,11 +205,27 @@ python -m stylized_motion.run \
 part-fsq             data/configs/part_fsq_40x9.yaml
 residual-part-fsq    data/configs/residual_part_fsq_40x9.yaml
 latent-residual-fsq  data/configs/latent_residual_fsq_40x9.yaml
+latent-residual-fsq-v2 data/configs/latent_residual_fsq_v2_40x9.yaml
+```
+
+也可以直接使用 MimicKit 风格的参数预设：
+
+```bash
+python -m stylized_motion.run --arg-file args/latent_residual_fsq_v2_args.txt
 ```
 
 配置边界是：`data` 描述 Store，`sampling` 描述窗口和采样，`loader` 描述 batch/worker/host memory，`training` 描述 optimizer、epoch、precision、clip、seed 和 output。默认输出目录是 `outputs/<family>_40x9/`。
 
-### 6.2 验证和测试
+V2 训练会始终监督 base reconstruction。batch size 大于 1 时，runner 每个 step 轮换一个 body part，并用 batch 内循环移位构造 donor，联合计算 part transfer 和 non-part preserve loss。base、final reconstruction 和 edited reconstruction 的 latent 会合并后通过一次共享 decoder 调用。
+
+### 6.2 训练效率
+
+- `evaluation.metrics_interval` 控制昂贵 FSQ usage/perplexity 统计的采样频率，当前配置默认为每 100 step 一次；loss 仍在每个 step 完整计算。
+- 没有外部 metric callback 时，runner 使用 `compact_output=True`，丢弃训练 loss 不需要的诊断 tensor。
+- epoch scalar 在 device 上累加，epoch 结束时统一传到 CPU；DDP 使用一次 packed all-reduce 聚合。
+- `precision` 支持 `fp32` 和 CUDA-only `amp`；当前五份 representation 配置默认使用 `fp32`。
+
+### 6.3 验证和测试
 
 ```bash
 python -m stylized_motion.run \
@@ -227,7 +253,19 @@ python -m stylized_motion.run \
 loss, recon, delta, root_pos, root_rot, joint, contact, foot_slide, foot_height
 ```
 
-representation-specific loss 由各模型的 `compute_representation_losses()` 提供并参与总 loss，但目前不单独写入 TensorBoard。
+representation-specific loss 由各模型的 `compute_representation_losses()` 提供并参与总 loss。
+
+当前各 family 的额外 loss 为：
+
+| family | representation-specific loss |
+| --- | --- |
+| `flat_fsq` | 无 |
+| `part_fsq` | `reuse` |
+| `residual_part_fsq` | `base_reuse` |
+| `latent_residual_fsq` | `latent_energy` |
+| `latent_residual_fsq_v2` | `base_recon`，训练时另有 `part_edit_transfer`、`part_edit_preserve` |
+
+这些字段会进入 epoch 聚合结果和 checkpoint metrics。TensorBoard 当前只写入总 loss、八个 common loss component，以及按 `metrics_interval` 采样的 `train/step_loss`；representation-specific 字段尚未建立独立 tag。
 
 训练日志位置：
 
@@ -283,8 +321,8 @@ Token database 必须使用已训练的 representation checkpoint。`run.py` 在
 python -m stylized_motion.run \
   --mode preprocess --pipeline token-database \
   --checkpoint outputs/flat_fsq_40x9/best.pt \
-  --feature-database data/processed/100style_pruned/feature_database \
-  --output data/processed/100style_pruned/flat_fsq_40x9 \
+  --feature-database data/processed/100style_pruned_90/feature_database \
+  --output data/processed/100style_pruned_90/flat_fsq_40x9 \
   --device cuda --chunk-size 1024 --save-codes
 ```
 
@@ -311,7 +349,7 @@ python -m stylized_motion.run \
 
 python -m stylized_motion.run \
   --mode generate --pipeline motion \
-  --token-database data/processed/100style_pruned/flat_fsq_40x9 \
+  --token-database data/processed/100style_pruned_90/flat_fsq_40x9 \
   --generator-checkpoint outputs/generator_flat_fsq_40x9/best.pt \
   --seed-indices outputs/seed_indices.npy \
   --steps 60 --output outputs/generated_indices.npy --greedy
@@ -327,14 +365,67 @@ generator checkpoint 绑定 tokenizer checkpoint SHA256、TokenStore representat
 python -m stylized_motion.run \
   --mode visualize --pipeline motion \
   --checkpoint outputs/flat_fsq_40x9/best.pt \
-  --feature-database data/processed/100style_pruned/feature_database \
+  --feature-database data/processed/100style_pruned_90/feature_database \
   --range-idx 0 --start 0 --length 240 \
   --view compare --device cuda
 ```
 
 `--view` 可选 `source`、`recon`、`compare`；`--dry-run` 只执行加载和重建检查；`--save-debug` 保存 source/recon features、tokens 和 metadata。
 
-### 10.2 GenoView
+### 10.2 Part edit
+
+`part-edit` 从同一 FeatureStore 读取 target 与 donor 片段，将 donor 的指定 body-part code 或 latent residual 迁移到 target，并使用 GenoView 并排播放参考动作和编辑结果。它支持 `part_fsq`、`residual_part_fsq`、`latent_residual_fsq` 和 `latent_residual_fsq_v2`；Flat-FSQ 没有 part layout，不支持该 pipeline。
+
+```bash
+python -m stylized_motion.run \
+  --mode visualize --pipeline part-edit \
+  --checkpoint outputs/latent_residual_fsq_v2_40x9/best.pt \
+  --feature-database data/processed/100style_pruned_90/feature_database \
+  --target-range-idx 0 --target-start 0 \
+  --donor-range-idx 16 --donor-start 0 \
+  --length 240 \
+  --part left_arm \
+  --compare-with target \
+  --device cuda
+```
+
+可编辑部位为 `torso`、`left_leg`、`right_leg`、`left_arm` 和 `right_arm`。`--compare-with target` 用于观察非目标部位是否保持，`--compare-with donor` 用于观察目标部位是否接近 donor。
+
+不同 family 保留各自的编辑语义：Part-FSQ 和 Residual Part-FSQ 替换对应 part 的 code group；旧 Latent Residual-FSQ 迁移 donor latent residual；V2 使用 donor base-conditioned state 相对 target base 重新计算 compensated residual。pipeline 会按模型的 63 帧历史需求读取 target/donor 上下文，并在展示前裁掉历史帧。
+
+无窗口检查与 debug 输出：
+
+```bash
+python -m stylized_motion.run \
+  --mode visualize --pipeline part-edit \
+  --checkpoint outputs/latent_residual_fsq_v2_40x9/best.pt \
+  --feature-database data/processed/100style_pruned_90/feature_database \
+  --target-range-idx 0 --target-start 0 \
+  --donor-range-idx 16 --donor-start 0 \
+  --length 240 --part left_arm \
+  --device cuda --dry-run --save-debug
+```
+
+默认输出位于：
+
+```text
+outputs/latent_residual_fsq_v2_40x9/part_edit_visualization/
+  target_000_donor_016_left_arm/
+    target_source_features.npy
+    donor_source_features.npy
+    target_recon_features.npy
+    donor_recon_features.npy
+    edited_features.npy
+    target_indices.npy
+    donor_indices.npy
+    metadata.json
+```
+
+Part-FSQ 和 Residual Part-FSQ 还会保存 `edited_indices.npy`。终端输出中的 `target_part_change` 表示被编辑 feature partition 相对 target reconstruction 的平均变化，`non_target_change` 表示其他 partition 的平均变化；二者用于快速辅助观察，不是训练或正式评估指标。
+
+`target-range-idx` 和 `donor-range-idx` 是 FeatureStore range index，`target-start` 和 `donor-start` 是各自 range 内的相对帧。checkpoint 与 FeatureStore 必须具有相同的 structural feature schema 和 skeleton；如果 normalization statistics 不同，pipeline 会先还原 raw feature，再按 checkpoint statistics 重新标准化。
+
+### 10.3 GenoView
 
 ```bash
 python -m stylized_motion.run \
@@ -348,20 +439,20 @@ python -m stylized_motion.run \
 python -m stylized_motion.run \
   --mode visualize --pipeline genoview \
   --features outputs/sequence_debug/recon_features.npy \
-  --stats-source data/processed/100style_pruned/feature_database
+  --stats-source data/processed/100style_pruned_90/feature_database
 ```
 
 GenoView 支持播放、暂停、逐帧移动、速度调整、时间轴拖拽和相机交互。
 
-### 10.3 实时 FSQ rollout
+### 10.4 实时 FSQ rollout
 
 ```bash
 python -m stylized_motion.run \
   --mode visualize --pipeline realtime \
   --generator-checkpoint outputs/generator_flat_fsq_40x9/best.pt \
   --fsq-checkpoint outputs/flat_fsq_40x9/best.pt \
-  --token-database data/processed/100style_pruned/flat_fsq_40x9 \
-  --feature-database data/processed/100style_pruned/feature_database \
+  --token-database data/processed/100style_pruned_90/flat_fsq_40x9 \
+  --feature-database data/processed/100style_pruned_90/feature_database \
   --seed-source reencode --range-idx 0 --seed-frames 64 --device cuda
 ```
 
@@ -372,8 +463,8 @@ python -m stylized_motion.run \
   --mode visualize --pipeline realtime \
   --generator-checkpoint outputs/generator_flat_fsq_40x9/best.pt \
   --fsq-checkpoint outputs/flat_fsq_40x9/best.pt \
-  --token-database data/processed/100style_pruned/flat_fsq_40x9 \
-  --feature-database data/processed/100style_pruned/feature_database \
+  --token-database data/processed/100style_pruned_90/flat_fsq_40x9 \
+  --feature-database data/processed/100style_pruned_90/feature_database \
   --dry-run --dry-run-frames 120
 ```
 
@@ -391,4 +482,4 @@ python -m compileall -q stylized_motion
 
 ## 12. 当前边界
 
-当前主训练路径是四条 FSQ representation。Generator 已有独立训练和生成路径，但尚未与 representation runner 共用 TensorBoard writer；legacy VQ-VAE 仅用于 baseline。data 层不负责 model、optimizer、loss、AMP、checkpoint 或 device transfer；learning 层不直接访问 shard 文件。
+当前主训练路径是五条 FSQ representation，其中 `latent_residual_fsq` 保留为旧实现对照，新增实验应优先使用独立的 `latent_residual_fsq_v2` family。Generator 已有独立训练和生成路径，但尚未与 representation runner 共用 TensorBoard writer；legacy VQ-VAE 仅用于 baseline。data 层不负责 model、optimizer、loss、AMP、checkpoint 或 device transfer；learning 层不直接访问 shard 文件。

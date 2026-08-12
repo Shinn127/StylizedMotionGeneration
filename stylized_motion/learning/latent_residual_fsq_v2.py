@@ -122,7 +122,11 @@ class LatentResidualPartFSQV2MotionAutoencoder(nn.Module):
         return self.part_quantizers[self._part_family(part)]
 
     def _quantize(self, quantizer: MotionFSQ, state: torch.Tensor, collect_metrics: bool):
-        embedding, codes, indices, _, *stats = quantizer(state.permute(0, 2, 1).contiguous(), collect_stats=collect_metrics)
+        embedding, codes, indices, _, *stats = quantizer(
+            state.permute(0, 2, 1).contiguous(),
+            collect_stats=collect_metrics,
+            collect_sequence_stats=False,
+        )
         return embedding.permute(0, 2, 1).contiguous(), codes, indices, tuple(stats)
 
     def _encode(self, x: torch.Tensor, collect_metrics: bool):

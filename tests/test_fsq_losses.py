@@ -1,6 +1,7 @@
 import torch
+import pytest
 
-from stylized_motion.learning.fsq import FSQMotionAutoencoder
+from stylized_motion.learning.fsq import FSQMotionAutoencoder, MotionFSQ
 from stylized_motion.learning.losses import (
     compute_motion_reconstruction_losses,
     denormalize_motion_features,
@@ -49,6 +50,17 @@ def test_fsq_codes_roundtrip_and_ste_gradient():
     output["fsq_codes"].sum().backward()
     assert motion.grad is not None
     assert torch.count_nonzero(motion.grad) > 0
+
+
+def test_motion_fsq_can_skip_sequence_statistics():
+    quantizer = MotionFSQ(code_dim=8, num_coordinates=5, num_levels=9)
+    quantizer._sequence_stats = lambda _indices: pytest.fail("sequence statistics should be skipped")
+    z = torch.randn(2, 8, 64)
+    result = quantizer(z, collect_stats=True, collect_sequence_stats=False)
+    assert result[4].isfinite()
+    assert result[10].item() == 0.0
+    assert result[11].item() == 0.0
+    assert result[12].item() == 0.0
 
 
 def test_joint_and_foot_losses_use_target_contact_gates():

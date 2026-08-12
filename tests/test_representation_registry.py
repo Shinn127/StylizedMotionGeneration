@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from stylized_motion.learning.representation import (
@@ -209,3 +210,77 @@ def test_common_runner_owns_train_validate_test_lifecycle(tmp_path):
     assert train["global_step"] == 2
     assert validate["mode"] == "val"
     assert test["mode"] == "test"
+
+
+def test_compact_output_preserves_the_uniform_training_contract():
+    torch.manual_seed(21)
+    motion = torch.randn(1, 64, 230)
+    for filename in (
+        "flat_fsq_40x9.yaml",
+        "part_fsq_40x9.yaml",
+        "residual_part_fsq_40x9.yaml",
+        "latent_residual_fsq_40x9.yaml",
+        "latent_residual_fsq_v2_40x9.yaml",
+    ):
+        representation = build_representation(_config(filename))
+        with torch.no_grad():
+            full = representation(motion, collect_metrics=False)
+            compact = representation(motion, collect_metrics=False, compact_output=True)
+        for key in ("recon_state", "codes", "indices", "commit_loss", "representation_metrics"):
+            assert key in compact
+        torch.testing.assert_close(compact["recon_state"], full["recon_state"])
+        torch.testing.assert_close(compact["codes"], full["codes"])
+        torch.testing.assert_close(compact["indices"], full["indices"])
+        assert "fsq_codes" not in compact
+        assert "group_codes" not in compact
+        assert "group_indices" not in compact
+        assert "part_codes" not in compact
+        assert "part_indices" not in compact
+        assert "part_residuals" not in compact
+        assert "part_latent_residuals" not in compact
+
+
+class _MetricIntervalProbe(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.zeros(()))
+        self.metric_flags: list[bool] = []
+
+    def forward(self, motion, *, collect_metrics, compact_output):
+        self.metric_flags.append(bool(collect_metrics))
+        output = {
+            "recon_state": motion + self.scale,
+            "codes": torch.zeros((*motion.shape[:2], 40), device=motion.device),
+            "indices": torch.zeros((*motion.shape[:2], 40), dtype=torch.long, device=motion.device),
+            "commit_loss": motion.new_zeros(()),
+        }
+        if collect_metrics:
+            output["representation_metrics"] = {"probe": motion.new_ones(())}
+        return output
+
+
+def test_training_metrics_interval_samples_without_changing_loss_frequency(tmp_path):
+    probe = _MetricIntervalProbe()
+    loader = DataLoader([{"motion": torch.zeros(64, 230)} for _ in range(5)], batch_size=1)
+    runner = RepresentationRunner(
+        probe,
+        family=FLAT_FSQ_FAMILY,
+        train_loader=loader,
+        val_loader=None,
+        test_loader=None,
+        loss_fn=lambda output, batch: {"loss": output["recon_state"].square().mean()},
+        metric_suite={},
+        checkpoint_manager=CheckpointManager(tmp_path),
+        config={"evaluation": {"metrics_interval": 2}},
+        feature_schema={},
+        feature_stats={},
+        device=torch.device("cpu"),
+        epochs=1,
+        optimizer=torch.optim.SGD(probe.parameters(), lr=0.001),
+    )
+    result = runner.train_epoch(1)
+    assert probe.metric_flags == [True, False, True, False, True]
+    assert result["samples"] == 5.0
+    assert result["valid_frames"] == 5.0 * 64.0
+    assert "loss" in result
+    assert "representation/probe" in result

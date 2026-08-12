@@ -204,7 +204,7 @@ def build_loss_fn(representation: RepresentationProtocol, context: Mapping[str, 
         loss_mask = batch.get("loss_mask")
         if not isinstance(loss_mask, torch.Tensor) or loss_mask.shape != motion.shape[:2]:
             raise ValueError("Canonical representation batches require loss_mask with shape [B,64]")
-        if not bool(loss_mask.to(dtype=torch.bool).all()):
+        if batch.get("_all_frames_valid") is not True and not bool(loss_mask.to(dtype=torch.bool).all()):
             raise ValueError("Canonical 64-frame representation batches require all loss_mask values to be true")
         loss_values = compute_motion_reconstruction_losses(
             batch_motion=motion,
@@ -254,6 +254,64 @@ def _scalar(value: Any) -> float:
             raise ValueError("Runner metrics must be scalar")
         return float(value.detach().cpu())
     return float(value)
+
+
+class _DeviceMetricAccumulator:
+    """Accumulate scalar metrics on-device and transfer them once per epoch."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.sums: dict[str, torch.Tensor] = {}
+        self.weights: dict[str, int] = {}
+
+    def update(self, values: Mapping[str, Any], weight: int) -> None:
+        if weight <= 0:
+            return
+        for name, value in values.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    raise ValueError(f"Runner metrics must be scalar: {name}")
+                tensor = value.detach().float()
+            else:
+                tensor = torch.as_tensor(float(value), dtype=torch.float32, device=self.device)
+            if tensor.device != self.device:
+                tensor = tensor.to(self.device)
+            weighted = tensor * float(weight)
+            self.sums[name] = weighted if name not in self.sums else self.sums[name] + weighted
+            self.weights[name] = self.weights.get(name, 0) + int(weight)
+
+    def finalize(self) -> dict[str, float]:
+        if not self.sums:
+            return {}
+        names = sorted(self.sums)
+        sums = torch.stack([self.sums[name] for name in names])
+        weights = torch.tensor(
+            [float(self.weights[name]) for name in names],
+            dtype=sums.dtype,
+            device=sums.device,
+        )
+        packed = torch.cat((sums, weights), dim=0)
+        reduce_device = self.device if self.device.type in {"cpu", "cuda"} else torch.device("cpu")
+        if packed.device != reduce_device:
+            packed = packed.to(reduce_device)
+        if distributed.is_available() and distributed.is_initialized():
+            distributed.all_reduce(packed, op=distributed.ReduceOp.SUM)
+        packed = packed.cpu()
+        return {
+            name: float(packed[index] / max(float(packed[len(names) + index]), 1.0))
+            for index, name in enumerate(names)
+        }
+
+
+def _reduce_counts(device: torch.device, *counts: int) -> tuple[float, ...]:
+    values = torch.tensor(
+        [float(count) for count in counts],
+        dtype=torch.float64,
+        device=device if device.type in {"cpu", "cuda"} else torch.device("cpu"),
+    )
+    if distributed.is_available() and distributed.is_initialized():
+        distributed.all_reduce(values, op=distributed.ReduceOp.SUM)
+    return tuple(float(value) for value in values.cpu().tolist())
 
 
 def _unwrap(model: nn.Module) -> nn.Module:
@@ -307,6 +365,12 @@ class RepresentationRunner:
         self.writer = writer
         self.global_step = 0
         self.best_val: float | None = None
+        evaluation = self.config.get("evaluation", {})
+        if not isinstance(evaluation, Mapping):
+            raise ValueError("evaluation config must be a mapping")
+        self.metrics_interval = int(evaluation.get("metrics_interval", 100))
+        if self.metrics_interval <= 0:
+            raise ValueError("evaluation.metrics_interval must be positive")
         if self.precision not in {"fp32", "amp"}:
             raise ValueError("training.precision must be fp32 or amp")
         if self.precision == "amp" and device.type != "cuda":
@@ -325,7 +389,7 @@ class RepresentationRunner:
         else:
             yield
 
-    def _forward(self, batch: Batch) -> dict[str, Any]:
+    def _forward(self, batch: Batch, *, collect_metrics: bool, compact_output: bool) -> dict[str, Any]:
         motion = batch["motion"]
         if not isinstance(motion, torch.Tensor) or not _matches_requested_device(motion.device, self.device):
             raise ValueError("Runner expects a device batch produced by move_batch_to_device()")
@@ -333,7 +397,11 @@ class RepresentationRunner:
             raise ValueError("Canonical representation runner requires motion with shape [B,64,motion_dim]")
         with self._autocast():
             if self.family == "latent_residual_fsq_v2":
-                kwargs: dict[str, Any] = {"collect_metrics": True, "decode_base": True}
+                kwargs: dict[str, Any] = {
+                    "collect_metrics": collect_metrics,
+                    "compact_output": compact_output,
+                    "decode_base": True,
+                }
                 if self.representation.training and motion.shape[0] > 1:
                     part_index = self.global_step % len(PART_NAMES)
                     kwargs["edit_part"] = PART_NAMES[part_index]
@@ -341,40 +409,47 @@ class RepresentationRunner:
                         torch.arange(motion.shape[0], device=motion.device), shifts=1
                     )
                 return self.representation(motion, **kwargs)
-            return self.representation(motion, collect_metrics=True)
+            return self.representation(
+                motion,
+                collect_metrics=collect_metrics,
+                compact_output=compact_output,
+            )
 
-    def _record(self, output: Mapping[str, Any], batch: Batch, loss_values: Mapping[str, torch.Tensor]) -> dict[str, float]:
-        result = {name: _scalar(value) for name, value in loss_values.items()}
+    def _metric_values(
+        self,
+        output: Mapping[str, Any],
+        batch: Batch,
+        loss_values: Mapping[str, torch.Tensor],
+        *,
+        collect_metrics: bool,
+    ) -> dict[str, Any]:
+        result = dict(loss_values)
+        if not collect_metrics:
+            return result
         metrics = output.get("representation_metrics", {})
         if isinstance(metrics, Mapping):
             for name, value in metrics.items():
                 if isinstance(value, (torch.Tensor, float, int)):
-                    result[f"representation/{name}"] = _scalar(value)
+                    result[f"representation/{name}"] = value
         for name, callback in self.metric_suite.items():
-            result[name] = _scalar(callback(output, batch))
+            result[name] = callback(output, batch)
         return result
 
     @staticmethod
-    def _reduce_totals(
-        total: dict[str, float],
-        count: int,
-        device: torch.device,
-    ) -> tuple[dict[str, float], float]:
-        if not distributed.is_available() or not distributed.is_initialized():
-            return total, float(count)
-        names = sorted(total)
-        reduce_device = device if device.type in {"cpu", "cuda"} else torch.device("cpu")
-        values = torch.tensor(
-            [float(count), *(float(total[name]) for name in names)],
-            dtype=torch.float64,
-            device=reduce_device,
-        )
-        distributed.all_reduce(values, op=distributed.ReduceOp.SUM)
-        return {name: float(values[index + 1].item()) for index, name in enumerate(names)}, float(values[0].item())
-
-    @staticmethod
-    def _average(total: dict[str, float], count: float) -> dict[str, float]:
-        return {name: value / max(count, 1.0) for name, value in total.items()}
+    def _validate_cpu_batch(batch: Batch) -> int:
+        motion = batch.get("motion")
+        loss_mask = batch.get("loss_mask")
+        if not isinstance(motion, torch.Tensor):
+            raise ValueError("Canonical representation batches require a motion tensor")
+        if loss_mask is None:
+            return int(motion.shape[0] * motion.shape[1])
+        if not isinstance(loss_mask, torch.Tensor):
+            raise ValueError("Canonical representation loss_mask must be a tensor")
+        if loss_mask.shape != motion.shape[:2]:
+            raise ValueError("Canonical representation batches require loss_mask with shape [B,64]")
+        if not bool(loss_mask.to(dtype=torch.bool).all()):
+            raise ValueError("Canonical 64-frame representation batches require all loss_mask values to be true")
+        return int(loss_mask.numel())
 
     def evaluate(self, split: str) -> dict[str, Any]:
         if split not in {"val", "test"}:
@@ -383,11 +458,11 @@ class RepresentationRunner:
         if loader is None:
             raise ValueError(f"No loader configured for {split}")
         self.representation.eval()
-        total: dict[str, float] = {}
-        count = 0
+        accumulator = _DeviceMetricAccumulator(self.device)
         sample_count = 0
+        valid_frame_count = 0
         data_wait = 0.0
-        step_time = 0.0
+        started = time.perf_counter()
         iterator = iter(loader)
         with torch.inference_mode():
             while True:
@@ -397,39 +472,48 @@ class RepresentationRunner:
                 except StopIteration:
                     break
                 data_wait += time.perf_counter() - wait_started
-                step_started = time.perf_counter()
+                valid_frames = self._validate_cpu_batch(batch)
+                batch = dict(batch)
+                batch["_all_frames_valid"] = True
+                batch["_valid_frames"] = valid_frames
                 device_batch = move_batch_to_device(batch, self.device)
-                output = self._forward(device_batch)
+                output = self._forward(
+                    device_batch,
+                    collect_metrics=True,
+                    compact_output=not bool(self.metric_suite),
+                )
                 values = self.loss_fn(output, device_batch)
-                record = self._record(output, device_batch, values)
-                batch_count = int(device_batch.get("loss_mask", torch.ones(device_batch["motion"].shape[:2], dtype=torch.bool, device=self.device)).sum())
+                record = self._metric_values(
+                    output, device_batch, values, collect_metrics=True
+                )
+                accumulator.update(record, valid_frames)
                 sample_count += int(device_batch["motion"].shape[0])
-                for name, value in record.items():
-                    total[name] = total.get(name, 0.0) + value * batch_count
-                count += batch_count
-                step_time += time.perf_counter() - step_started
-        total, reduced_count = self._reduce_totals(total, count, self.device)
-        elapsed = max(data_wait + step_time, 1e-8)
+                valid_frame_count += valid_frames
+        metrics = accumulator.finalize()
+        elapsed = max(time.perf_counter() - started, 1e-8)
+        reduced_count, reduced_samples = _reduce_counts(
+            self.device, valid_frame_count, sample_count
+        )
+        step_time = max(elapsed - data_wait, 0.0)
         return {
             "mode": split,
-            "metrics": self._average(total, reduced_count),
+            "metrics": metrics,
             "valid_frames": reduced_count,
-            "samples": float(sample_count),
+            "samples": reduced_samples,
             "data_wait_seconds": data_wait,
             "step_time_seconds": step_time,
             "target_frames_per_second": reduced_count / elapsed,
-            "samples_per_second": sample_count / max(elapsed, 1e-8),
+            "samples_per_second": reduced_samples / max(elapsed, 1e-8),
         }
 
     def train_epoch(self, epoch: int) -> dict[str, float]:
         if self.train_loader is None or self.optimizer is None:
             raise ValueError("Training requires train_loader and optimizer")
         self.representation.train()
-        total: dict[str, float] = {}
+        accumulator = _DeviceMetricAccumulator(self.device)
         count = 0
         sample_count = 0
         data_wait = 0.0
-        step_time = 0.0
         started = time.perf_counter()
         sampler = getattr(self.train_loader, "sampler", None)
         if sampler is not None and hasattr(sampler, "set_epoch"):
@@ -442,10 +526,18 @@ class RepresentationRunner:
             except StopIteration:
                 break
             data_wait += time.perf_counter() - wait_started
-            step_started = time.perf_counter()
+            valid_frames = self._validate_cpu_batch(batch)
+            batch = dict(batch)
+            batch["_all_frames_valid"] = True
+            batch["_valid_frames"] = valid_frames
+            collect_metrics = self.global_step % self.metrics_interval == 0
             self.optimizer.zero_grad(set_to_none=True)
             device_batch = move_batch_to_device(batch, self.device)
-            output = self._forward(device_batch)
+            output = self._forward(
+                device_batch,
+                collect_metrics=collect_metrics,
+                compact_output=not bool(self.metric_suite),
+            )
             values = self.loss_fn(output, device_batch)
             loss = values["loss"]
             if self.precision == "amp":
@@ -460,27 +552,33 @@ class RepresentationRunner:
                 if self.grad_clip_norm and self.grad_clip_norm > 0:
                     nn.utils.clip_grad_norm_(self.representation.parameters(), self.grad_clip_norm)
                 self.optimizer.step()
+            record = self._metric_values(
+                output,
+                device_batch,
+                values,
+                collect_metrics=collect_metrics,
+            )
+            accumulator.update(record, valid_frames)
             self.global_step += 1
-            record = self._record(output, device_batch, values)
-            batch_count = int(device_batch.get("loss_mask", torch.ones(device_batch["motion"].shape[:2], dtype=torch.bool, device=self.device)).sum())
+            count += valid_frames
             sample_count += int(device_batch["motion"].shape[0])
-            for name, value in record.items():
-                total[name] = total.get(name, 0.0) + value * batch_count
-            count += batch_count
-            step_time += time.perf_counter() - step_started
-            if self.writer is not None:
-                self.writer.add_scalar("train/step_loss", record["loss"], self.global_step)
+            if self.writer is not None and collect_metrics:
+                self.writer.add_scalar(
+                    "train/step_loss",
+                    float(values["loss"].detach().cpu()),
+                    self.global_step,
+                )
         if self.scheduler is not None:
             self.scheduler.step()
-        total, reduced_count = self._reduce_totals(total, count, self.device)
-        result = self._average(total, reduced_count)
+        result = accumulator.finalize()
+        reduced_count, reduced_samples = _reduce_counts(self.device, count, sample_count)
         elapsed = max(time.perf_counter() - started, 1e-8)
         result["valid_frames"] = reduced_count
-        result["samples"] = float(sample_count)
+        result["samples"] = reduced_samples
         result["data_wait_seconds"] = data_wait
-        result["step_time_seconds"] = step_time
+        result["step_time_seconds"] = max(elapsed - data_wait, 0.0)
         result["target_frames_per_second"] = reduced_count / elapsed
-        result["samples_per_second"] = sample_count / elapsed
+        result["samples_per_second"] = reduced_samples / elapsed
         return result
 
     def checkpoint_payload(self, epoch: int, metrics: Mapping[str, Any]) -> dict[str, object]:

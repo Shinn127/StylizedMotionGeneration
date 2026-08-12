@@ -36,6 +36,7 @@ COMMANDS: dict[tuple[str, str], str] = {
     ("train", "generator"): "stylized_motion.learning.generate",
     ("generate", "motion"): "stylized_motion.learning.generate",
     ("visualize", "motion"): "stylized_motion.anim.view_motion_sequence",
+    ("visualize", "part-edit"): "stylized_motion.anim.view_part_edit",
     ("visualize", "genoview"): "stylized_motion.anim.genoview",
     ("visualize", "realtime"): "stylized_motion.anim.realtime_fsq_controller",
     ("visualize", "plot"): "stylized_motion.anim.visualization",

@@ -322,6 +322,8 @@ class RepresentationAdapter(nn.Module):
         return required_history_frames(self.receptive_field, self.lookahead_frames)
 
     def forward(self, motion: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
+        compact_output = bool(kwargs.pop("compact_output", False))
+        collect_metrics = bool(kwargs.get("collect_metrics", True))
         output = self.module(motion, **kwargs)
         if not isinstance(output, Mapping):
             raise TypeError("Representation forward() must return a mapping")
@@ -331,7 +333,9 @@ class RepresentationAdapter(nn.Module):
         if result.get("codes") is None:
             raise ValueError("Representation output is missing codes")
         metrics = result.get("representation_metrics")
-        if metrics is None:
+        if not collect_metrics:
+            metrics = {}
+        elif metrics is None:
             standard = {
                 "recon_state", "indices", "codes", "fsq_codes", "commit_loss",
                 "group_codes", "group_indices", "base_codes", "base_indices",
@@ -341,6 +345,15 @@ class RepresentationAdapter(nn.Module):
             }
             metrics = {key: value for key, value in result.items() if key not in standard}
         result["representation_metrics"] = metrics
+        if compact_output:
+            keep = {"recon_state", "codes", "indices", "commit_loss", "representation_metrics"}
+            if self.family in {RESIDUAL_PART_FSQ_FAMILY, LATENT_RESIDUAL_FSQ_FAMILY}:
+                keep.add("base_codes")
+            if self.family == LATENT_RESIDUAL_FSQ_FAMILY:
+                keep.add("latent_residual_energy")
+            if self.family == LATENT_RESIDUAL_FSQ_V2_FAMILY:
+                keep.update({"base_recon_state", "edit_recon_state", "edit_part", "donor_permutation"})
+            result = {key: result[key] for key in keep if key in result}
         return result
 
     def encode_to_indices(self, motion: torch.Tensor) -> torch.Tensor:

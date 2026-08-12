@@ -251,6 +251,7 @@ class LatentResidualPartFSQMotionAutoencoder(ResidualPartFSQMotionAutoencoder):
         decode_base: bool = False,
         edit_part: str | None = None,
         donor_permutation: torch.Tensor | None = None,
+        collect_diagnostics: bool = False,
     ):
         base = self._validate_embeddings(embeddings)
         fused, residuals, total_residual = self._fuse_embeddings(embeddings)
@@ -282,8 +283,11 @@ class LatentResidualPartFSQMotionAutoencoder(ResidualPartFSQMotionAutoencoder):
         residual_energy = torch.stack(
             [value.square().mean(dim=-1) for value in residuals.values()], dim=0
         ).mean(dim=0)
-        base_rms = base.square().mean().sqrt().clamp_min(1e-7)
-        latent_to_base_ratio = total_residual.square().mean().sqrt() / base_rms
+        if collect_diagnostics:
+            base_rms = base.square().mean().sqrt().clamp_min(1e-7)
+            latent_to_base_ratio = total_residual.square().mean().sqrt() / base_rms
+        else:
+            latent_to_base_ratio = None
         return (
             decoded_by_name["recon"],
             decoded_by_name.get("base"),
@@ -308,6 +312,7 @@ class LatentResidualPartFSQMotionAutoencoder(ResidualPartFSQMotionAutoencoder):
                 decode_base=decode_base,
                 edit_part=edit_part,
                 donor_permutation=donor_permutation,
+                collect_diagnostics=collect_metrics,
             )
         )
         output: dict[str, object] = {

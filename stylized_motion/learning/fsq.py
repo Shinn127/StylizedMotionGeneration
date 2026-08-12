@@ -95,7 +95,12 @@ class MotionFSQ(nn.Module):
             )
         return self.fsq.project_out(codes).permute(0, 2, 1).contiguous()
 
-    def forward(self, z: torch.Tensor, collect_stats: bool = True):
+    def forward(
+        self,
+        z: torch.Tensor,
+        collect_stats: bool = True,
+        collect_sequence_stats: bool = True,
+    ):
         projected = self.project_to_coordinates(z)
         codes, indices = self.quantize_coordinates(projected)
         quantized = self.project_codes_to_latent(codes)
@@ -108,7 +113,11 @@ class MotionFSQ(nn.Module):
                 level_usage_min,
                 level_usage_max,
             ) = self._usage_stats(indices)
-            tuple_unique_ratio, tuple_change_rate, coordinate_change_rate = self._sequence_stats(indices)
+            if collect_sequence_stats:
+                tuple_unique_ratio, tuple_change_rate, coordinate_change_rate = self._sequence_stats(indices)
+            else:
+                zero = quantized.new_zeros(())
+                tuple_unique_ratio, tuple_change_rate, coordinate_change_rate = (zero,) * 3
         else:
             zero = quantized.new_zeros(())
             (

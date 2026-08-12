@@ -228,7 +228,9 @@ class ResidualPartFSQMotionAutoencoder(nn.Module):
         quantizer: MotionFSQ, state_bt: torch.Tensor, collect_metrics: bool
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
         embedding, codes, indices, _, *stats = quantizer(
-            state_bt.permute(0, 2, 1).contiguous(), collect_stats=collect_metrics
+            state_bt.permute(0, 2, 1).contiguous(),
+            collect_stats=collect_metrics,
+            collect_sequence_stats=False,
         )
         return embedding.permute(0, 2, 1).contiguous(), codes, indices, tuple(stats)
 
