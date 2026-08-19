@@ -34,7 +34,7 @@ RAW_DIR = DATA_DIR / "raw"
 LAFAN_SOURCE = RAW_DIR / "lafan"
 STYLE100_SOURCE = RAW_DIR / "100style"
 
-STYLE100_CLIPS = ["BR", "BW", "FR", "FW", "ID", "SR", "SW", "TR1", "TR2", "TR3"]
+STYLE100_CLIPS = ["BR", "BW", "FR", "FW", "ID", "SR", "SW", "TR1"]
 FINGER_TOKENS = ("Thumb", "Index", "Middle", "Ring", "Pinky")
 MOTION_FRAME_KEYS = ("positions", "velocities", "rotations", "angular_velocities", "contacts")
 UNKNOWN_LABEL = "__unknown__"

@@ -15,6 +15,7 @@ from stylized_motion.data.feature_data import (
 )
 from stylized_motion.data.preprocess import (
     MotionDatabaseWriter,
+    STYLE100_CLIPS,
     UNKNOWN_LABEL,
     _SourceClip,
     _clip_tags,
@@ -138,6 +139,12 @@ def test_slice_motion_crops_only_frame_aligned_values():
 def test_lafan_labels_remain_unclassified_until_taxonomy_is_defined(tmp_path: Path):
     clip = _SourceClip("lafan/walk1_subject1", tmp_path / "walk1_subject1.bvh", 0, 10, UNKNOWN_LABEL, UNKNOWN_LABEL)
     assert _clip_tags(clip) == [("lafan/walk1_subject1", "all", 0, 10)]
+
+
+def test_100style_action_list_excludes_sparse_tr3():
+    assert "TR3" not in STYLE100_CLIPS
+    assert "TR2" not in STYLE100_CLIPS
+    assert STYLE100_CLIPS[-1] == "TR1"
 
 
 def test_combined_discovery_uses_dataset_prefixes_and_cut_intervals(monkeypatch, tmp_path: Path):
