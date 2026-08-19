@@ -70,7 +70,7 @@ python -m stylized_motion.run \
   --workers 8
 ```
 
-支持的数据集入口是 `lafan` 和 `100style`；`--styles` 可筛选样式，`--max-styles` 适合小规模试跑。
+支持的数据集入口是 `lafan`、`100style` 和 `combined`；`--styles` 可筛选 100style 样式，`--max-styles` 适合小规模试跑。LAFAN 当前只保留 source clip，不推断 style/action 标签。
 
 ### 3.2 FeatureStore
 
@@ -86,6 +86,20 @@ python -m stylized_motion.run \
   --workers 8 \
   --overwrite
 ```
+
+联合构建时，LAFAN 使用完整 source clip，100style 使用 `Frame_Cuts.csv` 的 `[START, STOP)` 区间；两者共同计算 train normalization：
+
+```bash
+python -m stylized_motion.run \
+  --mode preprocess --pipeline feature-database \
+  --dataset combined \
+  --output data/processed/combined_pruned/feature_database \
+  --prune-ends-and-fingers \
+  --workers 1 \
+  --overwrite
+```
+
+combined Store 的 `range_names` 使用 `lafan/<clip>` 和 `100style/<style>_<clip>` 前缀，避免 source clip 冲突。LAFAN style/action taxonomy 留作后续 TODO。
 
 物理布局：
 

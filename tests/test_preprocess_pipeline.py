@@ -15,10 +15,15 @@ from stylized_motion.data.feature_data import (
 )
 from stylized_motion.data.preprocess import (
     MotionDatabaseWriter,
+    _build_shard_specs,
+    _clip_labels,
     _normalize_motion_shard,
+    _relative_tags,
     _save_motion_shard,
+    _slice_motion,
     validate_data,
 )
+import stylized_motion.data.preprocess as preprocess_module
 from stylized_motion.data.sampling import SampleRequest
 
 
@@ -116,6 +121,52 @@ def test_database_writer_preserves_ranges_and_clips_tags(tmp_path: Path):
         np.testing.assert_array_equal(data["range_mirror"], [False, True])
         assert data["positions"].shape == (6, 2, 3)
         assert data["joint_subset"].item() == "prune_ends_and_fingers"
+
+
+def test_slice_motion_crops_only_frame_aligned_values():
+    motion = _motion(10)
+    motion["positions"][:, 0, 0] = np.arange(10, dtype=np.float32)
+
+    clipped = _slice_motion(motion, 3, 8)
+
+    np.testing.assert_array_equal(clipped["positions"][:, 0, 0], [3, 4, 5, 6, 7])
+    assert clipped["parents"] is motion["parents"]
+    assert clipped["names"] is motion["names"]
+
+
+def test_lafan_labels_remain_unclassified_until_taxonomy_is_defined():
+    assert _clip_labels("lafan/walk1_subject1") == {"style": "", "action": ""}
+    assert _clip_labels("100style/Aeroplane_BR") == {"style": "Aeroplane", "action": "BR"}
+
+
+def test_combined_specs_use_dataset_prefixes_and_cut_intervals(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(preprocess_module, "LAFAN_SOURCE", tmp_path / "lafan")
+    monkeypatch.setattr(preprocess_module, "STYLE100_SOURCE", tmp_path / "100style")
+    monkeypatch.setattr(
+        preprocess_module,
+        "build_lafan_tags",
+        lambda prefix="lafan": [(f"{prefix}/walk1_subject1", "all", 0, None)],
+    )
+    monkeypatch.setattr(
+        preprocess_module,
+        "build_100style_tags",
+        lambda style_filter=None, max_styles=None, prefix=None: [
+            (f"{prefix}/Aeroplane_BR" if prefix else "Aeroplane_BR", "all", 10, 70),
+            (f"{prefix}/Aeroplane_BR" if prefix else "Aeroplane_BR", "style", 10, 70),
+        ],
+    )
+    monkeypatch.setattr(preprocess_module.bvh, "read_frame_count", lambda path: 100)
+
+    specs, tags, paths = _build_shard_specs("combined", None, None)
+
+    assert [str(spec["range_name"]) for spec in specs[::2]] == [
+        "lafan/walk1_subject1",
+        "100style/Aeroplane_BR",
+    ]
+    assert [int(spec["nframes"]) for spec in specs[::2]] == [100, 60]
+    assert len(paths) == 2
+    relative = _relative_tags(tags, specs)
+    assert ("100style/Aeroplane_BR", "style", 0, 60) in relative
 
 
 def test_normalize_motion_shard_updates_file_in_chunks(tmp_path: Path):

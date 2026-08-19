@@ -489,6 +489,22 @@ validate-data
 TrajectoryStore 时继承 manifest。`run.py` 负责 CLI dispatch 与 TokenEncoderProtocol
 注入。
 
+`feature-database --dataset combined` 联合构建 LAFAN 和 100style。LAFAN 使用完整 source
+clip，100style 使用 `Frame_Cuts.csv` 中的半开区间 `[START, STOP)`；两个数据集共同参与
+source-clip split 和 train normalization。combined range name 使用
+`lafan/<clip>` 或 `100style/<style>_<clip>` 前缀。LAFAN 的 style/action taxonomy 暂不从
+文件名推断，保留为空并作为后续 TODO。
+
+```bash
+python -m stylized_motion.run \
+  --mode preprocess --pipeline feature-database \
+  --dataset combined \
+  --output data/processed/combined_pruned/feature_database \
+  --prune-ends-and-fingers \
+  --workers 1 \
+  --overwrite
+```
+
 ## 11. Public API
 
 `stylized_motion.data` 只导出：
