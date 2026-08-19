@@ -525,6 +525,20 @@ def _feature_split_manifest(clips: list[_SourceClip], seed: int) -> tuple[SplitM
     return split, source_ids
 
 
+def _frame_split_intervals(clip: _SourceClip) -> list[tuple[str, int, int]]:
+    """Return train/val/test frame ranges for one source clip."""
+    frames = int(clip.nframes)
+    boundaries = (0, int(np.floor(frames * 0.8)), int(np.floor(frames * 0.9)), frames)
+    intervals = [
+        ("train", boundaries[0], boundaries[1]),
+        ("val", boundaries[1], boundaries[2]),
+        ("test", boundaries[2], boundaries[3]),
+    ]
+    if any(stop <= start for _split, start, stop in intervals):
+        raise ValueError(f"Clip {clip.range_name} is too short for frame-level train/val/test splitting")
+    return intervals
+
+
 def _normalize_motion_shard(path: Path, stats: MotionFeatureStats, chunk_size: int = 16384) -> None:
     motion = np.load(path, mmap_mode="r+", allow_pickle=False)
     if motion.dtype != np.float32 or motion.ndim != 2 or motion.shape[1] != len(stats.offset):
@@ -628,9 +642,13 @@ def build_feature_database(
             tags_data=[tag for clip in clips for tag in _clip_tags(clip)],
             prune_ends_and_fingers=prune_ends_and_fingers,
         )
+    frame_intervals = [_frame_split_intervals(clip) for clip in clips]
     train_masks = [
-        np.full(clip.nframes, split_manifest.split_by_source_clip[clip.range_name] == "train", dtype=bool)
-        for clip in clips
+        np.asarray(
+            [split == "train" for split, start, stop in frame_intervals[path_idx] for _ in range(stop - start)],
+            dtype=bool,
+        )
+        for path_idx in range(len(clips))
         for _mirror in (False, True)
     ]
     stats_accumulator = _FeatureStatsAccumulator()
@@ -671,7 +689,13 @@ def build_feature_database(
             _normalize_motion_shard(staging / relative, stats)
         if writer is not None:
             writer.save()
-        range_names = [clip.range_name for clip in clips for _mirror in (False, True)]
+        range_records = [
+            (clip, mirror, split_name, start, stop)
+            for clip, intervals in zip(clips, frame_intervals)
+            for mirror in (False, True)
+            for split_name, start, stop in intervals
+        ]
+        range_names = [clip.range_name for clip, _mirror, _split, _start, _stop in range_records]
         source_clip_names = list(split_manifest.source_clip_names)
         labels = {
             clip.range_name: {"style": clip.style, "action": clip.action}
@@ -682,33 +706,42 @@ def build_feature_database(
         style_to_id = {name: idx for idx, name in enumerate(style_names)}
         action_to_id = {name: idx for idx, name in enumerate(action_names)}
         style_ids = np.asarray(
-            [style_to_id[labels[name]["style"]] for name in range_names], dtype=np.int32
+            [style_to_id[labels[clip.range_name]["style"]] for clip, _mirror, _split, _start, _stop in range_records], dtype=np.int32
         )
         action_ids = np.asarray(
-            [action_to_id[labels[name]["action"]] for name in range_names], dtype=np.int32
+            [action_to_id[labels[clip.range_name]["action"]] for clip, _mirror, _split, _start, _stop in range_records], dtype=np.int32
         )
         split_ids = np.asarray(
             [
-                {"train": 0, "val": 1, "test": 2}[split_manifest.split_by_source_clip[name]]
-                for name in range_names
+                {"train": 0, "val": 1, "test": 2}[split_name]
+                for _clip, _mirror, split_name, _start, _stop in range_records
             ],
             dtype=np.uint8,
         )
-        source_clip_ids = np.asarray([source_ids[name] for name in range_names], dtype=np.int32)
-        clip_ids = np.arange(num_shards, dtype=np.int32)
+        source_clip_ids = np.asarray(
+            [source_ids[clip.range_name] for clip, _mirror, _split, _start, _stop in range_records], dtype=np.int32
+        )
         shard_frames = np.asarray([clip.nframes for clip in clips for _mirror in (False, True)], dtype=np.int64)
-        range_starts = np.zeros(num_shards, dtype=np.int64)
-        range_stops = shard_frames.copy()
+        range_shard_indices = np.asarray(
+            [clips.index(clip) * 2 + int(mirror) for clip, mirror, _split, _start, _stop in range_records],
+            dtype=np.int32,
+        )
+        # ``clip_ids`` is a range-level field and must have one entry per
+        # range, just like source/style/action/split metadata.  Each frame
+        # interval points into one of the underlying motion shards.
+        clip_ids = range_shard_indices.copy()
+        range_starts = np.asarray([start for _clip, _mirror, _split, start, _stop in range_records], dtype=np.int64)
+        range_stops = np.asarray([stop for _clip, _mirror, _split, _start, stop in range_records], dtype=np.int64)
         stats_payload = serialize_motion_feature_stats(stats, names=names, parents=parents, joint_subset=("prune_ends_and_fingers" if prune_ends_and_fingers else "full"))
         np.savez(
             staging / "index.npz",
             shard_num_frames=shard_frames,
             clip_ids=clip_ids,
             source_clip_ids=source_clip_ids,
-            range_shard_indices=np.arange(num_shards, dtype=np.int32),
+            range_shard_indices=range_shard_indices,
             range_starts=range_starts,
             range_stops=range_stops,
-            range_mirror=np.asarray([mirror for _clip in clips for mirror in (False, True)], dtype=bool),
+            range_mirror=np.asarray([mirror for _clip, mirror, _split, _start, _stop in range_records], dtype=bool),
             split_ids=split_ids,
             style_ids=style_ids,
             action_ids=action_ids,
@@ -750,6 +783,8 @@ def build_feature_database(
                 "parents": parents.tolist(),
             },
             "normalization_train_frames": int(stats_accumulator.count),
+            "split_policy": "frame_interval",
+            "frame_split_ratios": {"train": 0.8, "val": 0.1, "test": 0.1},
         }
         (staging / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=True, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         validate_data(feature_database=staging, full=True)
@@ -1165,6 +1200,26 @@ def build_trajectory_database(
 def _assert_source_split_disjoint(store: Any) -> None:
     source_ids = np.asarray(store.source_clip_ids, dtype=np.int32)
     split_ids = np.asarray(store.split_ids, dtype=np.uint8)
+    if str(getattr(store, "manifest", {}).get("split_policy", "source_clip")) == "frame_interval":
+        # Frame-level splitting intentionally places each source clip in all
+        # three splits. Validate that every source has all splits and that
+        # ranges within each mirrored shard do not overlap.
+        shard_ids = np.asarray(store.range_shard_indices, dtype=np.int32)
+        starts = np.asarray(store.range_starts, dtype=np.int64)
+        stops = np.asarray(store.range_stops, dtype=np.int64)
+        for source_id in sorted(set(source_ids.tolist())):
+            source_rows = np.flatnonzero(source_ids == source_id)
+            values = set(split_ids[source_rows].tolist())
+            if values != {0, 1, 2}:
+                raise ValueError(
+                    f"Source clip {source_id} must contain train/val/test frame ranges; got {sorted(values)}"
+                )
+            for shard_id in sorted(set(shard_ids[source_rows].tolist())):
+                rows = source_rows[shard_ids[source_rows] == shard_id]
+                ordered = rows[np.argsort(starts[rows])]
+                if np.any(starts[ordered[1:]] < stops[ordered[:-1]]):
+                    raise ValueError(f"Source clip {source_id} has overlapping frame ranges")
+        return
     for source_id in sorted(set(source_ids.tolist())):
         values = set(split_ids[source_ids == source_id].tolist())
         if len(values) != 1:
