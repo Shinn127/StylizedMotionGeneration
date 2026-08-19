@@ -24,7 +24,7 @@ def process_motion_pair(task):
             prune_ends_and_fingers=prune_ends_and_fingers,
         )
         motions.append((mirror, motion))
-    return path.stem, motions
+    return path, motions
 
 
 __all__ = ["process_motion_pair"]

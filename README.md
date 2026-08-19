@@ -99,7 +99,12 @@ python -m stylized_motion.run \
   --overwrite
 ```
 
-combined Store 的 `range_names` 使用 `lafan/<clip>` 和 `100style/<style>_<clip>` 前缀，避免 source clip 冲突。LAFAN style/action taxonomy 留作后续 TODO。
+`feature-database` 默认只写 FeatureStore，不会额外生成大型 `database.npz`。如果后续需要构建
+trajectory inputs，可显式添加 `--motion-database-output data/processed/combined/motion_database.npz`；
+独立的 `motion-database` pipeline 仍保持可用。LAFAN 的 style/action 使用 `__unknown__` 占位，
+不从文件名推断，taxonomy 留作后续 TODO。
+
+combined Store 的 `range_names` 使用 `lafan/<clip>` 和 `100style/<style>_<clip>` 前缀，避免 source clip 冲突。
 
 物理布局：
 

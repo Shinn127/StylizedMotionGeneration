@@ -493,7 +493,7 @@ TrajectoryStore 时继承 manifest。`run.py` 负责 CLI dispatch 与 TokenEncod
 clip，100style 使用 `Frame_Cuts.csv` 中的半开区间 `[START, STOP)`；两个数据集共同参与
 source-clip split 和 train normalization。combined range name 使用
 `lafan/<clip>` 或 `100style/<style>_<clip>` 前缀。LAFAN 的 style/action taxonomy 暂不从
-文件名推断，保留为空并作为后续 TODO。
+文件名推断，使用 `__unknown__` 占位并作为后续 TODO。
 
 ```bash
 python -m stylized_motion.run \
@@ -504,6 +504,9 @@ python -m stylized_motion.run \
   --workers 1 \
   --overwrite
 ```
+
+`feature-database` 默认不生成 raw `database.npz`。需要 trajectory preprocessing 时，显式传入
+`--motion-database-output <path>`，或单独运行 `motion-database`。
 
 ## 11. Public API
 

@@ -37,17 +37,23 @@ STYLE100_SOURCE = RAW_DIR / "100style"
 STYLE100_CLIPS = ["BR", "BW", "FR", "FW", "ID", "SR", "SW", "TR1", "TR2", "TR3"]
 FINGER_TOKENS = ("Thumb", "Index", "Middle", "Ring", "Pinky")
 MOTION_FRAME_KEYS = ("positions", "velocities", "rotations", "angular_velocities", "contacts")
+UNKNOWN_LABEL = "__unknown__"
 
 
 @dataclass(frozen=True)
 class _SourceClip:
     """One source clip and its effective frame interval."""
 
-    dataset: str
     range_name: str
     path: Path
     start: int
     stop: int
+    style: str
+    action: str
+
+    @property
+    def nframes(self) -> int:
+        return self.stop - self.start
 
 
 def _mirror_bones(names):
@@ -326,21 +332,13 @@ class MotionDatabaseWriter:
         self._temp_dir.cleanup()
 
 
-def build_lafan_tags(prefix: str | None = None):
-    tags = []
-    for path in sorted(LAFAN_SOURCE.glob("*.bvh")):
-        range_name = f"{prefix}/{path.stem}" if prefix else path.stem
-        tags.append((range_name, "all", 0, None))
-    return tags
-
-
-def build_100style_tags(style_filter=None, max_styles=None, prefix: str | None = None):
+def _read_100style_clips(style_filter: set[str] | None, max_styles: int | None) -> list[_SourceClip]:
     frame_cuts = STYLE100_SOURCE / "Frame_Cuts.csv"
-    tags = []
-    seen_styles = []
+    clips: list[_SourceClip] = []
+    seen_ranges: set[str] = set()
+    seen_styles: list[str] = []
     with frame_cuts.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+        for row in csv.DictReader(f):
             style_name = row["STYLE_NAME"].strip()
             if style_filter is not None and style_name not in style_filter:
                 continue
@@ -348,33 +346,78 @@ def build_100style_tags(style_filter=None, max_styles=None, prefix: str | None =
                 if len(seen_styles) >= max_styles:
                     continue
                 seen_styles.append(style_name)
-            for clip in STYLE100_CLIPS:
-                start_key = f"{clip}_START"
-                stop_key = f"{clip}_STOP"
-                start = row.get(start_key, "N/A")
-                stop = row.get(stop_key, "N/A")
-                if start == "N/A" or stop == "N/A":
+            for clip_name in STYLE100_CLIPS:
+                start_value = row.get(f"{clip_name}_START", "N/A")
+                stop_value = row.get(f"{clip_name}_STOP", "N/A")
+                if start_value == "N/A" or stop_value == "N/A":
                     continue
-                base_name = f"{style_name}_{clip}"
-                range_name = f"{prefix}/{base_name}" if prefix else base_name
-                tags.append((range_name, "all", int(start), int(stop)))
-                tags.append((range_name, style_name, int(start), int(stop)))
-                tags.append((range_name, clip, int(start), int(stop)))
-    return tags
+                range_name = f"{style_name}_{clip_name}"
+                if range_name in seen_ranges:
+                    continue
+                seen_ranges.add(range_name)
+                clips.append(
+                    _SourceClip(
+                        range_name=range_name,
+                        path=STYLE100_SOURCE / style_name / f"{range_name}.bvh",
+                        start=int(start_value),
+                        stop=int(stop_value),
+                        style=style_name,
+                        action=clip_name,
+                    )
+                )
+    return clips
 
 
-def source_path_for(dataset_name, range_name):
-    if "/" in str(range_name):
-        source_dataset, separator, source_name = str(range_name).partition("/")
-        if source_dataset not in {"lafan", "100style"}:
-            raise ValueError(f"Combined range name must be prefixed with a dataset: {range_name!r}")
-        dataset_name, range_name = source_dataset, source_name
+def _discover_source_clips(dataset_name: str, styles_arg: str | None, max_styles: int | None) -> list[_SourceClip]:
+    style_filter = _parse_style_filter(styles_arg)
+
+    def lafan_clips(prefix: str = "") -> list[_SourceClip]:
+        return [
+            _SourceClip(
+                range_name=f"{prefix}{path.stem}",
+                path=path,
+                start=0,
+                stop=int(bvh.read_frame_count(path)),
+                style=UNKNOWN_LABEL,
+                action=UNKNOWN_LABEL,
+            )
+            for path in sorted(LAFAN_SOURCE.glob("*.bvh"))
+        ]
+
+    def style_clips(prefix: str = "") -> list[_SourceClip]:
+        clips = _read_100style_clips(style_filter, max_styles)
+        if prefix:
+            clips = [
+                _SourceClip(
+                    range_name=f"{prefix}{clip.range_name}",
+                    path=clip.path,
+                    start=clip.start,
+                    stop=clip.stop,
+                    style=clip.style,
+                    action=clip.action,
+                )
+                for clip in clips
+            ]
+        for clip in clips:
+            frame_count = int(bvh.read_frame_count(clip.path))
+            if clip.start < 0 or clip.stop <= clip.start or clip.stop > frame_count:
+                raise ValueError(
+                    f"Invalid frame interval for {clip.range_name}: "
+                    f"[{clip.start}, {clip.stop}) with {frame_count} frames"
+                )
+        return clips
+
     if dataset_name == "lafan":
-        return LAFAN_SOURCE / f"{range_name}.bvh"
-    if dataset_name == "100style":
-        style_name, _sep, clip = range_name.rpartition("_")
-        return STYLE100_SOURCE / style_name / f"{range_name}.bvh"
-    raise ValueError(f"Unsupported dataset: {dataset_name}")
+        clips = lafan_clips()
+    elif dataset_name == "100style":
+        clips = style_clips()
+    elif dataset_name == "combined":
+        clips = [*lafan_clips("lafan/"), *style_clips("100style/")]
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+    if not clips:
+        raise FileNotFoundError(f"No BVH files found for dataset {dataset_name}")
+    return clips
 
 
 class _FeatureStatsAccumulator:
@@ -446,74 +489,16 @@ def _parse_style_filter(styles_arg: str | None) -> set[str] | None:
     return {item.strip() for item in styles_arg.split(",") if item.strip()}
 
 
-def _dataset_tags(dataset_name: str, styles_arg: str | None, max_styles: int | None) -> list[tuple[Any, ...]]:
-    style_filter = _parse_style_filter(styles_arg)
-    if dataset_name == "lafan":
-        return build_lafan_tags()
-    if dataset_name == "100style":
-        return build_100style_tags(style_filter=style_filter, max_styles=max_styles)
-    if dataset_name == "combined":
-        return [
-            *build_lafan_tags(prefix="lafan"),
-            *build_100style_tags(style_filter=style_filter, max_styles=max_styles, prefix="100style"),
-        ]
-    raise ValueError(f"Unsupported dataset: {dataset_name}")
-
-
-def _build_shard_specs(dataset_name: str, styles_arg: str | None, max_styles: int | None) -> tuple[list[dict[str, object]], list[tuple[Any, ...]], list[Path]]:
-    tags_data = _dataset_tags(dataset_name, styles_arg, max_styles)
-    clips: list[_SourceClip] = []
-    seen_names: set[str] = set()
-    for range_name, tag, start, stop in tags_data:
-        if tag != "all":
-            continue
-        range_name = str(range_name)
-        if range_name in seen_names:
-            continue
-        seen_names.add(range_name)
-        path = source_path_for(dataset_name, range_name)
-        frame_count = int(bvh.read_frame_count(path))
-        start = int(start)
-        stop = frame_count if stop is None else int(stop)
-        if start < 0 or stop <= start or stop > frame_count:
-            raise ValueError(
-                f"Invalid frame interval for {range_name}: [{start}, {stop}) with {frame_count} frames"
+def _clip_tags(clip: _SourceClip) -> list[tuple[str, str, int, int]]:
+    tags = [(clip.range_name, "all", 0, clip.nframes)]
+    if clip.style != UNKNOWN_LABEL:
+        tags.extend(
+            (
+                (clip.range_name, clip.style, 0, clip.nframes),
+                (clip.range_name, clip.action, 0, clip.nframes),
             )
-        clips.append(_SourceClip(dataset_name, range_name, path, start, stop))
-    if not clips:
-        raise FileNotFoundError(f"No BVH files found for dataset {dataset_name}")
-    specs = [
-        {
-            "range_name": clip.range_name,
-            "path": clip.path,
-            "frame_start": clip.start,
-            "frame_stop": clip.stop,
-            "mirror": bool(mirror),
-            "nframes": clip.stop - clip.start,
-        }
-        for clip in clips
-        for mirror in (False, True)
-    ]
-    return specs, tags_data, [clip.path for clip in clips]
-
-
-def _relative_tags(tags_data: Iterable[tuple[Any, ...]], specs: list[dict[str, object]]) -> list[tuple[Any, ...]]:
-    starts = {str(spec["range_name"]): int(spec["frame_start"]) for spec in specs[::2]}
-    stops = {str(spec["range_name"]): int(spec["frame_stop"]) for spec in specs[::2]}
-    relative: list[tuple[Any, ...]] = []
-    for range_name, tag, start, stop in tags_data:
-        range_name = str(range_name)
-        if range_name not in starts:
-            continue
-        base_start = starts[range_name]
-        base_stop = stops[range_name]
-        tag_start = max(int(start), base_start) - base_start
-        tag_stop = base_stop if stop is None else min(int(stop), base_stop)
-        tag_stop -= base_start
-        if tag_stop <= tag_start:
-            continue
-        relative.append((range_name, tag, tag_start, tag_stop))
-    return relative
+        )
+    return tags
 
 
 def _slice_motion(motion: Mapping[str, Any], start: int, stop: int) -> dict[str, Any]:
@@ -525,23 +510,16 @@ def _slice_motion(motion: Mapping[str, Any], start: int, stop: int) -> dict[str,
     return clipped
 
 
-def _clip_labels(name: str) -> dict[str, str]:
-    dataset, separator, base_name = str(name).partition("/")
-    if separator and dataset == "lafan":
-        # TODO: define a stable LAFAN style/action taxonomy instead of guessing from filenames.
-        return {"style": "", "action": ""}
-    name = base_name if separator else str(name)
-    style, separator, action = name.rpartition("_")
-    return {"style": style if separator else "", "action": action if separator else str(name)}
-
-
-def _feature_split_manifest(specs: list[dict[str, object]], seed: int) -> tuple[SplitManifest, dict[str, int]]:
-    source_names = sorted({str(spec["range_name"]) for spec in specs})
+def _feature_split_manifest(clips: list[_SourceClip], seed: int) -> tuple[SplitManifest, dict[str, int]]:
+    source_names = [clip.range_name for clip in clips]
     split = build_split_manifest(
         source_names,
         seed=seed,
         stratify_keys=("style", "action"),
-        labels={name: _clip_labels(name) for name in source_names},
+        labels={
+            clip.range_name: {"style": clip.style, "action": clip.action}
+            for clip in clips
+        },
     )
     source_ids = {name: index for index, name in enumerate(split.source_clip_names)}
     return split, source_ids
@@ -589,34 +567,31 @@ def build_motion_database(
     """Build the raw animation database used by trajectory preprocessing."""
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    specs, tags_data, bvh_paths = _build_shard_specs(dataset_name, styles, max_styles)
+    clips = _discover_source_clips(dataset_name, styles, max_styles)
     writer = MotionDatabaseWriter(
         output,
-        total_frames=sum(int(spec["nframes"]) for spec in specs),
-        tags_data=_relative_tags(tags_data, specs),
+        total_frames=sum(clip.nframes * 2 for clip in clips),
+        tags_data=[tag for clip in clips for tag in _clip_tags(clip)],
         prune_ends_and_fingers=prune_ends_and_fingers,
     )
     shard_idx = 0
-    for path_idx, (range_name, motions) in enumerate(iter_motion_pairs(
-        bvh_paths, prune_ends_and_fingers, workers, desc="Building motion database"
+    for path_idx, (processed_path, motions) in enumerate(iter_motion_pairs(
+        [clip.path for clip in clips], prune_ends_and_fingers, workers, desc="Building motion database"
     )):
-        base_spec = specs[path_idx * 2]
-        if Path(str(bvh_paths[path_idx])).stem != str(range_name).split("/")[-1]:
+        clip = clips[path_idx]
+        if Path(processed_path) != clip.path:
             raise ValueError("Processed motion order does not match source specification")
         for mirror, motion in motions:
-            spec = specs[shard_idx]
-            if bool(mirror) != bool(spec["mirror"]) or str(spec["range_name"]) != str(base_spec["range_name"]):
-                raise ValueError("Processed motion order does not match shard specification")
             full_frames = int(np.asarray(motion["positions"]).shape[0])
-            if int(spec["frame_stop"]) > full_frames:
+            if clip.stop > full_frames:
                 raise ValueError("Motion crop exceeds processed frame count")
-            clipped = _slice_motion(motion, int(spec["frame_start"]), int(spec["frame_stop"]))
-            if len(clipped["positions"]) != int(spec["nframes"]):
+            clipped = _slice_motion(motion, clip.start, clip.stop)
+            if len(clipped["positions"]) != clip.nframes:
                 raise ValueError("Motion crop frame count differs from shard specification")
-            writer.add(str(spec["range_name"]), bool(mirror), clipped)
+            writer.add(clip.range_name, bool(mirror), clipped)
             shard_idx += 1
-    if shard_idx != len(specs):
-        raise ValueError(f"Expected {len(specs)} motion shards, wrote {shard_idx}")
+    if shard_idx != len(clips) * 2:
+        raise ValueError(f"Expected {len(clips) * 2} motion shards, wrote {shard_idx}")
     writer.save()
     return output
 
@@ -631,50 +606,51 @@ def build_feature_database(
     seed: int = 3407,
     workers: int = 1,
     overwrite: bool = False,
+    motion_database_output: str | Path | None = None,
 ) -> Path:
     """Build and atomically publish a canonical FeatureStore."""
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists() and not overwrite:
         raise FileExistsError(f"FeatureStore already exists: {output}")
-    specs, tags_data, bvh_paths = _build_shard_specs(dataset_name, styles, max_styles)
-    split_manifest, source_ids = _feature_split_manifest(specs, seed)
+    clips = _discover_source_clips(dataset_name, styles, max_styles)
+    split_manifest, source_ids = _feature_split_manifest(clips, seed)
+    num_shards = len(clips) * 2
     staging = output.parent / f".{output.name}.staging-{os.getpid()}"
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True)
-    raw_database = output.parent / "database.npz"
-    writer = MotionDatabaseWriter(
-        raw_database,
-        total_frames=sum(int(spec["nframes"]) for spec in specs),
-        tags_data=_relative_tags(tags_data, specs),
-        prune_ends_and_fingers=prune_ends_and_fingers,
-    )
+    writer = None
+    if motion_database_output is not None:
+        writer = MotionDatabaseWriter(
+            motion_database_output,
+            total_frames=sum(clip.nframes * 2 for clip in clips),
+            tags_data=[tag for clip in clips for tag in _clip_tags(clip)],
+            prune_ends_and_fingers=prune_ends_and_fingers,
+        )
     train_masks = [
-        np.full(int(spec["nframes"]), split_manifest.split_by_source_clip[str(spec["range_name"])] == "train", dtype=bool)
-        for spec in specs
+        np.full(clip.nframes, split_manifest.split_by_source_clip[clip.range_name] == "train", dtype=bool)
+        for clip in clips
+        for _mirror in (False, True)
     ]
     stats_accumulator = _FeatureStatsAccumulator()
     names: list[str] | None = None
     parents: np.ndarray | None = None
     motion_files: list[str] = []
     try:
-        for path_idx, (range_name, motions) in enumerate(iter_motion_pairs(
-            bvh_paths, prune_ends_and_fingers, workers, desc="Building feature database"
+        for path_idx, (processed_path, motions) in enumerate(iter_motion_pairs(
+            [clip.path for clip in clips], prune_ends_and_fingers, workers, desc="Building feature database"
         )):
-            base_spec = specs[path_idx * 2]
-            if Path(str(bvh_paths[path_idx])).stem != str(range_name).split("/")[-1]:
+            clip = clips[path_idx]
+            if Path(processed_path) != clip.path:
                 raise ValueError("Processed motion order does not match source specification")
             for mirror, motion in motions:
                 spec_idx = path_idx * 2 + int(bool(mirror))
-                spec = specs[spec_idx]
-                if str(spec["range_name"]) != str(base_spec["range_name"]) or bool(mirror) != bool(spec["mirror"]):
-                    raise ValueError("Processed motion order does not match feature shard specification")
                 full_frames = int(np.asarray(motion["positions"]).shape[0])
-                if int(spec["frame_stop"]) > full_frames:
+                if clip.stop > full_frames:
                     raise ValueError("Motion crop exceeds processed frame count")
-                motion = _slice_motion(motion, int(spec["frame_start"]), int(spec["frame_stop"]))
-                if len(motion["positions"]) != int(spec["nframes"]):
+                motion = _slice_motion(motion, clip.start, clip.stop)
+                if len(motion["positions"]) != clip.nframes:
                     raise ValueError("Motion crop frame count differs from shard specification")
                 if names is None:
                     names = list(motion["names"])
@@ -684,7 +660,8 @@ def build_feature_database(
                 components = build_motion_feature_components(motion)
                 stats_accumulator.update(components, train_masks[spec_idx])
                 motion_files.append(_save_motion_shard(staging, spec_idx, components.x))
-                writer.add(str(spec["range_name"]), bool(mirror), motion)
+                if writer is not None:
+                    writer.add(clip.range_name, bool(mirror), motion)
         if names is None or parents is None:
             raise ValueError("No motion shards were processed")
         stats = stats_accumulator.finalize(names)
@@ -692,26 +669,35 @@ def build_feature_database(
             raise ValueError(f"Canonical FeatureStore requires motion_dim=230, got {stats.offset.shape}")
         for relative in motion_files:
             _normalize_motion_shard(staging / relative, stats)
-        writer.save()
-        range_names = [str(spec["range_name"]) for spec in specs]
+        if writer is not None:
+            writer.save()
+        range_names = [clip.range_name for clip in clips for _mirror in (False, True)]
         source_clip_names = list(split_manifest.source_clip_names)
-        style_names = sorted({_clip_labels(name)["style"] for name in range_names})
-        action_names = sorted({_clip_labels(name)["action"] for name in range_names})
+        labels = {
+            clip.range_name: {"style": clip.style, "action": clip.action}
+            for clip in clips
+        }
+        style_names = sorted({clip.style for clip in clips})
+        action_names = sorted({clip.action for clip in clips})
         style_to_id = {name: idx for idx, name in enumerate(style_names)}
         action_to_id = {name: idx for idx, name in enumerate(action_names)}
-        style_ids = np.asarray([style_to_id[_clip_labels(name)["style"]] for name in range_names], dtype=np.int32)
-        action_ids = np.asarray([action_to_id[_clip_labels(name)["action"]] for name in range_names], dtype=np.int32)
+        style_ids = np.asarray(
+            [style_to_id[labels[name]["style"]] for name in range_names], dtype=np.int32
+        )
+        action_ids = np.asarray(
+            [action_to_id[labels[name]["action"]] for name in range_names], dtype=np.int32
+        )
         split_ids = np.asarray(
             [
-                {"train": 0, "val": 1, "test": 2}[split_manifest.split_by_source_clip[str(spec["range_name"])] ]
-                for spec in specs
+                {"train": 0, "val": 1, "test": 2}[split_manifest.split_by_source_clip[name]]
+                for name in range_names
             ],
             dtype=np.uint8,
         )
-        source_clip_ids = np.asarray([source_ids[str(spec["range_name"])] for spec in specs], dtype=np.int32)
-        clip_ids = np.arange(len(specs), dtype=np.int32)
-        shard_frames = np.asarray([int(spec["nframes"]) for spec in specs], dtype=np.int64)
-        range_starts = np.zeros(len(specs), dtype=np.int64)
+        source_clip_ids = np.asarray([source_ids[name] for name in range_names], dtype=np.int32)
+        clip_ids = np.arange(num_shards, dtype=np.int32)
+        shard_frames = np.asarray([clip.nframes for clip in clips for _mirror in (False, True)], dtype=np.int64)
+        range_starts = np.zeros(num_shards, dtype=np.int64)
         range_stops = shard_frames.copy()
         stats_payload = serialize_motion_feature_stats(stats, names=names, parents=parents, joint_subset=("prune_ends_and_fingers" if prune_ends_and_fingers else "full"))
         np.savez(
@@ -719,10 +705,10 @@ def build_feature_database(
             shard_num_frames=shard_frames,
             clip_ids=clip_ids,
             source_clip_ids=source_clip_ids,
-            range_shard_indices=np.arange(len(specs), dtype=np.int32),
+            range_shard_indices=np.arange(num_shards, dtype=np.int32),
             range_starts=range_starts,
             range_stops=range_stops,
-            range_mirror=np.asarray([bool(spec["mirror"]) for spec in specs], dtype=bool),
+            range_mirror=np.asarray([mirror for _clip in clips for mirror in (False, True)], dtype=bool),
             split_ids=split_ids,
             style_ids=style_ids,
             action_ids=action_ids,
@@ -1279,6 +1265,12 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     feature.add_argument("--prune-ends-and-fingers", action="store_true")
     feature.add_argument("--seed", type=int, default=3407)
     feature.add_argument("--workers", type=int, default=1)
+    feature.add_argument(
+        "--motion-database-output",
+        type=Path,
+        default=None,
+        help="Optional raw database.npz for trajectory preprocessing.",
+    )
     feature.add_argument("--overwrite", action="store_true")
     token = subparsers.add_parser("token-database")
     token.add_argument("--feature-database", type=Path, required=True)
@@ -1310,7 +1302,17 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "motion-database":
         build_motion_database(args.dataset, args.output, styles=args.styles, max_styles=args.max_styles, prune_ends_and_fingers=args.prune_ends_and_fingers, workers=args.workers)
     elif args.command == "feature-database":
-        build_feature_database(args.dataset, args.output, styles=args.styles, max_styles=args.max_styles, prune_ends_and_fingers=args.prune_ends_and_fingers, seed=args.seed, workers=args.workers, overwrite=args.overwrite)
+        build_feature_database(
+            args.dataset,
+            args.output,
+            styles=args.styles,
+            max_styles=args.max_styles,
+            prune_ends_and_fingers=args.prune_ends_and_fingers,
+            seed=args.seed,
+            workers=args.workers,
+            overwrite=args.overwrite,
+            motion_database_output=args.motion_database_output,
+        )
     elif args.command == "token-database":
         raise RuntimeError("token-database requires an injected encoder; call run.py or build_token_database()")
     elif args.command == "trajectory-inputs":
