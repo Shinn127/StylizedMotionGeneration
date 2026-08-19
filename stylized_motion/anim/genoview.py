@@ -438,6 +438,65 @@ def load_bvh_data(path: Path):
     return bvh.load(str(path))
 
 
+def build_database_from_bvh(bvh_path: Path, range_name: str | None = None) -> dict[str, np.ndarray]:
+    """Convert one BVH clip into the database contract consumed by GenoView."""
+    data = load_bvh_data(Path(bvh_path))
+    positions = data["positions"].astype(np.float32) * 0.01
+    rotations = quat.unroll(
+        quat.from_euler(np.radians(data["rotations"]), order=data["order"])
+    ).astype(np.float32)
+    names = list(data["names"])
+    parents = np.asarray(data["parents"], dtype=np.int32)
+
+    required = ("Hips", "Spine2")
+    missing = [name for name in required if name not in names]
+    if missing:
+        raise ValueError(
+            f"BVH {bvh_path} is incompatible with GenoView; missing joints: {missing}"
+        )
+
+    # Match the project's simulation-root convention without importing the
+    # dataset-building pipeline (which would also pull in its CLI machinery).
+    global_rotations, global_positions = quat.fk(rotations, positions, parents)
+    sim_position = np.array([1.0, 0.0, 1.0], dtype=np.float32) * global_positions[
+        :, names.index("Spine2") : names.index("Spine2") + 1
+    ]
+    sim_direction = quat.mul_vec(
+        global_rotations[:, names.index("Hips") : names.index("Hips") + 1],
+        np.array([0.0, 0.0, 1.0], dtype=np.float32),
+    )
+    sim_direction = sim_direction / np.maximum(
+        np.linalg.norm(sim_direction, axis=-1, keepdims=True), 1e-8
+    )
+    sim_rotation = quat.normalize(
+        quat.between(np.array([0.0, 0.0, 1.0], dtype=np.float32), sim_direction)
+    )
+    positions[:, :1] = quat.mul_vec(quat.inv(sim_rotation), positions[:, :1] - sim_position)
+    rotations[:, :1] = quat.mul(quat.inv(sim_rotation), rotations[:, :1])
+    positions = np.concatenate([sim_position, positions], axis=1)
+    rotations = np.concatenate([sim_rotation, rotations], axis=1)
+    parents = np.concatenate([np.asarray([-1], dtype=np.int32), parents + 1])
+    names = ["Simulation", *names]
+
+    nframes = int(len(positions))
+    if range_name is None:
+        range_name = Path(bvh_path).stem
+    return {
+        "positions": positions.astype(np.float32),
+        "rotations": rotations.astype(np.float32),
+        "velocities": np.zeros_like(positions, dtype=np.float32),
+        "angular_velocities": np.zeros_like(positions, dtype=np.float32),
+        "contacts": np.zeros((nframes, 2), dtype=np.uint8),
+        "parents": parents,
+        "names": np.asarray(names, dtype=object),
+        "range_starts": np.asarray([0], dtype=np.int32),
+        "range_stops": np.asarray([nframes], dtype=np.int32),
+        "range_names": np.asarray([range_name], dtype=object),
+        "range_mirror": np.asarray([False], dtype=bool),
+        "joint_subset": np.asarray("full", dtype=object),
+    }
+
+
 def load_feature_array(path: Path, key: str) -> np.ndarray:
     if path.suffix == ".npy":
         features = np.load(path)
@@ -1210,6 +1269,7 @@ class GenoViewCompare(GenoView):
 def main():
     parser = argparse.ArgumentParser(description="High-quality Geno viewer driven by database.npz or 230D motion features.")
     parser.add_argument("--database", type=Path, default=None, help="Path to database.npz")
+    parser.add_argument("--bvh", type=Path, default=None, help="Path to a single BVH clip")
     parser.add_argument("--features", type=Path, default=None, help="Path to .npy or .npz containing 230D features with shape [T, D].")
     parser.add_argument("--feature-key", type=str, default="motion", help="Array key for .npz feature input.")
     parser.add_argument("--stats-source", type=Path, default=None, help="Checkpoint .pt or schema-v3 feature_database directory containing feature stats.")
@@ -1227,14 +1287,17 @@ def main():
     parser.add_argument("--fps", type=int, default=60, help="Playback FPS")
     args = parser.parse_args()
 
-    if (args.database is None) == (args.features is None):
-        raise ValueError("Exactly one of --database or --features is required")
+    selected_inputs = [args.database is not None, args.bvh is not None, args.features is not None]
+    if sum(selected_inputs) != 1:
+        raise ValueError("Exactly one of --database, --bvh, or --features is required")
     if args.features is not None and args.stats_source is None:
         raise ValueError("--stats-source is required when using --features")
 
     database = (
         load_database_dict(args.database)
         if args.database is not None
+        else build_database_from_bvh(args.bvh, range_name=args.range_name)
+        if args.bvh is not None
         else build_database_from_features(
             features_path=args.features,
             stats_source=args.stats_source,

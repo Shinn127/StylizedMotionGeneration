@@ -433,6 +433,18 @@ python -m stylized_motion.run \
   --database data/processed/100style/motion_database.npz
 ```
 
+也可以直接播放单个、且骨骼名称与 Geno bind skeleton 对齐的 BVH 文件，无需先生成
+`motion_database.npz`：
+
+```bash
+conda run -n mcc python -m stylized_motion.run \
+  --mode visualize --pipeline genoview \
+  --bvh data/raw/lafan/walk1_subject1.bvh
+```
+
+该入口会沿用项目的 BVH 解析、米制缩放和 Simulation root 约定；BVH 的骨骼名称
+必须与 Geno bind skeleton 兼容，否则会在启动时报告不匹配的关节。
+
 也可以查看 230D features：
 
 ```bash
