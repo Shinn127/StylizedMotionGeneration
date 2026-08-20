@@ -26,6 +26,8 @@ from stylized_motion.util.arg_parser import load_arg_file
 COMMANDS: dict[tuple[str, str], str] = {
     ("preprocess", "motion-database"): "stylized_motion.data.preprocess",
     ("preprocess", "feature-database"): "stylized_motion.data.preprocess",
+    ("preprocess", "feature-cache"): "stylized_motion.data.preprocess",
+    ("preprocess", "fsq-window-index"): "stylized_motion.data.preprocess",
     ("preprocess", "token-database"): "stylized_motion.data.preprocess",
     ("preprocess", "trajectory-inputs"): "stylized_motion.data.preprocess",
     ("preprocess", "trajectory-database"): "stylized_motion.data.preprocess",

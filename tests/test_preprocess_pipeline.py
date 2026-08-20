@@ -23,6 +23,9 @@ from stylized_motion.data.preprocess import (
     _normalize_motion_shard,
     _save_motion_shard,
     _slice_motion,
+    FSQ_WINDOW_FRAMES,
+    _fsq_clips,
+    _window_split_records,
     validate_data,
 )
 import stylized_motion.data.preprocess as preprocess_module
@@ -145,6 +148,22 @@ def test_100style_action_list_excludes_sparse_tr3():
     assert "TR3" not in STYLE100_CLIPS
     assert "TR2" not in STYLE100_CLIPS
     assert STYLE100_CLIPS[-1] == "TR1"
+
+
+def test_fsq_windows_are_fixed_length_and_seeded():
+    clips = [_SourceClip("clip", Path("clip.bvh"), 0, 200, "style", "action")]
+    rows_a, hash_a = _window_split_records(clips, 3407)
+    rows_b, hash_b = _window_split_records(clips, 3407)
+    assert rows_a == rows_b
+    assert hash_a == hash_b
+    assert {(start, stop) for _clip, start, stop, _split in rows_a} == {(0, 64), (64, 128), (128, 192)}
+    assert all(stop - start == FSQ_WINDOW_FRAMES for _clip, start, stop, _split in rows_a)
+
+
+def test_100style_fsq_excludes_last_ten_styles():
+    clips, heldout = _fsq_clips("100style", None, None)
+    assert len(heldout) == 10
+    assert all(clip.style not in heldout for clip in clips)
 
 
 def test_combined_discovery_uses_dataset_prefixes_and_cut_intervals(monkeypatch, tmp_path: Path):

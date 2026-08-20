@@ -20,9 +20,8 @@ import torch
 from tqdm import tqdm
 
 from stylized_motion.anim import bvh, quat
-from stylized_motion.anim.features import MotionFeatureStats, build_motion_feature_components, serialize_motion_feature_stats
-from stylized_motion.data.feature_data import canonical_json_bytes, open_feature_store, sha256_file
-from stylized_motion.data.sampling import SplitManifest, build_split_manifest
+from stylized_motion.anim.features import MotionFeatureStats, build_motion_feature_components, default_joint_weights, serialize_motion_feature_stats
+from stylized_motion.data.feature_data import MOTION_DIM, canonical_json_bytes, open_feature_cache, open_feature_store, sha256_file
 from stylized_motion.data.trajectory_data import open_trajectory_store
 from stylized_motion.data.token_data import open_token_store
 from stylized_motion.util.paths import DATA_DIR
@@ -38,6 +37,8 @@ STYLE100_CLIPS = ["BR", "BW", "FR", "FW", "ID", "SR", "SW", "TR1"]
 FINGER_TOKENS = ("Thumb", "Index", "Middle", "Ring", "Pinky")
 MOTION_FRAME_KEYS = ("positions", "velocities", "rotations", "angular_velocities", "contacts")
 UNKNOWN_LABEL = "__unknown__"
+FSQ_WINDOW_FRAMES = 64
+FSQ_SPLIT_RATIOS = {"train": 0.8, "val": 0.1, "test": 0.1}
 
 
 @dataclass(frozen=True)
@@ -510,33 +511,57 @@ def _slice_motion(motion: Mapping[str, Any], start: int, stop: int) -> dict[str,
     return clipped
 
 
-def _feature_split_manifest(clips: list[_SourceClip], seed: int) -> tuple[SplitManifest, dict[str, int]]:
-    source_names = [clip.range_name for clip in clips]
-    split = build_split_manifest(
-        source_names,
-        seed=seed,
-        stratify_keys=("style", "action"),
-        labels={
-            clip.range_name: {"style": clip.style, "action": clip.action}
-            for clip in clips
-        },
-    )
-    source_ids = {name: index for index, name in enumerate(split.source_clip_names)}
-    return split, source_ids
-
-
 def _frame_split_intervals(clip: _SourceClip) -> list[tuple[str, int, int]]:
-    """Return train/val/test frame ranges for one source clip."""
-    frames = int(clip.nframes)
-    boundaries = (0, int(np.floor(frames * 0.8)), int(np.floor(frames * 0.9)), frames)
-    intervals = [
-        ("train", boundaries[0], boundaries[1]),
-        ("val", boundaries[1], boundaries[2]),
-        ("test", boundaries[2], boundaries[3]),
+    """Return non-overlapping 64-frame windows for one source clip."""
+    return [
+        ("window", start, start + FSQ_WINDOW_FRAMES)
+        for start in range(0, int(clip.nframes) - FSQ_WINDOW_FRAMES + 1, FSQ_WINDOW_FRAMES)
     ]
-    if any(stop <= start for _split, start, stop in intervals):
-        raise ValueError(f"Clip {clip.range_name} is too short for frame-level train/val/test splitting")
-    return intervals
+
+
+def _heldout_style_names() -> tuple[str, ...]:
+    styles = list(dict.fromkeys(clip.style for clip in _read_100style_clips(None, None)))
+    return tuple(styles[-10:])
+
+
+def _fsq_clips(dataset_name: str, styles_arg: str | None, max_styles: int | None) -> tuple[list[_SourceClip], tuple[str, ...]]:
+    heldout = _heldout_style_names() if dataset_name in {"100style", "combined"} else ()
+    clips = _discover_source_clips(dataset_name, styles_arg, max_styles)
+    if heldout:
+        clips = [clip for clip in clips if clip.style not in heldout]
+    if not clips:
+        raise ValueError("No FSQ training clips remain after held-out style filtering")
+    return clips, heldout
+
+
+def _window_split_records(clips: list[_SourceClip], seed: int) -> tuple[list[tuple[_SourceClip, int, int, str]], str]:
+    logical: list[tuple[_SourceClip, int, int]] = []
+    for clip in clips:
+        logical.extend((clip, start, stop) for _window, start, stop in _frame_split_intervals(clip))
+    if not logical:
+        raise ValueError("No complete 64-frame windows were found")
+    rng = np.random.default_rng(int(seed))
+    order = rng.permutation(len(logical))
+    counts = [int(np.floor(len(logical) * ratio)) for ratio in FSQ_SPLIT_RATIOS.values()]
+    counts[-1] = len(logical) - sum(counts[:-1])
+    split_names = ("train", "val", "test")
+    records: list[tuple[_SourceClip, int, int, str]] = []
+    assignments: list[dict[str, object]] = []
+    offset = 0
+    for split, count in zip(split_names, counts):
+        for logical_idx in order[offset : offset + count]:
+            clip, start, stop = logical[int(logical_idx)]
+            records.append((clip, start, stop, split))
+            assignments.append({"clip": clip.range_name, "start": start, "stop": stop, "split": split})
+        offset += count
+    split_hash = hashlib.sha256(canonical_json_bytes({
+        "policy": "fixed_window_random_v1",
+        "window_frames": FSQ_WINDOW_FRAMES,
+        "seed": int(seed),
+        "ratios": FSQ_SPLIT_RATIOS,
+        "windows": assignments,
+    })).hexdigest()
+    return records, split_hash
 
 
 def _normalize_motion_shard(path: Path, stats: MotionFeatureStats, chunk_size: int = 16384) -> None:
@@ -567,6 +592,208 @@ def _publish_store(staging: Path, output: Path, overwrite: bool) -> None:
         else:
             output.unlink()
     os.replace(staging, output)
+
+
+def build_feature_cache(
+    dataset_name: str,
+    output: str | Path,
+    *,
+    styles: str | None = None,
+    max_styles: int | None = None,
+    prune_ends_and_fingers: bool = False,
+    workers: int = 1,
+    overwrite: bool = False,
+) -> Path:
+    """Build raw frame features without split, window, or training statistics."""
+    output = Path(output)
+    if output.exists() and not overwrite:
+        raise FileExistsError(f"Feature cache already exists: {output}")
+    clips = _discover_source_clips(dataset_name, styles, max_styles)
+    staging = output.parent / f".{output.name}.staging-{os.getpid()}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+    motion_files: list[str] = []
+    shard_frames: list[int] = []
+    range_names: list[str] = []
+    range_mirror: list[bool] = []
+    source_records: list[dict[str, object]] = []
+    names: list[str] | None = None
+    parents: np.ndarray | None = None
+    position_sum: np.ndarray | None = None
+    position_count = 0
+    try:
+        for path_idx, (processed_path, motions) in enumerate(iter_motion_pairs(
+            [clip.path for clip in clips], prune_ends_and_fingers, workers, desc="Building feature cache"
+        )):
+            clip = clips[path_idx]
+            if Path(processed_path) != clip.path:
+                raise ValueError("Processed motion order does not match source specification")
+            source_records.append({"range_name": clip.range_name, "style": clip.style, "action": clip.action, "nframes": clip.nframes})
+            for mirror, motion in motions:
+                full_frames = int(np.asarray(motion["positions"]).shape[0])
+                if clip.stop > full_frames:
+                    raise ValueError("Motion crop exceeds processed frame count")
+                motion = _slice_motion(motion, clip.start, clip.stop)
+                if names is None:
+                    names = list(motion["names"])
+                    parents = np.asarray(motion["parents"], dtype=np.int32)
+                elif names != list(motion["names"]) or not np.array_equal(parents, motion["parents"]):
+                    raise ValueError("Motion shards do not share one skeleton schema")
+                components = build_motion_feature_components(motion)
+                shard_idx = len(motion_files)
+                motion_files.append(_save_motion_shard(staging, shard_idx, components.x))
+                shard_frames.append(len(components.x))
+                range_names.append(clip.range_name)
+                range_mirror.append(bool(mirror))
+                position_sum = components.positions.sum(axis=0, dtype=np.float64) if position_sum is None else position_sum + components.positions.sum(axis=0, dtype=np.float64)
+                position_count += len(components.positions)
+        if names is None or parents is None or position_sum is None or position_count <= 0:
+            raise ValueError("No motion shards were processed")
+        schema_payload = {"name": "motion_feature_v2", "motion_dim": MOTION_DIM, "joint_subset": "prune_ends_and_fingers" if prune_ends_and_fingers else "full", "names": names, "parents": parents.tolist()}
+        schema_hash = hashlib.sha256(canonical_json_bytes(schema_payload)).hexdigest()
+        np.savez(
+            staging / "index.npz",
+            shard_num_frames=np.asarray(shard_frames, dtype=np.int64),
+            range_mirror=np.asarray(range_mirror, dtype=bool),
+            ref_pos=(position_sum / position_count).astype(np.float32),
+        )
+        manifest = {
+            "data_schema_version": 3,
+            "store_type": "feature_cache",
+            "frame_rate": 60,
+            "num_shards": len(motion_files),
+            "shard_files": motion_files,
+            "shard_sha256": [sha256_file(staging / value) for value in motion_files],
+            "feature_schema_hash": schema_hash,
+            "created_by": "stylized_motion.data.preprocess",
+            "motion_dim": MOTION_DIM,
+            "range_names": range_names,
+            "source_clips": source_records,
+            "unseen_style_names": list(_heldout_style_names() if dataset_name in {"100style", "combined"} else ()),
+            "feature_schema": schema_payload,
+        }
+        (staging / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=True, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        _publish_store(staging, output, overwrite)
+    except Exception:
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+    return output
+
+
+def _window_stats(cache: Any, train_records: list[tuple[int, int, int]]) -> MotionFeatureStats:
+    total = np.zeros(MOTION_DIM, dtype=np.float64)
+    squared = np.zeros(MOTION_DIM, dtype=np.float64)
+    count = 0
+    for shard_idx, start, stop in train_records:
+        values = cache.read_motion(shard_idx, start, stop - start).astype(np.float64)
+        total += values.sum(axis=0)
+        squared += np.square(values).sum(axis=0)
+        count += len(values)
+    if count <= 0:
+        raise ValueError("No train windows available for feature statistics")
+    mean = total / count
+    std = np.sqrt(np.maximum(squared / count - np.square(mean), 1e-8)).astype(np.float32)
+    nbones = len(cache.names)
+    rotation_stop = 9 + (nbones - 1) * 6
+    hip_velocity_stop = rotation_stop + 3
+    angular_stop = hip_velocity_stop + (nbones - 1) * 3
+    scale = np.concatenate((
+        np.full(3, std[:3].mean(), dtype=np.float32),
+        np.full(3, std[3:6].mean(), dtype=np.float32),
+        np.full(3, std[6:9].mean(), dtype=np.float32),
+        np.full(rotation_stop - 9, std[9:rotation_stop].mean(), dtype=np.float32),
+        np.full(3, std[rotation_stop:hip_velocity_stop].mean(), dtype=np.float32),
+        np.full(angular_stop - hip_velocity_stop, std[hip_velocity_stop:angular_stop].mean(), dtype=np.float32),
+        np.full(2, std[angular_stop:].mean(), dtype=np.float32),
+    ))
+    weights = np.concatenate((
+        np.ones(3, dtype=np.float32), np.ones(3, dtype=np.float32), np.ones(3, dtype=np.float32),
+        default_joint_weights(cache.names)[1:].repeat(6).astype(np.float32) * (nbones - 1),
+        np.ones(3, dtype=np.float32),
+        default_joint_weights(cache.names)[1:].repeat(3).astype(np.float32) * (nbones - 1),
+        np.ones(2, dtype=np.float32),
+    ))
+    return MotionFeatureStats(offset=mean.astype(np.float32), scale=np.maximum(scale, 1e-8), dist=(std / np.maximum(scale, 1e-8)).astype(np.float32), weights=weights, ref_pos=cache.ref_pos)
+
+
+def build_fsq_window_index(
+    feature_cache: str | Path,
+    output: str | Path,
+    *,
+    seed: int = 3407,
+    overwrite: bool = False,
+) -> Path:
+    """Build the FSQ-only 64-frame window index and train normalization."""
+    output = Path(output)
+    if output.exists() and not overwrite:
+        raise FileExistsError(f"FSQ window index already exists: {output}")
+    cache = open_feature_cache(feature_cache)
+    try:
+        source_records = cache.manifest.get("source_clips", [])
+        heldout = set(str(value) for value in cache.manifest.get("unseen_style_names", []))
+        if not heldout:
+            styles = list(dict.fromkeys(str(record.get("style", "")) for record in source_records if isinstance(record, Mapping)))
+            heldout = set(styles[-10:]) if len(styles) >= 10 else set()
+        logical: list[tuple[int, int, int]] = []
+        unseen: list[tuple[int, int, int]] = []
+        for shard_idx, frames in enumerate(cache.shard_num_frames.tolist()):
+            clip_idx = shard_idx // 2
+            style = str(source_records[clip_idx].get("style", ""))
+            target = unseen if style in heldout else logical
+            target.extend((shard_idx, start, start + FSQ_WINDOW_FRAMES) for start in range(0, int(frames) - FSQ_WINDOW_FRAMES + 1, FSQ_WINDOW_FRAMES) if shard_idx % 2 == 0)
+        rng = np.random.default_rng(int(seed))
+        order = rng.permutation(len(logical))
+        counts = [int(np.floor(len(logical) * ratio)) for ratio in FSQ_SPLIT_RATIOS.values()]
+        counts[-1] = len(logical) - sum(counts[:-1])
+        records: list[tuple[int, int, int, int]] = []
+        train_records: list[tuple[int, int, int]] = []
+        offset = 0
+        for split_id, count in enumerate(counts):
+            for logical_idx in order[offset:offset + count]:
+                shard_idx, start, stop = logical[int(logical_idx)]
+                records.extend(((shard_idx, start, stop, split_id), (shard_idx + 1, start, stop, split_id)))
+                if split_id == 0:
+                    train_records.extend(((shard_idx, start, stop), (shard_idx + 1, start, stop)))
+            offset += count
+        stats = _window_stats(cache, train_records)
+        staging = output.parent / f".{output.name}.staging-{os.getpid()}"
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True, exist_ok=True)
+        motion_files: list[str] = []
+        for shard_idx, source_path in enumerate(cache.motion_files):
+            values = cache.read_motion(shard_idx)
+            relative = Path("motion") / f"shard_{shard_idx:05d}.npy"
+            path = staging / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(path, (values - stats.offset) / stats.scale)
+            motion_files.append(relative.as_posix())
+        source_names = [str(record["range_name"]) for record in source_records if str(record.get("style", "")) not in heldout]
+        source_id_map = {name: index for index, name in enumerate(sorted(source_names))}
+        range_names = [cache.range_names[shard_idx] for shard_idx, _start, _stop, _split in records]
+        source_ids = np.asarray([source_id_map[cache.range_names[shard_idx]] for shard_idx, _start, _stop, _split in records], dtype=np.int32)
+        split_ids = np.asarray([split for _shard, _start, _stop, split in records], dtype=np.uint8)
+        shard_frames = cache.shard_num_frames.copy()
+        np.savez(staging / "index.npz", shard_num_frames=shard_frames, clip_ids=np.asarray([s for s, *_ in records], dtype=np.int32), source_clip_ids=source_ids, range_shard_indices=np.asarray([s for s, *_ in records], dtype=np.int32), range_starts=np.asarray([a for _s, a, _b, _split in records], dtype=np.int64), range_stops=np.asarray([b for _s, _a, b, _split in records], dtype=np.int64), range_mirror=np.asarray([cache.range_mirror[s] for s, *_ in records], dtype=bool), split_ids=split_ids, style_ids=np.zeros(len(records), dtype=np.int32), action_ids=np.zeros(len(records), dtype=np.int32), offset=stats.offset, scale=stats.scale, dist=stats.dist, weights=stats.weights, ref_pos=stats.ref_pos)
+        names_sha256 = hashlib.sha256(canonical_json_bytes(cache.names)).hexdigest()
+        stats_sha256 = hashlib.sha256()
+        for key in ("offset", "scale", "weights", "ref_pos"):
+            stats_sha256.update(key.encode("ascii"))
+            stats_sha256.update(np.asarray(getattr(stats, key), dtype=np.float32).tobytes())
+        schema_payload = {"name": "motion_feature_v2", "motion_dim": MOTION_DIM, "joint_subset": cache.joint_subset, "names_sha256": names_sha256, "stats_sha256": stats_sha256.hexdigest()}
+        schema_hash = hashlib.sha256(canonical_json_bytes(schema_payload)).hexdigest()
+        manifest = {"data_schema_version": 3, "store_type": "feature", "frame_rate": 60, "num_shards": len(motion_files), "shard_files": motion_files, "shard_sha256": [sha256_file(staging / value) for value in motion_files], "split_manifest_hash": hashlib.sha256(canonical_json_bytes({"policy": "fixed_window_random_v1", "seed": int(seed), "window_frames": FSQ_WINDOW_FRAMES, "ratios": FSQ_SPLIT_RATIOS, "records": records})).hexdigest(), "feature_schema_hash": schema_hash, "created_by": "stylized_motion.data.preprocess", "motion_dim": MOTION_DIM, "range_names": range_names, "source_clip_names": sorted(source_names), "style_names": sorted(set(str(record.get("style", "")) for record in source_records if str(record.get("style", "")) not in heldout)), "action_names": [], "feature_schema": {**schema_payload, "names": cache.names, "parents": cache.parents.tolist()}, "normalization_train_frames": len(train_records) * FSQ_WINDOW_FRAMES, "split_policy": "fixed_window_random_v1", "window_frames": FSQ_WINDOW_FRAMES, "split_seed": int(seed), "split_ratios": FSQ_SPLIT_RATIOS, "unseen_style_names": sorted(heldout)}
+        (staging / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=True, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        unseen_rows: list[tuple[int, int, int]] = []
+        for shard_idx, start, stop in unseen:
+            unseen_rows.extend(((shard_idx, start, stop), (shard_idx + 1, start, stop)))
+        np.savez(staging / "unseen_index.npz", windows=np.asarray(unseen_rows, dtype=np.int64))
+        _publish_store(staging, output, overwrite)
+    finally:
+        cache.close()
+    return output
 
 
 def build_motion_database(
@@ -627,9 +854,11 @@ def build_feature_database(
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists() and not overwrite:
         raise FileExistsError(f"FeatureStore already exists: {output}")
-    clips = _discover_source_clips(dataset_name, styles, max_styles)
-    split_manifest, source_ids = _feature_split_manifest(clips, seed)
-    num_shards = len(clips) * 2
+    all_clips = _discover_source_clips(dataset_name, styles, max_styles)
+    clips, heldout_styles = _fsq_clips(dataset_name, styles, max_styles)
+    window_records, split_manifest_hash = _window_split_records(clips, seed)
+    source_clip_names = sorted(clip.range_name for clip in clips)
+    source_ids = {name: index for index, name in enumerate(source_clip_names)}
     staging = output.parent / f".{output.name}.staging-{os.getpid()}"
     if staging.exists():
         shutil.rmtree(staging)
@@ -638,17 +867,22 @@ def build_feature_database(
     if motion_database_output is not None:
         writer = MotionDatabaseWriter(
             motion_database_output,
-            total_frames=sum(clip.nframes * 2 for clip in clips),
-            tags_data=[tag for clip in clips for tag in _clip_tags(clip)],
+            total_frames=sum(clip.nframes * 2 for clip in all_clips),
+            tags_data=[tag for clip in all_clips for tag in _clip_tags(clip)],
             prune_ends_and_fingers=prune_ends_and_fingers,
         )
-    frame_intervals = [_frame_split_intervals(clip) for clip in clips]
+    train_windows: dict[str, list[tuple[int, int]]] = {}
+    for clip, start, stop, split_name in window_records:
+        if split_name == "train":
+            train_windows.setdefault(clip.range_name, []).append((start, stop))
     train_masks = [
-        np.asarray(
-            [split == "train" for split, start, stop in frame_intervals[path_idx] for _ in range(stop - start)],
-            dtype=bool,
+        np.zeros(clip.nframes, dtype=bool)
+        if not train_windows.get(clip.range_name)
+        else np.isin(
+            np.arange(clip.nframes, dtype=np.int64),
+            np.concatenate([np.arange(start, stop, dtype=np.int64) for start, stop in train_windows[clip.range_name]]),
         )
-        for path_idx in range(len(clips))
+        for clip in all_clips
         for _mirror in (False, True)
     ]
     stats_accumulator = _FeatureStatsAccumulator()
@@ -657,9 +891,9 @@ def build_feature_database(
     motion_files: list[str] = []
     try:
         for path_idx, (processed_path, motions) in enumerate(iter_motion_pairs(
-            [clip.path for clip in clips], prune_ends_and_fingers, workers, desc="Building feature database"
+            [clip.path for clip in all_clips], prune_ends_and_fingers, workers, desc="Building feature database"
         )):
-            clip = clips[path_idx]
+            clip = all_clips[path_idx]
             if Path(processed_path) != clip.path:
                 raise ValueError("Processed motion order does not match source specification")
             for mirror, motion in motions:
@@ -691,12 +925,10 @@ def build_feature_database(
             writer.save()
         range_records = [
             (clip, mirror, split_name, start, stop)
-            for clip, intervals in zip(clips, frame_intervals)
+            for clip, start, stop, split_name in window_records
             for mirror in (False, True)
-            for split_name, start, stop in intervals
         ]
         range_names = [clip.range_name for clip, _mirror, _split, _start, _stop in range_records]
-        source_clip_names = list(split_manifest.source_clip_names)
         labels = {
             clip.range_name: {"style": clip.style, "action": clip.action}
             for clip in clips
@@ -721,9 +953,10 @@ def build_feature_database(
         source_clip_ids = np.asarray(
             [source_ids[clip.range_name] for clip, _mirror, _split, _start, _stop in range_records], dtype=np.int32
         )
-        shard_frames = np.asarray([clip.nframes for clip in clips for _mirror in (False, True)], dtype=np.int64)
+        shard_frames = np.asarray([clip.nframes for clip in all_clips for _mirror in (False, True)], dtype=np.int64)
+        clip_indices = {clip.range_name: index for index, clip in enumerate(all_clips)}
         range_shard_indices = np.asarray(
-            [clips.index(clip) * 2 + int(mirror) for clip, mirror, _split, _start, _stop in range_records],
+            [clip_indices[clip.range_name] * 2 + int(mirror) for clip, mirror, _split, _start, _stop in range_records],
             dtype=np.int32,
         )
         # ``clip_ids`` is a range-level field and must have one entry per
@@ -768,7 +1001,7 @@ def build_feature_database(
             "num_shards": len(motion_files),
             "shard_files": motion_files,
             "shard_sha256": [sha256_file(staging / relative) for relative in motion_files],
-            "split_manifest_hash": split_manifest.split_manifest_hash,
+            "split_manifest_hash": split_manifest_hash,
             "feature_schema_hash": feature_schema_hash,
             "created_by": "stylized_motion.data.preprocess",
             "motion_dim": 230,
@@ -776,15 +1009,17 @@ def build_feature_database(
             "source_clip_names": source_clip_names,
             "style_names": style_names,
             "action_names": action_names,
-            "split_manifest": {**split_manifest.as_dict(), "split_manifest_hash": split_manifest.split_manifest_hash},
             "feature_schema": {
                 **schema_payload,
                 "names": names,
                 "parents": parents.tolist(),
             },
             "normalization_train_frames": int(stats_accumulator.count),
-            "split_policy": "frame_interval",
-            "frame_split_ratios": {"train": 0.8, "val": 0.1, "test": 0.1},
+            "split_policy": "fixed_window_random_v1",
+            "window_frames": FSQ_WINDOW_FRAMES,
+            "split_seed": int(seed),
+            "split_ratios": FSQ_SPLIT_RATIOS,
+            "unseen_style_names": list(heldout_styles),
         }
         (staging / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=True, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         validate_data(feature_database=staging, full=True)
@@ -1200,20 +1435,15 @@ def build_trajectory_database(
 def _assert_source_split_disjoint(store: Any) -> None:
     source_ids = np.asarray(store.source_clip_ids, dtype=np.int32)
     split_ids = np.asarray(store.split_ids, dtype=np.uint8)
-    if str(getattr(store, "manifest", {}).get("split_policy", "source_clip")) == "frame_interval":
-        # Frame-level splitting intentionally places each source clip in all
-        # three splits. Validate that every source has all splits and that
-        # ranges within each mirrored shard do not overlap.
+    policy = str(getattr(store, "manifest", {}).get("split_policy", "source_clip"))
+    if policy in {"frame_interval", "fixed_window_random_v1"}:
+        # Window splitting may place one source in every split, but windows
+        # must remain non-overlapping within each mirrored source shard.
         shard_ids = np.asarray(store.range_shard_indices, dtype=np.int32)
         starts = np.asarray(store.range_starts, dtype=np.int64)
         stops = np.asarray(store.range_stops, dtype=np.int64)
         for source_id in sorted(set(source_ids.tolist())):
             source_rows = np.flatnonzero(source_ids == source_id)
-            values = set(split_ids[source_rows].tolist())
-            if values != {0, 1, 2}:
-                raise ValueError(
-                    f"Source clip {source_id} must contain train/val/test frame ranges; got {sorted(values)}"
-                )
             for shard_id in sorted(set(shard_ids[source_rows].tolist())):
                 rows = source_rows[shard_ids[source_rows] == shard_id]
                 ordered = rows[np.argsort(starts[rows])]
@@ -1327,6 +1557,19 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         help="Optional raw database.npz for trajectory preprocessing.",
     )
     feature.add_argument("--overwrite", action="store_true")
+    cache = subparsers.add_parser("feature-cache")
+    cache.add_argument("--dataset", choices=["lafan", "100style", "combined"], required=True)
+    cache.add_argument("--output", type=Path, required=True)
+    cache.add_argument("--styles", default=None)
+    cache.add_argument("--max-styles", type=int, default=None)
+    cache.add_argument("--prune-ends-and-fingers", action="store_true")
+    cache.add_argument("--workers", type=int, default=1)
+    cache.add_argument("--overwrite", action="store_true")
+    windows = subparsers.add_parser("fsq-window-index")
+    windows.add_argument("--feature-cache", type=Path, required=True)
+    windows.add_argument("--output", type=Path, required=True)
+    windows.add_argument("--seed", type=int, default=3407)
+    windows.add_argument("--overwrite", action="store_true")
     token = subparsers.add_parser("token-database")
     token.add_argument("--feature-database", type=Path, required=True)
     token.add_argument("--output", type=Path, required=True)
@@ -1356,6 +1599,10 @@ def main(argv: list[str] | None = None) -> None:
     args = _build_cli_parser().parse_args(argv)
     if args.command == "motion-database":
         build_motion_database(args.dataset, args.output, styles=args.styles, max_styles=args.max_styles, prune_ends_and_fingers=args.prune_ends_and_fingers, workers=args.workers)
+    elif args.command == "feature-cache":
+        build_feature_cache(args.dataset, args.output, styles=args.styles, max_styles=args.max_styles, prune_ends_and_fingers=args.prune_ends_and_fingers, workers=args.workers, overwrite=args.overwrite)
+    elif args.command == "fsq-window-index":
+        build_fsq_window_index(args.feature_cache, args.output, seed=args.seed, overwrite=args.overwrite)
     elif args.command == "feature-database":
         build_feature_database(
             args.dataset,
@@ -1380,7 +1627,9 @@ def main(argv: list[str] | None = None) -> None:
 
 
 __all__ = [
+    "build_feature_cache",
     "build_feature_database",
+    "build_fsq_window_index",
     "build_motion_database",
     "build_token_database",
     "build_trajectory_database",

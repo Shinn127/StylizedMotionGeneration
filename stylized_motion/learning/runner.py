@@ -727,9 +727,9 @@ def main(argv: list[str] | None = None) -> None:
         rank = 0
         world_size = 1
     device = choose_device(args.device)
-    feature_database = data.get("feature_database")
+    feature_database = data.get("fsq_window_index", data.get("feature_database"))
     if feature_database is None:
-        raise ValueError("data.feature_database is required")
+        raise ValueError("data.fsq_window_index is required for FSQ training")
     store = open_feature_store(feature_database)
     feature_schema = store.feature_schema()
     sampling = config.get("sampling", {})

@@ -485,7 +485,7 @@ validate-data
 写入流程使用 staging directory；所有 shard、manifest、index 和 full validation 成功后
 再原子发布最终 Store。失败不得留下看似完整的 `manifest.json`。
 
-构建 FeatureStore 时创建 split manifest 并拟合 train stats；构建 TokenStore 和
+FSQ 构建先生成不含 split 的 raw feature cache，再生成固定 64 帧 window index 并拟合 train stats；构建 TokenStore 和
 TrajectoryStore 时继承 manifest。`run.py` 负责 CLI dispatch 与 TokenEncoderProtocol
 注入。
 

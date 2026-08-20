@@ -72,34 +72,47 @@ python -m stylized_motion.run \
 
 支持的数据集入口是 `lafan`、`100style` 和 `combined`；`--styles` 可筛选 100style 样式，`--max-styles` 适合小规模试跑。LAFAN 当前只保留 source clip，不推断 style/action 标签。
 
-### 3.2 FeatureStore
+### 3.2 FSQ feature cache and window index
 
-representation 训练直接消费 FeatureStore。构建过程会读取 BVH、计算 `motion_feature_v2`、按 source clip 建立 train/val/test split、只使用 train split 拟合 normalization statistics，并在 full validation 成功后原子发布 Store。
+FSQ 数据构建分为两个阶段：`feature-cache` 只把完整 source sequence 转为未归一化的帧级 `motion_feature_v2`；`fsq-window-index` 再切分不重叠的 64 帧 window、按固定 seed 以 8:1:1 分配并只用 train windows 拟合 normalization。100style 最后 10 个 style 会写入 cache，但排除出标准训练 index，记录在 `unseen_style_names`。
 
 ```bash
 python -m stylized_motion.run \
-  --mode preprocess --pipeline feature-database \
+  --mode preprocess --pipeline feature-cache \
   --dataset 100style \
-  --output data/processed/100style_pruned_90/feature_database \
-  --max-styles 90 \
+  --output data/processed/100style_pruned_90/feature_cache \
   --prune-ends-and-fingers \
   --workers 8 \
   --overwrite
-```
 
-联合构建时，LAFAN 使用完整 source clip，100style 使用 `Frame_Cuts.csv` 的 `[START, STOP)` 区间；两者共同计算 train normalization：
-
-```bash
 python -m stylized_motion.run \
-  --mode preprocess --pipeline feature-database \
-  --dataset combined \
-  --output data/processed/combined_pruned/feature_database \
-  --prune-ends-and-fingers \
-  --workers 1 \
+  --mode preprocess --pipeline fsq-window-index \
+  --feature-cache data/processed/100style_pruned_90/feature_cache \
+  --output data/processed/100style_pruned_90/fsq_window_index \
+  --seed 3407 \
   --overwrite
 ```
 
-`feature-database` 默认只写 FeatureStore，不会额外生成大型 `database.npz`。如果后续需要构建
+联合构建时，LAFAN 使用完整 source clip，100style 使用 `Frame_Cuts.csv` 的 `[START, STOP)` 区间；推荐同样先生成 cache，再生成 FSQ window index：
+
+```bash
+python -m stylized_motion.run \
+  --mode preprocess --pipeline feature-cache \
+  --dataset combined \
+  --output data/processed/combined_pruned/feature_cache \
+  --prune-ends-and-fingers \
+  --workers 1 \
+  --overwrite
+
+python -m stylized_motion.run \
+  --mode preprocess --pipeline fsq-window-index \
+  --feature-cache data/processed/combined_pruned/feature_cache \
+  --output data/processed/combined_pruned/fsq_window_index \
+  --seed 3407 \
+  --overwrite
+```
+
+旧的 `feature-database` 入口仍保留用于兼容 token/trajectory pipeline；FSQ 训练使用上面的两阶段入口。如果后续需要构建
 trajectory inputs，可显式添加 `--motion-database-output data/processed/combined/motion_database.npz`；
 独立的 `motion-database` pipeline 仍保持可用。LAFAN 的 style/action 使用 `__unknown__` 占位，
 不从文件名推断，taxonomy 留作后续 TODO。

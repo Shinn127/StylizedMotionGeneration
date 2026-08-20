@@ -70,6 +70,93 @@ class MMapShardCache:
         return state
 
 
+@dataclass
+class FeatureCache:
+    """Raw frame-level feature cache; it intentionally has no split metadata."""
+
+    database: Path
+    manifest: dict[str, object]
+    motion_files: list[Path]
+    shard_num_frames: np.ndarray
+    range_names: tuple[str, ...]
+    range_mirror: np.ndarray
+    names: list[str]
+    parents: np.ndarray
+    joint_subset: str
+    feature_schema_hash: str
+    ref_pos: np.ndarray
+    max_open_shards: int = 32
+    _cache: MMapShardCache | None = None
+
+    @property
+    def motion_dim(self) -> int:
+        return MOTION_DIM
+
+    def read_motion(self, shard_idx: int, start: int = 0, frames: int | None = None) -> np.ndarray:
+        if self._cache is None:
+            self._cache = MMapShardCache(self.motion_files, self.max_open_shards)
+        values = self._cache.get(int(shard_idx))
+        start = int(start)
+        stop = len(values) if frames is None else start + int(frames)
+        if start < 0 or stop > len(values) or stop <= start:
+            raise IndexError("FeatureCache frame range is invalid")
+        return np.ascontiguousarray(values[start:stop], dtype=np.float32)
+
+    def close(self) -> None:
+        if self._cache is not None:
+            self._cache.close()
+        self._cache = None
+
+    def __getstate__(self) -> dict[str, object]:
+        state = dict(self.__dict__)
+        state["_cache"] = None
+        return state
+
+
+def open_feature_cache(database: str | Path, *, max_open_shards: int = 32) -> FeatureCache:
+    database = Path(database)
+    manifest_path = database / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing feature cache manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or manifest.get("store_type") != "feature_cache":
+        raise ValueError("Expected a feature_cache manifest")
+    shard_files = [database / str(value) for value in manifest.get("shard_files", [])]
+    if not shard_files or any(not path.exists() for path in shard_files):
+        raise FileNotFoundError("Feature cache manifest references missing shards")
+    index = _load_index(database)
+    required = {"shard_num_frames", "range_mirror", "ref_pos"}
+    _require_index(index, required, "Feature cache")
+    schema = manifest.get("feature_schema")
+    if not isinstance(schema, Mapping):
+        raise ValueError("Feature cache manifest must contain feature_schema")
+    names = [str(value) for value in schema.get("names", [])]
+    parents = np.asarray(schema.get("parents", []), dtype=np.int32)
+    if not names or parents.shape != (len(names),):
+        raise ValueError("Feature cache skeleton schema is invalid")
+    frames = np.asarray(index["shard_num_frames"], dtype=np.int64)
+    if len(frames) != len(shard_files) or np.any(frames <= 0):
+        raise ValueError("Feature cache shard_num_frames is invalid")
+    for path, expected in zip(shard_files, frames.tolist()):
+        values = np.load(path, mmap_mode="r", allow_pickle=False)
+        if values.dtype != np.float32 or values.shape != (int(expected), MOTION_DIM):
+            raise ValueError(f"Feature cache shard has invalid shape: {path}")
+    return FeatureCache(
+        database=database,
+        manifest=manifest,
+        motion_files=shard_files,
+        shard_num_frames=frames,
+        range_names=tuple(str(value) for value in manifest.get("range_names", [])),
+        range_mirror=np.asarray(index["range_mirror"], dtype=bool),
+        names=names,
+        parents=parents,
+        joint_subset=str(schema.get("joint_subset", "unknown")),
+        feature_schema_hash=str(manifest.get("feature_schema_hash", "")),
+        ref_pos=np.asarray(index["ref_pos"], dtype=np.float32),
+        max_open_shards=int(max_open_shards),
+    )
+
+
 def _require_manifest(manifest: Mapping[str, object], store_type: str) -> None:
     required = {
         "data_schema_version",
@@ -525,4 +612,4 @@ class FeatureDataset(Dataset):
         return dict(self.__dict__)
 
 
-__all__ = ["FeatureDataset", "FeatureStore", "open_feature_store"]
+__all__ = ["FeatureCache", "FeatureDataset", "FeatureStore", "open_feature_cache", "open_feature_store"]
