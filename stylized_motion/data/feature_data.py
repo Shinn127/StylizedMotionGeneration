@@ -137,6 +137,19 @@ def open_feature_cache(database: str | Path, *, max_open_shards: int = 32) -> Fe
     frames = np.asarray(index["shard_num_frames"], dtype=np.int64)
     if len(frames) != len(shard_files) or np.any(frames <= 0):
         raise ValueError("Feature cache shard_num_frames is invalid")
+    range_names = tuple(str(value) for value in manifest.get("range_names", []))
+    range_mirror = np.asarray(index["range_mirror"], dtype=bool)
+    source_records = manifest.get("source_clips", [])
+    if len(range_names) != len(shard_files) or len(range_mirror) != len(shard_files):
+        raise ValueError("Feature cache range metadata is invalid")
+    if not isinstance(source_records, list) or len(source_records) * 2 != len(shard_files):
+        raise ValueError("Feature cache source clip metadata is invalid")
+    for source_idx, record in enumerate(source_records):
+        if not isinstance(record, Mapping):
+            raise ValueError("Feature cache source clip records must be objects")
+        pair = slice(source_idx * 2, source_idx * 2 + 2)
+        if range_names[pair.start] != range_names[pair.start + 1] or tuple(range_mirror[pair]) != (False, True):
+            raise ValueError("Feature cache shards must be ordered as original/mirror pairs")
     for path, expected in zip(shard_files, frames.tolist()):
         values = np.load(path, mmap_mode="r", allow_pickle=False)
         if values.dtype != np.float32 or values.shape != (int(expected), MOTION_DIM):
@@ -146,8 +159,8 @@ def open_feature_cache(database: str | Path, *, max_open_shards: int = 32) -> Fe
         manifest=manifest,
         motion_files=shard_files,
         shard_num_frames=frames,
-        range_names=tuple(str(value) for value in manifest.get("range_names", [])),
-        range_mirror=np.asarray(index["range_mirror"], dtype=bool),
+        range_names=range_names,
+        range_mirror=range_mirror,
         names=names,
         parents=parents,
         joint_subset=str(schema.get("joint_subset", "unknown")),

@@ -183,7 +183,7 @@ def _epoch_seed(seed: int, epoch: int) -> int:
 
 
 class TrainWindowSampler(Sampler[SampleRequest]):
-    """Dynamic frame-uniform requests with deterministic DDP ordinal partitioning."""
+    """Sample source clips uniformly, then sample a frame window within a clip."""
 
     def __init__(
         self,
@@ -224,14 +224,15 @@ class TrainWindowSampler(Sampler[SampleRequest]):
         self._intervals = intervals
         self._valid_lengths = (intervals[:, 2] - intervals[:, 1] - self.required_frames + 1).astype(np.int64)
         source_ids = np.asarray(store.source_clip_ids, dtype=np.int32)
-        mirror = np.asarray(store.range_mirror, dtype=bool)
         self._groups: list[np.ndarray] = []
         for source_id in sorted(set(source_ids[intervals[:, 3]].tolist())):
             rows = np.flatnonzero(source_ids[intervals[:, 3]] == source_id)
             self._groups.append(rows)
         if not self._groups:
             raise ValueError("Train split has no source clip groups")
-        group_weights = np.asarray([self._valid_lengths[group].sum() for group in self._groups], dtype=np.float64)
+        # Keep each source clip equally likely. Weighting clips by their number
+        # of frames would let long clips dominate the training distribution.
+        group_weights = np.ones(len(self._groups), dtype=np.float64)
         if balance_key in {"style", "action"}:
             values = np.asarray(getattr(store, f"{balance_key}_ids"), dtype=np.int32)[intervals[:, 3]]
             labels = [int(values[group[0]]) for group in self._groups]

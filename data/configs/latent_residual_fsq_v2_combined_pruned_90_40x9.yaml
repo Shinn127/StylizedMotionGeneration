@@ -15,18 +15,18 @@ representation:
     fsq_noise_dropout: 0.0
 
 data:
-  feature_database: data/processed/combined_pruned_90/feature_database
+  fsq_window_index: data/processed/combined_pruned_90/fsq_window_index
   required_data_schema_version: 3
 
 sampling:
-  strategy: frame_uniform
+  strategy: clip_uniform
   target_frames: 64
   samples_per_epoch: 100000
   seed: 3407
   mirror_probability: 0.5
 
 training:
-  epochs: 100
+  epochs: 500
   lr: 0.0005
   weight_decay: 0.0
   precision: fp32
@@ -51,7 +51,7 @@ evaluation:
   root_dt: 0.016666666666666666
 
 loader:
-  batch_size: 512
+  batch_size: 256
   num_workers: 4
   pin_memory: auto
   persistent_workers: true

@@ -10,11 +10,11 @@ representation:
     fsq_noise_dropout: 0.0
 
 data:
-  feature_database: data/processed/100style_pruned_90/feature_database
+  fsq_window_index: data/processed/100style_pruned_90/fsq_window_index
   required_data_schema_version: 3
 
 sampling:
-  strategy: frame_uniform
+  strategy: clip_uniform
   target_frames: 64
   samples_per_epoch: 100000
   seed: 3407

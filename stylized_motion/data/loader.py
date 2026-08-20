@@ -115,8 +115,12 @@ def _build_sampler(
 
 
 def _validate_sampling_contract(sampling: Mapping[str, object], kind: DataKind) -> int:
-    strategy = str(sampling.get("strategy", "frame_uniform"))
-    if strategy not in {"frame_uniform", "group_balanced"}:
+    strategy = str(sampling.get("strategy", "clip_uniform"))
+    if strategy == "frame_uniform":
+        strategy = "clip_uniform"
+    if kind == "representation" and strategy != "clip_uniform":
+        raise ValueError(f"Unsupported sampling strategy: {strategy!r}")
+    if kind != "representation" and strategy not in {"clip_uniform", "group_balanced"}:
         raise ValueError(f"Unsupported sampling strategy: {strategy!r}")
     target_frames = int(sampling.get("target_frames", 64))
     if target_frames != 64:
@@ -124,6 +128,8 @@ def _validate_sampling_contract(sampling: Mapping[str, object], kind: DataKind) 
     balance_key = sampling.get("balance_key")
     if balance_key is not None and balance_key not in {"style", "action"}:
         raise ValueError("sampling.balance_key must be null, style, or action")
+    if kind == "representation" and balance_key is not None:
+        raise ValueError("FSQ sampling does not support balance_key; use clip_uniform sampling")
     if strategy == "group_balanced" and balance_key is None:
         raise ValueError("group_balanced sampling requires sampling.balance_key")
     return target_frames

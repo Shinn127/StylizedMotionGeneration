@@ -269,8 +269,8 @@ split:
 7. FeatureStore 创建 split，TokenStore/TrajectoryStore 只能继承；
 8. train stats、trajectory stats 和 sampling weights 只能读取 train split。
 
-canonical benchmark 禁止同一 source clip 的窗口跨 split。实验性 within-clip split 必须
-使用不同 policy 名称并保持 source clip 边界隔离，不得覆盖 canonical manifest。
+FSQ 的 `fixed_window_random_v1` policy 以不重叠的 64 帧窗口为 split 原子；同一 source clip
+可以在多个 split 出现，但同一 shard 内窗口不得重叠。TokenStore 必须继承该 index，不能重新切分。
 
 ## 6. Sampling Contract
 
@@ -292,7 +292,7 @@ window start。
 
 ```yaml
 sampling:
-  strategy: frame_uniform
+  strategy: clip_uniform
   target_frames: 64
   samples_per_epoch: 100000
   seed: 3407
@@ -301,9 +301,10 @@ sampling:
 ```
 
 - 不 materialize 全部 train window；
-- `frame_uniform` 按 source clip 的有效 target start 数量加权，再均匀采样 start；
+- `clip_uniform` 对 source clip 等概率采样，再在 clip 内均匀采样有效 start；
+- `frame_uniform` 作为兼容别名映射到 `clip_uniform`；
 - 先采样 source clip group，再按 mirror probability 选择 variant；
-- `group_balanced` 可按 style/action/label 平衡，但必须记录最终 sampling weight；
+- `group_balanced` 仅用于 generator 的 style/action 平衡；representation/FSQ 使用 `clip_uniform`；
 - sampling 允许 replacement，epoch 长度只由 `samples_per_epoch` 决定；
 - `(base_seed, epoch)` 生成带稳定 ordinal 的全局 request sequence，再按 rank 确定性分片；
 - rank 之间的 ordinal 不重叠；sampling with replacement 导致的 request value 偶然碰撞不属于分片错误；
@@ -485,9 +486,10 @@ validate-data
 写入流程使用 staging directory；所有 shard、manifest、index 和 full validation 成功后
 再原子发布最终 Store。失败不得留下看似完整的 `manifest.json`。
 
-FSQ 构建先生成不含 split 的 raw feature cache，再生成固定 64 帧 window index 并拟合 train stats；构建 TokenStore 和
-TrajectoryStore 时继承 manifest。`run.py` 负责 CLI dispatch 与 TokenEncoderProtocol
-注入。
+FSQ 构建先生成不含 split 的 raw feature cache，再生成自包含的固定 64 帧 window FeatureStore 并拟合 train stats；
+TokenStore 直接继承该最终 FeatureStore 的 split、range 和 feature schema，避免重复构建 feature database。
+TrajectoryStore 当前仍使用 raw motion database 的整段 clip range；迁移到 FSQ window range 前必须增加显式的 window 对齐步骤。
+`run.py` 负责 CLI dispatch 与 TokenEncoderProtocol 注入。
 
 `feature-database --dataset combined` 联合构建 LAFAN 和 100style。LAFAN 使用完整 source
 clip，100style 使用 `Frame_Cuts.csv` 中的半开区间 `[START, STOP)`；两个数据集共同参与
@@ -536,11 +538,11 @@ offline builder helper、manifest parser internal type、shard cache 和 collato
 
 ```yaml
 data:
-  feature_database: data/processed/100style_pruned/feature_database
+  fsq_window_index: data/processed/100style_pruned/fsq_window_index
   required_data_schema_version: 3
 
 sampling:
-  strategy: frame_uniform
+  strategy: clip_uniform
   target_frames: 64
   samples_per_epoch: 100000
   seed: 3407
@@ -607,7 +609,7 @@ loader:
 - `data` package 的 import graph 不包含 `stylized_motion.learning`；
 - manifest JSON 不含绝对路径，index NPZ 可用 `allow_pickle=False` 读取；
 - 三种 Store data schema v3、split manifest 和 frame index 完全对齐；
-- source clip/mirror 不跨 split，train/val/test source id 交集为空；
+- FSQ 的固定窗口不重叠，mirror 与原始窗口保持同一 split；`fixed_window_random_v1` 允许 source clip 跨 split；
 - train request 跨 epoch 变化，相同 seed/epoch/world size 可复现；
 - request sequence 不随 num_workers 变化，不同 rank 的 global sequence ordinal 不重叠；
 - representation batch 为 `[B,64,230]`，64 帧全部进入 loss/metric；
@@ -624,7 +626,7 @@ loader:
 
 1. data schema v3 使用 `manifest.json + index.npz + mmap .npy shards`。
 2. data package 不依赖 learning；token encoder 由 composition root 注入。
-3. source clip 是 canonical split 原子，mirror 不改变 source clip sampling weight。
+3. FSQ 使用固定 64 帧窗口作为 split 原子，mirror 不改变 source clip sampling weight。
 4. train random crop，val/test fixed windows。
 5. representation 使用 64-frame causal window；generator 使用 65 token frame。
 6. default batch tensor-only；token 在 CPU 保持 uint8。

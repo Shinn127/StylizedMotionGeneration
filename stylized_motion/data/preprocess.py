@@ -727,9 +727,11 @@ def build_fsq_window_index(
 ) -> Path:
     """Build the FSQ-only 64-frame window index and train normalization."""
     output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists() and not overwrite:
         raise FileExistsError(f"FSQ window index already exists: {output}")
     cache = open_feature_cache(feature_cache)
+    staging: Path | None = None
     try:
         source_records = cache.manifest.get("source_clips", [])
         heldout = set(str(value) for value in cache.manifest.get("unseen_style_names", []))
@@ -763,7 +765,7 @@ def build_fsq_window_index(
             shutil.rmtree(staging)
         staging.mkdir(parents=True, exist_ok=True)
         motion_files: list[str] = []
-        for shard_idx, source_path in enumerate(cache.motion_files):
+        for shard_idx in range(len(cache.motion_files)):
             values = cache.read_motion(shard_idx)
             relative = Path("motion") / f"shard_{shard_idx:05d}.npy"
             path = staging / relative
@@ -776,7 +778,7 @@ def build_fsq_window_index(
         source_ids = np.asarray([source_id_map[cache.range_names[shard_idx]] for shard_idx, _start, _stop, _split in records], dtype=np.int32)
         split_ids = np.asarray([split for _shard, _start, _stop, split in records], dtype=np.uint8)
         shard_frames = cache.shard_num_frames.copy()
-        np.savez(staging / "index.npz", shard_num_frames=shard_frames, clip_ids=np.asarray([s for s, *_ in records], dtype=np.int32), source_clip_ids=source_ids, range_shard_indices=np.asarray([s for s, *_ in records], dtype=np.int32), range_starts=np.asarray([a for _s, a, _b, _split in records], dtype=np.int64), range_stops=np.asarray([b for _s, _a, b, _split in records], dtype=np.int64), range_mirror=np.asarray([cache.range_mirror[s] for s, *_ in records], dtype=bool), split_ids=split_ids, style_ids=np.zeros(len(records), dtype=np.int32), action_ids=np.zeros(len(records), dtype=np.int32), offset=stats.offset, scale=stats.scale, dist=stats.dist, weights=stats.weights, ref_pos=stats.ref_pos)
+        np.savez(staging / "index.npz", shard_num_frames=shard_frames, clip_ids=np.asarray([s for s, *_ in records], dtype=np.int32), source_clip_ids=source_ids, range_shard_indices=np.asarray([s for s, *_ in records], dtype=np.int32), range_starts=np.asarray([a for _s, a, _b, _split in records], dtype=np.int64), range_stops=np.asarray([b for _s, _a, b, _split in records], dtype=np.int64), range_mirror=np.asarray([cache.range_mirror[s] for s, *_ in records], dtype=bool), split_ids=split_ids, offset=stats.offset, scale=stats.scale, dist=stats.dist, weights=stats.weights, ref_pos=stats.ref_pos)
         names_sha256 = hashlib.sha256(canonical_json_bytes(cache.names)).hexdigest()
         stats_sha256 = hashlib.sha256()
         for key in ("offset", "scale", "weights", "ref_pos"):
@@ -784,13 +786,18 @@ def build_fsq_window_index(
             stats_sha256.update(np.asarray(getattr(stats, key), dtype=np.float32).tobytes())
         schema_payload = {"name": "motion_feature_v2", "motion_dim": MOTION_DIM, "joint_subset": cache.joint_subset, "names_sha256": names_sha256, "stats_sha256": stats_sha256.hexdigest()}
         schema_hash = hashlib.sha256(canonical_json_bytes(schema_payload)).hexdigest()
-        manifest = {"data_schema_version": 3, "store_type": "feature", "frame_rate": 60, "num_shards": len(motion_files), "shard_files": motion_files, "shard_sha256": [sha256_file(staging / value) for value in motion_files], "split_manifest_hash": hashlib.sha256(canonical_json_bytes({"policy": "fixed_window_random_v1", "seed": int(seed), "window_frames": FSQ_WINDOW_FRAMES, "ratios": FSQ_SPLIT_RATIOS, "records": records})).hexdigest(), "feature_schema_hash": schema_hash, "created_by": "stylized_motion.data.preprocess", "motion_dim": MOTION_DIM, "range_names": range_names, "source_clip_names": sorted(source_names), "style_names": sorted(set(str(record.get("style", "")) for record in source_records if str(record.get("style", "")) not in heldout)), "action_names": [], "feature_schema": {**schema_payload, "names": cache.names, "parents": cache.parents.tolist()}, "normalization_train_frames": len(train_records) * FSQ_WINDOW_FRAMES, "split_policy": "fixed_window_random_v1", "window_frames": FSQ_WINDOW_FRAMES, "split_seed": int(seed), "split_ratios": FSQ_SPLIT_RATIOS, "unseen_style_names": sorted(heldout)}
+        manifest = {"data_schema_version": 3, "store_type": "feature", "frame_rate": 60, "num_shards": len(motion_files), "shard_files": motion_files, "shard_sha256": [sha256_file(staging / value) for value in motion_files], "split_manifest_hash": hashlib.sha256(canonical_json_bytes({"policy": "fixed_window_random_v1", "seed": int(seed), "window_frames": FSQ_WINDOW_FRAMES, "ratios": FSQ_SPLIT_RATIOS, "records": records})).hexdigest(), "feature_schema_hash": schema_hash, "created_by": "stylized_motion.data.preprocess", "motion_dim": MOTION_DIM, "range_names": range_names, "source_clip_names": sorted(source_names), "feature_schema": {**schema_payload, "names": cache.names, "parents": cache.parents.tolist()}, "normalization_train_frames": len(train_records) * FSQ_WINDOW_FRAMES, "split_policy": "fixed_window_random_v1", "window_frames": FSQ_WINDOW_FRAMES, "split_seed": int(seed), "split_ratios": FSQ_SPLIT_RATIOS, "unseen_style_names": sorted(heldout)}
         (staging / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=True, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         unseen_rows: list[tuple[int, int, int]] = []
         for shard_idx, start, stop in unseen:
             unseen_rows.extend(((shard_idx, start, stop), (shard_idx + 1, start, stop)))
         np.savez(staging / "unseen_index.npz", windows=np.asarray(unseen_rows, dtype=np.int64))
+        validate_data(feature_database=staging, full=False)
         _publish_store(staging, output, overwrite)
+    except Exception:
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging)
+        raise
     finally:
         cache.close()
     return output
@@ -1479,8 +1486,10 @@ def validate_data(
                     raise ValueError(f"FeatureStore and TokenStore are not aligned at {key}")
         if full:
             for store in stores:
-                for relative, expected in zip(store.manifest["shard_files"], store.manifest["shard_sha256"]):
-                    path = store.database / str(relative)
+                shard_paths = getattr(store, "motion_files", None)
+                if shard_paths is None:
+                    shard_paths = [store.database / str(value) for value in store.manifest["shard_files"]]
+                for path, expected in zip(shard_paths, store.manifest["shard_sha256"]):
                     if sha256_file(path) != str(expected):
                         raise ValueError(f"Shard checksum mismatch: {path}")
                 if store.manifest.get("store_type") == "token" and store.manifest.get("code_shard_files") is not None:
@@ -1571,7 +1580,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     windows.add_argument("--seed", type=int, default=3407)
     windows.add_argument("--overwrite", action="store_true")
     token = subparsers.add_parser("token-database")
-    token.add_argument("--feature-database", type=Path, required=True)
+    token.add_argument("--feature-database", "--feature-store", dest="feature_database", type=Path, required=True)
     token.add_argument("--output", type=Path, required=True)
     token.add_argument("--checkpoint", type=Path, required=True)
     token.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
@@ -1588,7 +1597,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     trajectory.add_argument("--output", type=Path, required=True)
     trajectory.add_argument("--overwrite", action="store_true")
     validate = subparsers.add_parser("validate-data")
-    validate.add_argument("--feature-database", type=Path, default=None)
+    validate.add_argument("--feature-database", "--feature-store", dest="feature_database", type=Path, default=None)
     validate.add_argument("--token-database", type=Path, default=None)
     validate.add_argument("--trajectory-database", type=Path, default=None)
     validate.add_argument("--full", action="store_true")

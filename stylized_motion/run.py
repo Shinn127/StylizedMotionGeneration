@@ -87,7 +87,7 @@ def _run_token_database(forwarded_args: list[str]) -> None:
     """Load the checkpoint in the composition root and inject its encoder."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--feature-database", type=Path, required=True)
+    parser.add_argument("--feature-database", "--feature-store", dest="feature_database", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")

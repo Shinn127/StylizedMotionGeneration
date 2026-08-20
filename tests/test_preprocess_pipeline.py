@@ -29,7 +29,7 @@ from stylized_motion.data.preprocess import (
     validate_data,
 )
 import stylized_motion.data.preprocess as preprocess_module
-from stylized_motion.data.sampling import SampleRequest
+from stylized_motion.data.sampling import SampleRequest, TrainWindowSampler
 
 
 def _motion(nframes: int) -> dict[str, np.ndarray | list[str]]:
@@ -207,6 +207,39 @@ def test_normalize_motion_shard_updates_file_in_chunks(tmp_path: Path):
     _normalize_motion_shard(path, stats, chunk_size=2)
 
     np.testing.assert_allclose(np.load(path), (raw - stats.offset) / stats.scale)
+
+
+def test_train_sampler_balances_source_clips_not_window_counts():
+    rows = []
+    source_ids = []
+    shard_ids = []
+    starts = []
+    stops = []
+    mirrors = []
+    for source_id, window_count in ((0, 1), (1, 8)):
+        for mirror in (False, True):
+            shard_id = len(set(shard_ids))
+            for window_idx in range(window_count):
+                row = len(rows)
+                start = window_idx * 64
+                rows.append((shard_id, start, start + 64, row))
+                source_ids.append(source_id)
+                shard_ids.append(shard_id)
+                starts.append(start)
+                stops.append(start + 64)
+                mirrors.append(mirror)
+    store = type("Store", (), {
+        "split_ids": np.zeros(len(rows), dtype=np.uint8),
+        "source_clip_ids": np.asarray(source_ids, dtype=np.int32),
+        "range_shard_indices": np.asarray(shard_ids, dtype=np.int32),
+        "range_starts": np.asarray(starts, dtype=np.int64),
+        "range_stops": np.asarray(stops, dtype=np.int64),
+        "range_mirror": np.asarray(mirrors, dtype=bool),
+        "style_ids": np.zeros(len(rows), dtype=np.int32),
+        "action_ids": np.zeros(len(rows), dtype=np.int32),
+    })()
+    sampler = TrainWindowSampler(store, samples_per_epoch=16, seed=3407)
+    np.testing.assert_allclose(sampler._group_weights, [0.5, 0.5])
 
 
 def test_save_motion_shard_creates_directory_under_output(tmp_path: Path):

@@ -74,7 +74,7 @@ python -m stylized_motion.run \
 
 ### 3.2 FSQ feature cache and window index
 
-FSQ 数据构建分为两个阶段：`feature-cache` 只把完整 source sequence 转为未归一化的帧级 `motion_feature_v2`；`fsq-window-index` 再切分不重叠的 64 帧 window、按固定 seed 以 8:1:1 分配并只用 train windows 拟合 normalization。100style 最后 10 个 style 会写入 cache，但排除出标准训练 index，记录在 `unseen_style_names`。
+FSQ 数据构建只保留两个阶段：`feature-cache` 把完整 source sequence 转为未归一化的帧级 `motion_feature_v2`；`fsq-window-index` 在自己的 staging 目录中生成归一化 shard、切分不重叠的 64 帧 window，并按固定 seed 以 8:1:1 分配。100style 最后 10 个 style 会写入 cache，但排除出标准训练 index，记录在 `unseen_style_names`。
 
 ```bash
 python -m stylized_motion.run \
@@ -112,22 +112,28 @@ python -m stylized_motion.run \
   --overwrite
 ```
 
-旧的 `feature-database` 入口仍保留用于兼容 token/trajectory pipeline；FSQ 训练使用上面的两阶段入口。如果后续需要构建
-trajectory inputs，可显式添加 `--motion-database-output data/processed/combined/motion_database.npz`；
-独立的 `motion-database` pipeline 仍保持可用。LAFAN 的 style/action 使用 `__unknown__` 占位，
-不从文件名推断，taxonomy 留作后续 TODO。
+旧的 `feature-database` 入口仍保留用于兼容旧的 token/trajectory 构建；FSQ 训练只使用上面的两阶段入口。
+TokenStore 可以直接继承 `fsq-window-index` 的最终 FeatureStore metadata 和 split，避免再次构建一套 feature database。
+Trajectory 目前仍从 raw `motion-database.npz` 生成；它使用整段 source clip range，与 FSQ 的 64 帧 window range 尚未统一，暂不要混用两者。
+如需 trajectory inputs，仍可显式添加 `--motion-database-output` 或单独运行 `motion-database`。
 
 combined Store 的 `range_names` 使用 `lafan/<clip>` 和 `100style/<style>_<clip>` 前缀，避免 source clip 冲突。
 
 物理布局：
 
 ```text
-feature_database/
-  manifest.json
-  index.npz
-  motion/shard_00000.npy
-  motion/shard_00001.npy
-  ...
+feature_cache/
+    manifest.json
+    index.npz
+    motion/shard_00000.npy
+    ...
+
+fsq_window_index/
+    manifest.json
+    index.npz
+    unseen_index.npz
+    motion/shard_00000.npy
+    ...
 ```
 
 manifest 保存 data schema、相对 shard 路径、split manifest、feature schema、skeleton metadata 和 hash；index 保存 shard/range/split 数值索引及 normalization arrays。运行时使用 mmap 和 lazy shard cache，不会一次加载全部动作。
@@ -137,7 +143,7 @@ manifest 保存 data schema、相对 shard 路径、split manifest、feature sch
 ```bash
 python -m stylized_motion.run \
   --mode preprocess --pipeline validate-data \
-  --feature-database data/processed/100style_pruned_90/feature_database \
+  --feature-store data/processed/100style_pruned_90/fsq_window_index \
   --full
 ```
 
@@ -161,7 +167,7 @@ FeatureStore
 
 ### 4.1 Sampling
 
-- train 使用 epoch-aware 随机 frame crop，支持 `samples_per_epoch` 和 mirror probability；
+- train 先均匀采样 source clip，再在该 clip 的有效窗口内随机采样，支持 `samples_per_epoch` 和 mirror probability；因此 clip 长度不会直接改变总体采样概率；
 - val/test 使用确定性的完整 64 帧窗口，默认 stride 为 64，尾部不足窗口的部分丢弃；
 - DDP 下 sampler 按 rank 分配互不重叠的 sample positions；
 - 相同 Store、seed、epoch、world size 产生可复现采样序列；
@@ -353,12 +359,12 @@ Token database 必须使用已训练的 representation checkpoint。`run.py` 在
 python -m stylized_motion.run \
   --mode preprocess --pipeline token-database \
   --checkpoint outputs/flat_fsq_40x9/best.pt \
-  --feature-database data/processed/100style_pruned_90/feature_database \
+  --feature-store data/processed/100style_pruned_90/fsq_window_index \
   --output data/processed/100style_pruned_90/flat_fsq_40x9 \
   --device cuda --chunk-size 1024 --save-codes
 ```
 
-TokenStore 继承 FeatureStore 的 range、source clip、split、frame rate 和 feature schema，不重新生成 split。每个 token frame 保存 `[40]` 个 `uint8` index；可选 FSQ code 以 `float16` 保存。分块编码时会读取所需的 63 帧历史，保持 chunk 边界的 causal 语义。
+TokenStore 继承最终 FeatureStore 的 range、source clip、split、frame rate 和 feature schema，不重新生成 split。每个 token frame 保存 `[40]` 个 `uint8` index；可选 FSQ code 以 `float16` 保存。分块编码时会读取所需的 63 帧历史，保持 chunk 边界的 causal 语义。
 
 ### 9.2 Generator batch
 
@@ -397,7 +403,7 @@ generator checkpoint 绑定 tokenizer checkpoint SHA256、TokenStore representat
 python -m stylized_motion.run \
   --mode visualize --pipeline motion \
   --checkpoint outputs/flat_fsq_40x9/best.pt \
-  --feature-database data/processed/100style_pruned_90/feature_database \
+  --feature-database data/processed/100style_pruned_90/fsq_window_index \
   --range-idx 0 --start 0 --length 240 \
   --view compare --device cuda
 ```
@@ -412,7 +418,7 @@ python -m stylized_motion.run \
 python -m stylized_motion.run \
   --mode visualize --pipeline part-edit \
   --checkpoint outputs/latent_residual_fsq_v2_40x9/best.pt \
-  --feature-database data/processed/100style_pruned_90/feature_database \
+  --feature-database data/processed/100style_pruned_90/fsq_window_index \
   --target-range-idx 0 --target-start 0 \
   --donor-range-idx 16 --donor-start 0 \
   --length 240 \
@@ -431,7 +437,7 @@ python -m stylized_motion.run \
 python -m stylized_motion.run \
   --mode visualize --pipeline part-edit \
   --checkpoint outputs/latent_residual_fsq_v2_40x9/best.pt \
-  --feature-database data/processed/100style_pruned_90/feature_database \
+  --feature-database data/processed/100style_pruned_90/fsq_window_index \
   --target-range-idx 0 --target-start 0 \
   --donor-range-idx 16 --donor-start 0 \
   --length 240 --part left_arm \
@@ -496,7 +502,7 @@ python -m stylized_motion.run \
   --generator-checkpoint outputs/generator_flat_fsq_40x9/best.pt \
   --fsq-checkpoint outputs/flat_fsq_40x9/best.pt \
   --token-database data/processed/100style_pruned_90/flat_fsq_40x9 \
-  --feature-database data/processed/100style_pruned_90/feature_database \
+  --feature-database data/processed/100style_pruned_90/fsq_window_index \
   --seed-source reencode --range-idx 0 --seed-frames 64 --device cuda
 ```
 
@@ -508,7 +514,7 @@ python -m stylized_motion.run \
   --generator-checkpoint outputs/generator_flat_fsq_40x9/best.pt \
   --fsq-checkpoint outputs/flat_fsq_40x9/best.pt \
   --token-database data/processed/100style_pruned_90/flat_fsq_40x9 \
-  --feature-database data/processed/100style_pruned_90/feature_database \
+  --feature-database data/processed/100style_pruned_90/fsq_window_index \
   --dry-run --dry-run-frames 120
 ```
 
