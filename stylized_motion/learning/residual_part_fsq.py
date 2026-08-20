@@ -14,11 +14,11 @@ from stylized_motion.learning.part_layout import PART_NAMES, PartFSQLayout
 GROUP_NAMES = ("base", *PART_NAMES)
 GROUP_COORDINATES = {
     "base": 20,
-    "torso": 4,
+    "torso": 6,
     "left_leg": 4,
     "right_leg": 4,
-    "left_arm": 4,
-    "right_arm": 4,
+    "left_arm": 3,
+    "right_arm": 3,
 }
 
 
