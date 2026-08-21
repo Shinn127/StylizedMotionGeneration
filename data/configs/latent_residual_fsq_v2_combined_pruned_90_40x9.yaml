@@ -38,12 +38,12 @@ training:
   edit_weight: 0.25
   edit_preserve_weight: 1.0
   delta_weight: 3.0
-  root_pos_weight: 0.5
-  root_rot_weight: 0.5
+  root_pos_weight: 0.1
+  root_rot_weight: 0.1
   joint_weight: 0.5
-  contact_weight: 0.2
-  foot_slide_weight: 0.5
-  foot_height_weight: 0.25
+  contact_weight: 0.1
+  foot_slide_weight: 0.1
+  foot_height_weight: 0.1
   contact_temperature: 10.0
 
 evaluation:
@@ -51,7 +51,7 @@ evaluation:
   root_dt: 0.016666666666666666
 
 loader:
-  batch_size: 256
+  batch_size: 512
   num_workers: 4
   pin_memory: auto
   persistent_workers: true
