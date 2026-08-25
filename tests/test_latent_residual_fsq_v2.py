@@ -1,6 +1,7 @@
 import torch
 
 from stylized_motion.learning.latent_residual_fsq_v2 import LatentResidualPartFSQV2MotionAutoencoder
+from stylized_motion.learning.losses import compute_latent_residual_v2_representation_losses
 from stylized_motion.learning.part_layout import PART_NAMES
 from stylized_motion.learning.residual_part_fsq import GROUP_NAMES
 
@@ -102,3 +103,48 @@ def test_v2_is_strictly_causal_with_rf64():
         actual = model(changed)["recon_state"][:, 64]
     assert (model.receptive_field, model.lookahead_frames) == (64, 0)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_v2_base_recon_uses_feature_weights_and_loss_mask():
+    model = _model()
+    motion = torch.zeros(1, 2, model.motion_dim)
+    base_recon = torch.zeros_like(motion)
+    base_recon[0, 0, 0] = 1.0
+    base_recon[0, 1, 0] = 100.0
+    losses = compute_latent_residual_v2_representation_losses(
+        {"base_recon_state": base_recon},
+        {
+            "motion": motion,
+            "feature_weights": torch.cat((torch.tensor([2.0]), torch.ones(model.motion_dim - 1))),
+            "loss_mask": torch.tensor([[True, False]]),
+            "base_recon_weight": 1.0,
+        },
+        model.layout,
+    )
+    torch.testing.assert_close(losses["base_recon"], torch.tensor(2.0 / model.motion_dim))
+
+
+def test_v2_edit_representation_losses_backpropagate():
+    torch.manual_seed(7)
+    model = _model().train()
+    motion = torch.randn(3, 64, model.motion_dim)
+    output = model(
+        motion,
+        decode_base=True,
+        edit_part="left_leg",
+        donor_permutation=torch.tensor([1, 2, 0]),
+    )
+    losses = compute_latent_residual_v2_representation_losses(
+        output,
+        {
+            "motion": motion,
+            "feature_weights": torch.ones(model.motion_dim),
+            "loss_mask": torch.ones(3, 64, dtype=torch.bool),
+            "base_recon_weight": 1.0,
+            "edit_weight": 1.0,
+            "edit_preserve_weight": 1.0,
+        },
+        model.layout,
+    )
+    sum(losses.values()).backward()
+    assert any(parameter.grad is not None for parameter in model.parameters())

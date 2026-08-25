@@ -22,6 +22,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from stylized_motion.data import FeatureStore, build_data_loaders, open_feature_store
 from stylized_motion.learning.checkpoint import CheckpointManager
+from stylized_motion.learning.gradient_probe import compute_gradient_probe
 from stylized_motion.learning.losses import compute_motion_reconstruction_losses
 from stylized_motion.learning.part_layout import PART_NAMES
 from stylized_motion.learning.representation import (
@@ -46,7 +47,20 @@ LOSS_COMPONENTS = (
     "contact",
     "foot_slide",
     "foot_height",
+    "base_recon",
+    "part_edit_transfer",
+    "part_edit_preserve",
 )
+_WEIGHTED_MOTION_COMPONENTS = {
+    "recon": None,
+    "delta": "delta_weight",
+    "root_pos": "root_pos_weight",
+    "root_rot": "root_rot_weight",
+    "joint": "joint_weight",
+    "contact": "contact_weight",
+    "foot_slide": "foot_slide_weight",
+    "foot_height": "foot_height_weight",
+}
 
 
 def choose_device(name: str = "auto") -> torch.device:
@@ -158,13 +172,35 @@ def _foot_indices(store: FeatureStore) -> tuple[int, int] | None:
         return None
 
 
+def _joint_weights_from_feature_weights(
+    feature_weights: torch.Tensor,
+    num_joints: int,
+) -> torch.Tensor:
+    """Project the stored per-feature weights to non-root joint weights."""
+    if num_joints <= 1:
+        raise ValueError(f"num_joints must be greater than one, got {num_joints}")
+    weights = feature_weights.reshape(-1)
+    rotation_start = 9
+    rotation_stop = rotation_start + (num_joints - 1) * 6
+    if weights.numel() < rotation_stop:
+        raise ValueError(
+            f"Feature weights have length {weights.numel()}, too short for "
+            f"{num_joints} joints"
+        )
+    rotation_weights = weights[rotation_start:rotation_stop].reshape(num_joints - 1, 6)
+    non_root = rotation_weights.mean(dim=-1)
+    return torch.cat((weights.new_zeros(1), non_root), dim=0)
+
+
 def build_loss_context(config: Mapping[str, object], store: FeatureStore, device: torch.device) -> dict[str, Any]:
     training = config["training"]
     evaluation = config["evaluation"]
     assert isinstance(training, Mapping) and isinstance(evaluation, Mapping)
     stats = store.stats
+    feature_weights = torch.from_numpy(store.model_feature_weights()).to(device)
     context: dict[str, Any] = {
-        "feature_weights": torch.from_numpy(store.model_feature_weights()).to(device),
+        "feature_weights": feature_weights,
+        "joint_weights": _joint_weights_from_feature_weights(feature_weights, len(store.names)),
         "feature_offset": torch.from_numpy(stats.offset.astype(np.float32)).to(device),
         "feature_scale": torch.from_numpy(stats.scale.astype(np.float32)).to(device),
         "ref_pos": torch.from_numpy(stats.ref_pos.astype(np.float32)).to(device),
@@ -218,6 +254,7 @@ def build_loss_fn(representation: RepresentationProtocol, context: Mapping[str, 
             root_rot_weight=context["root_rot_weight"],
             root_dt=context["root_dt"],
             joint_weight=context["joint_weight"],
+            joint_weights=context["joint_weights"],
             contact_weight=context["contact_weight"],
             foot_slide_weight=context["foot_slide_weight"],
             foot_height_weight=context["foot_height_weight"],
@@ -246,6 +283,28 @@ def build_loss_fn(representation: RepresentationProtocol, context: Mapping[str, 
         return result
 
     return compute
+
+
+def _effective_loss_components(
+    values: Mapping[str, torch.Tensor],
+    context: Mapping[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Return scalar loss contributions exactly as included in ``values['loss']``."""
+    components: dict[str, torch.Tensor] = {}
+    for name, weight_key in _WEIGHTED_MOTION_COMPONENTS.items():
+        value = values.get(name)
+        if not isinstance(value, torch.Tensor):
+            continue
+        if weight_key is None:
+            components[name] = value
+        else:
+            components[name] = value * float(context[weight_key])
+    for name in ("base_recon", "part_edit_transfer", "part_edit_preserve"):
+        value = values.get(name)
+        if isinstance(value, torch.Tensor):
+            # V2 representation losses already apply their configured scalar.
+            components[name] = value
+    return components
 
 
 def _scalar(value: Any) -> float:
@@ -344,6 +403,7 @@ class RepresentationRunner:
         optimizer: torch.optim.Optimizer | None = None,
         scheduler: Any | None = None,
         writer: SummaryWriter | None = None,
+        gradient_probe_path: Path | None = None,
     ) -> None:
         self.representation = representation
         self.family = family
@@ -363,6 +423,17 @@ class RepresentationRunner:
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.writer = writer
+        training = self.config.get("training", {})
+        if not isinstance(training, Mapping):
+            raise ValueError("training config must be a mapping")
+        self.gradient_probe_enabled = bool(training.get("gradient_probe_enabled", False))
+        self.gradient_probe_interval = int(training.get("gradient_probe_interval", 503))
+        if self.gradient_probe_enabled and self.gradient_probe_interval <= 0:
+            raise ValueError("training.gradient_probe_interval must be positive")
+        self.gradient_probe_file = None
+        if self.gradient_probe_enabled and _is_main_process() and gradient_probe_path is not None:
+            gradient_probe_path.parent.mkdir(parents=True, exist_ok=True)
+            self.gradient_probe_file = gradient_probe_path.open("a", encoding="utf-8")
         self.global_step = 0
         self.best_val: float | None = None
         evaluation = self.config.get("evaluation", {})
@@ -376,6 +447,46 @@ class RepresentationRunner:
         if self.precision == "amp" and device.type != "cuda":
             raise ValueError("AMP is only enabled for CUDA in the canonical runner")
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.precision == "amp")
+
+    def _write_gradient_probe(
+        self,
+        epoch: int,
+        step: int,
+        output: Mapping[str, Any],
+        probe: Mapping[str, Any],
+    ) -> None:
+        if self.gradient_probe_file is None:
+            return
+        record = {
+            "epoch": int(epoch),
+            "step": int(step),
+            "edit_part": output.get("edit_part"),
+            **probe,
+        }
+        self.gradient_probe_file.write(json.dumps(record, sort_keys=True) + "\n")
+        self.gradient_probe_file.flush()
+        if self.writer is None:
+            return
+        self.writer.add_scalar("gradient/train/total_norm", probe["total_norm"], step)
+        self.writer.add_scalar("gradient/train/component_norm_sum", probe["component_norm_sum"], step)
+        self.writer.add_scalar("gradient/train/loss_recompose_error", probe["loss_recompose_error"], step)
+        components = probe.get("components", {})
+        if isinstance(components, Mapping):
+            for name, metrics in components.items():
+                if not isinstance(metrics, Mapping):
+                    continue
+                for metric_name in ("value", "norm", "share", "projection", "cosine"):
+                    if metric_name in metrics:
+                        self.writer.add_scalar(
+                            f"gradient/train/{name}/{metric_name}",
+                            float(metrics[metric_name]),
+                            step,
+                        )
+
+    def close(self) -> None:
+        if self.gradient_probe_file is not None:
+            self.gradient_probe_file.close()
+            self.gradient_probe_file = None
 
     @property
     def protocol(self) -> RepresentationProtocol:
@@ -540,6 +651,20 @@ class RepresentationRunner:
             )
             values = self.loss_fn(output, device_batch)
             loss = values["loss"]
+            probe_step = self.global_step + 1
+            should_probe = (
+                self.gradient_probe_enabled
+                and _is_main_process()
+                and probe_step % self.gradient_probe_interval == 0
+            )
+            if should_probe:
+                components = _effective_loss_components(values, self.config["training"])
+                probe = compute_gradient_probe(
+                    components,
+                    loss,
+                    tuple(self.representation.parameters()),
+                )
+                self._write_gradient_probe(epoch, probe_step, output, probe)
             if self.precision == "amp":
                 self.scaler.scale(loss).backward()
                 if self.grad_clip_norm and self.grad_clip_norm > 0:
@@ -795,10 +920,12 @@ def main(argv: list[str] | None = None) -> None:
         optimizer=optimizer,
         scheduler=scheduler,
         writer=writer,
+        gradient_probe_path=output / "gradient_probe.jsonl",
     )
     try:
         result = runner.run(args.workflow_mode, split=args.split)
     finally:
+        runner.close()
         if writer is not None:
             writer.close()
         store.close()

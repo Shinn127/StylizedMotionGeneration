@@ -11,6 +11,7 @@ from stylized_motion.learning.losses import (
     reconstruct_joint_positions,
     rotation_6d_to_matrix,
 )
+from stylized_motion.learning.runner import _joint_weights_from_feature_weights
 
 
 def _identity_rotation_6d() -> torch.Tensor:
@@ -61,6 +62,46 @@ def test_motion_fsq_can_skip_sequence_statistics():
     assert result[10].item() == 0.0
     assert result[11].item() == 0.0
     assert result[12].item() == 0.0
+
+
+def test_delta_loss_uses_feature_weights():
+    motion = torch.zeros(1, 3, 4)
+    recon = motion.clone()
+    recon[:, 1:, 0] = torch.tensor([1.0, 3.0])
+    common = dict(
+        batch_motion=motion,
+        feature_offset=torch.zeros(4),
+        feature_scale=torch.ones(4),
+        delta_weight=1.0,
+        commit_weight=0.0,
+        root_pos_weight=0.0,
+        root_rot_weight=0.0,
+        root_dt=1.0 / 60.0,
+        joint_weight=0.0,
+        contact_weight=0.0,
+        foot_slide_weight=0.0,
+        foot_height_weight=0.0,
+    )
+    unweighted = compute_motion_reconstruction_losses(
+        output={"recon_state": recon, "commit_loss": motion.new_zeros(())},
+        feature_weights=torch.ones(4),
+        **common,
+    )
+    weighted = compute_motion_reconstruction_losses(
+        output={"recon_state": recon, "commit_loss": motion.new_zeros(())},
+        feature_weights=torch.tensor([2.0, 1.0, 1.0, 1.0]),
+        **common,
+    )
+    torch.testing.assert_close(unweighted.delta, torch.tensor(0.375))
+    torch.testing.assert_close(weighted.delta, torch.tensor(0.75))
+
+
+def test_joint_weights_are_projected_from_rotation_feature_weights():
+    feature_weights = torch.ones(32)
+    feature_weights[9:15] = 2.0
+    feature_weights[15:21] = 4.0
+    projected = _joint_weights_from_feature_weights(feature_weights, num_joints=3)
+    torch.testing.assert_close(projected, torch.tensor([0.0, 2.0, 4.0]))
 
 
 def test_joint_and_foot_losses_use_target_contact_gates():

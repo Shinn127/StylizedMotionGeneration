@@ -28,6 +28,26 @@ class MotionReconstructionLosses:
 VQVAELosses = MotionReconstructionLosses
 
 
+def _masked_weighted_mean(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Average weighted values over valid elements."""
+    if weights is not None:
+        weights = weights.to(device=values.device, dtype=values.dtype).reshape(-1)
+        if values.shape[-1] != weights.numel():
+            raise ValueError(
+                f"Weights have length {weights.numel()}, expected {values.shape[-1]}"
+            )
+        values = values * weights.view(*([1] * (values.ndim - 1)), -1)
+    mask = mask.to(device=values.device, dtype=values.dtype)
+    while mask.ndim < values.ndim:
+        mask = mask.unsqueeze(-1)
+    mask = mask.expand_as(values)
+    return (values * mask).sum() / mask.sum().clamp_min(1.0)
+
+
 def integrate_root_trajectory(
     motion: torch.Tensor,
     feature_offset: torch.Tensor,
@@ -268,21 +288,18 @@ def compute_motion_reconstruction_losses(
         raise ValueError(f"loss_mask must have shape {tuple(batch_motion.shape[:2])}, got {tuple(loss_mask.shape)}")
     loss_mask = loss_mask.to(device=batch_motion.device, dtype=torch.bool)
 
-    def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        while mask.ndim < values.ndim:
-            mask = mask.unsqueeze(-1)
-        mask = mask.to(dtype=values.dtype)
-        return (values * mask).sum() / mask.sum().clamp_min(1.0)
-
-    feature_weights = feature_weights.view(1, 1, -1).to(batch_motion.device)
+    feature_weights = feature_weights.to(device=batch_motion.device, dtype=batch_motion.dtype).reshape(-1)
     feature_offset = feature_offset.to(batch_motion.device, dtype=batch_motion.dtype)
     feature_scale = feature_scale.to(batch_motion.device, dtype=batch_motion.dtype)
 
-    recon_loss = masked_mean(feature_weights * torch.abs(recon - batch_motion), loss_mask)
+    recon_loss = _masked_weighted_mean(
+        torch.abs(recon - batch_motion), loss_mask, feature_weights
+    )
     pair_mask = loss_mask[:, 1:] & loss_mask[:, :-1]
-    delta_loss = masked_mean(
+    delta_loss = _masked_weighted_mean(
         torch.abs((recon[:, 1:] - recon[:, :-1]) - (batch_motion[:, 1:] - batch_motion[:, :-1])),
         pair_mask,
+        feature_weights,
     )
     commit_loss = output["commit_loss"]
     motion_raw_pred = denormalize_motion_features(recon, feature_offset, feature_scale)
@@ -314,12 +331,12 @@ def compute_motion_reconstruction_losses(
                 return_rotations=need_root_rotations,
             )
         root_pos_loss = (
-            masked_mean(torch.abs(pred_root_positions[:, 1:] - target_root_positions[:, 1:]), loss_mask[:, 1:])
+            _masked_weighted_mean(torch.abs(pred_root_positions[:, 1:] - target_root_positions[:, 1:]), loss_mask[:, 1:])
             if compute_root_pos
             else recon.new_zeros(())
         )
         root_rot_loss = (
-            masked_mean(quat.torch_quat_angle(pred_root_rotations[:, 1:], target_root_rotations[:, 1:]), loss_mask[:, 1:])
+            _masked_weighted_mean(quat.torch_quat_angle(pred_root_rotations[:, 1:], target_root_rotations[:, 1:]), loss_mask[:, 1:])
             if compute_root_rot
             else recon.new_zeros(())
         )
@@ -352,14 +369,14 @@ def compute_motion_reconstruction_losses(
         else:
             weights = joint_weights.to(batch_motion.device, dtype=batch_motion.dtype).clone()
         weights[0] = 0.0
-        joint_error = F.smooth_l1_loss(pred_joint_positions, target_joint_positions, reduction="none").sum(dim=-1)
-        joint_loss = masked_mean(joint_error * weights.view(1, 1, -1), loss_mask)
+        joint_error = F.smooth_l1_loss(pred_joint_positions, target_joint_positions, reduction="none").mean(dim=-1)
+        joint_loss = _masked_weighted_mean(joint_error, loss_mask, weights)
     else:
         joint_loss = recon.new_zeros(())
 
     if contact_weight > 0.0:
         contact_logits = float(contact_temperature) * (motion_raw_pred[..., -2:] - 0.5)
-        contact_loss = masked_mean(
+        contact_loss = _masked_weighted_mean(
             F.binary_cross_entropy_with_logits(contact_logits, target_contact, reduction="none"), loss_mask
         )
     else:
@@ -378,12 +395,12 @@ def compute_motion_reconstruction_losses(
         target_feet = target_world_positions[:, :, list(foot_indices)]
         contact_gate = target_contact[:, 1:] * target_contact[:, :-1]
         foot_velocity = (pred_feet[:, 1:] - pred_feet[:, :-1]) / float(root_dt)
-        horizontal_speed = foot_velocity[..., (0, 2)].abs().sum(dim=-1)
+        horizontal_speed = foot_velocity[..., (0, 2)].abs().mean(dim=-1)
         valid_contact_gate = contact_gate * pair_mask.unsqueeze(-1).to(contact_gate.dtype)
-        foot_slide_loss = (horizontal_speed * valid_contact_gate).sum() / valid_contact_gate.sum().clamp_min(1.0)
+        foot_slide_loss = _masked_weighted_mean(horizontal_speed, valid_contact_gate)
         foot_height_error = (pred_feet[..., 1] - target_feet[..., 1]).abs()
         valid_target_contact = target_contact * loss_mask.unsqueeze(-1).to(target_contact.dtype)
-        foot_height_loss = (foot_height_error * valid_target_contact).sum() / valid_target_contact.sum().clamp_min(1.0)
+        foot_height_loss = _masked_weighted_mean(foot_height_error, valid_target_contact)
     else:
         foot_slide_loss = recon.new_zeros(())
         foot_height_loss = recon.new_zeros(())
@@ -430,8 +447,7 @@ def _code_reuse_loss(codes: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         return codes.new_zeros(())
     changes = codes[:, 1:] - codes[:, :-1]
     penalty = torch.sqrt(changes.square() + 1e-6) - 1e-3
-    weighted = penalty.mean(dim=-1) * gate
-    return weighted.sum() / gate.sum().clamp_min(1.0)
+    return _masked_weighted_mean(penalty, gate)
 
 
 def compute_part_representation_losses(
@@ -485,7 +501,7 @@ def compute_latent_residual_representation_losses(
                 "latent_residual_energy must have shape [B,T] when loss_mask is provided"
             )
         mask = loss_mask.to(device=residual_energy.device, dtype=residual_energy.dtype)
-        residual_energy = (residual_energy * mask).sum() / mask.sum().clamp_min(1.0)
+        residual_energy = _masked_weighted_mean(residual_energy, mask)
     elif residual_energy.ndim != 0:
         residual_energy = residual_energy.mean()
     return {
@@ -509,7 +525,17 @@ def compute_latent_residual_v2_representation_losses(
     if not isinstance(feature_weights, torch.Tensor):
         feature_weights = torch.ones(motion.shape[-1], device=motion.device, dtype=motion.dtype)
     feature_weights = feature_weights.to(device=motion.device, dtype=motion.dtype)
-    base_loss = (torch.abs(base_recon - motion) * feature_weights.view(1, 1, -1)).mean()
+    loss_mask = batch.get("loss_mask")
+    if not isinstance(loss_mask, torch.Tensor):
+        loss_mask = torch.ones(motion.shape[:2], device=motion.device, dtype=torch.bool)
+    if loss_mask.shape != motion.shape[:2]:
+        raise ValueError(
+            "V2 representation loss_mask must have shape "
+            f"{tuple(motion.shape[:2])}, got {tuple(loss_mask.shape)}"
+        )
+    base_loss = _masked_weighted_mean(
+        torch.abs(base_recon - motion), loss_mask, feature_weights
+    )
     losses = {"base_recon": base_loss * float(batch.get("base_recon_weight", 0.1))}
 
     if edit_recon is None:
@@ -526,8 +552,16 @@ def compute_latent_residual_v2_representation_losses(
     part_index = layout.feature_indices(motion.shape[-1])[edit_part].to(motion.device)
     part_mask = torch.zeros(motion.shape[-1], device=motion.device, dtype=torch.bool)
     part_mask[part_index] = True
-    transfer = torch.abs(edit_recon[..., part_mask] - donor[..., part_mask]).mean()
-    preserve = torch.abs(edit_recon[..., ~part_mask] - motion[..., ~part_mask]).mean()
+    transfer = _masked_weighted_mean(
+        torch.abs(edit_recon[..., part_mask] - donor[..., part_mask]),
+        loss_mask,
+        feature_weights[part_mask],
+    )
+    preserve = _masked_weighted_mean(
+        torch.abs(edit_recon[..., ~part_mask] - motion[..., ~part_mask]),
+        loss_mask,
+        feature_weights[~part_mask],
+    )
     edit_weight = float(batch.get("edit_weight", 0.25))
     losses["part_edit_transfer"] = transfer * edit_weight
     losses["part_edit_preserve"] = preserve * edit_weight * float(batch.get("edit_preserve_weight", 1.0))

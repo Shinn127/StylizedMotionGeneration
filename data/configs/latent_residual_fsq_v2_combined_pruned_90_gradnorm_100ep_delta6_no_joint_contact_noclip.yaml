@@ -1,0 +1,63 @@
+representation:
+  family: latent_residual_fsq_v2
+  variant: v2
+  architecture_version: 3
+  config:
+    motion_dim: 230
+    base_code_dim: 128
+    base_width: 512
+    part_state_dim: 64
+    part_predictor_hidden_dim: 128
+    part_encoder_width: 128
+    num_levels: 9
+    fsq_scale:
+    fsq_preserve_symmetry: false
+    fsq_noise_dropout: 0.0
+
+data:
+  fsq_window_index: data/processed/combined_pruned_90/fsq_window_index
+  required_data_schema_version: 3
+
+sampling:
+  strategy: clip_uniform
+  target_frames: 64
+  samples_per_epoch: 100000
+  seed: 3407
+  mirror_probability: 0.5
+
+training:
+  epochs: 100
+  lr: 0.0005
+  weight_decay: 0.0
+  precision: fp32
+  seed: 3407
+  deterministic: false
+  grad_clip_norm: 0.0
+  gradient_probe_enabled: true
+  gradient_probe_interval: 503
+  output_dir: outputs/latent_residual_fsq_v2_combined_pruned_90_gradnorm_100ep_delta6_no_joint_contact_noclip
+  base_recon_weight: 0.1
+  edit_weight: 0.25
+  edit_preserve_weight: 1.0
+  delta_weight: 6.0
+  root_pos_weight: 0.1
+  root_rot_weight: 0.1
+  joint_weight: 0.0
+  contact_weight: 0.0
+  foot_slide_weight: 0.1
+  foot_height_weight: 0.1
+  contact_temperature: 10.0
+
+evaluation:
+  metrics_interval: 100
+  root_dt: 0.016666666666666666
+
+loader:
+  batch_size: 512
+  num_workers: 4
+  pin_memory: auto
+  persistent_workers: true
+  prefetch_factor: 2
+  drop_last_train: true
+  max_open_shards: 32
+  prefetch_memory_limit_mb: 512
