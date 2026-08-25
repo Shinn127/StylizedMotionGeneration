@@ -115,15 +115,12 @@ class FeatureCache:
 
 def open_feature_cache(database: str | Path, *, max_open_shards: int = 32) -> FeatureCache:
     database = Path(database)
-    manifest_path = database / "manifest.json"
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Missing feature cache manifest: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict) or manifest.get("store_type") != "feature_cache":
+    manifest = _read_manifest(database, "Feature cache")
+    if manifest.get("store_type") != "feature_cache":
         raise ValueError("Expected a feature_cache manifest")
-    shard_files = [database / str(value) for value in manifest.get("shard_files", [])]
-    if not shard_files or any(not path.exists() for path in shard_files):
-        raise FileNotFoundError("Feature cache manifest references missing shards")
+    shard_files = _manifest_files(database, manifest, label="Feature cache")
+    if not shard_files:
+        raise ValueError("Feature cache must contain at least one shard")
     index = _load_index(database)
     required = {"shard_num_frames", "range_mirror", "ref_pos"}
     _require_index(index, required, "Feature cache")
@@ -150,10 +147,13 @@ def open_feature_cache(database: str | Path, *, max_open_shards: int = 32) -> Fe
         pair = slice(source_idx * 2, source_idx * 2 + 2)
         if range_names[pair.start] != range_names[pair.start + 1] or tuple(range_mirror[pair]) != (False, True):
             raise ValueError("Feature cache shards must be ordered as original/mirror pairs")
-    for path, expected in zip(shard_files, frames.tolist()):
-        values = np.load(path, mmap_mode="r", allow_pickle=False)
-        if values.dtype != np.float32 or values.shape != (int(expected), MOTION_DIM):
-            raise ValueError(f"Feature cache shard has invalid shape: {path}")
+    _validate_shard_arrays(
+        shard_files,
+        frames,
+        dtype=np.float32,
+        tail_shape=(MOTION_DIM,),
+        label="Feature cache",
+    )
     return FeatureCache(
         database=database,
         manifest=manifest,
@@ -202,8 +202,6 @@ def _require_manifest(manifest: Mapping[str, object], store_type: str) -> None:
             raise ValueError(f"Manifest field {key!r} must be a non-empty string")
     if any(not isinstance(value, str) or not value for value in shard_hashes):
         raise ValueError("Manifest shard_sha256 entries must be non-empty strings")
-    for value in shard_files:
-        _require_relative_path(value, "shard")
 
 
 def _require_relative_path(value: object, label: str) -> None:
@@ -214,12 +212,73 @@ def _require_relative_path(value: object, label: str) -> None:
         raise ValueError(f"Store manifest {label} paths must be relative to the store root")
 
 
+def _manifest_files(
+    database: Path,
+    manifest: Mapping[str, object],
+    key: str = "shard_files",
+    label: str = "Store",
+) -> list[Path]:
+    values = manifest.get(key)
+    if not isinstance(values, list):
+        raise ValueError(f"{label} manifest field {key!r} must be a JSON list")
+    for value in values:
+        _require_relative_path(value, key.removesuffix("_files"))
+    paths = [database / value for value in values]
+    missing = [str(path) for path in paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"{label} manifest references missing files: {missing[:3]}")
+    return paths
+
+
+def _validate_shard_arrays(
+    paths: Iterable[Path],
+    frame_counts: Iterable[int],
+    *,
+    dtype: np.dtype[Any],
+    tail_shape: tuple[int, ...] = (),
+    label: str,
+) -> None:
+    paths = list(paths)
+    frame_counts = [int(value) for value in frame_counts]
+    if len(paths) != len(frame_counts):
+        raise ValueError(f"{label} shard metadata has inconsistent lengths")
+    expected_dtype = np.dtype(dtype)
+    for path, frames in zip(paths, frame_counts):
+        values = np.load(path, mmap_mode="r", allow_pickle=False)
+        expected_shape = (frames, *tail_shape)
+        if values.dtype != expected_dtype or values.shape != expected_shape:
+            raise ValueError(
+                f"{label} shard {path} has dtype/shape {values.dtype}/{values.shape}, "
+                f"expected {expected_dtype}/{expected_shape}"
+            )
+
+
+def _validate_shard_hashes(paths: Iterable[Path], expected: Iterable[object], label: str) -> None:
+    paths = list(paths)
+    expected = list(expected)
+    if len(paths) != len(expected):
+        raise ValueError(f"{label} checksum metadata has inconsistent lengths")
+    for path, digest in zip(paths, expected):
+        if sha256_file(path) != str(digest):
+            raise ValueError(f"{label} checksum mismatch: {path}")
+
+
 def _load_index(database: Path) -> dict[str, np.ndarray]:
     path = database / "index.npz"
     if not path.exists():
         raise FileNotFoundError(f"Missing data index: {path}")
     with np.load(path, allow_pickle=False) as npz:
         return {key: np.asarray(npz[key]) for key in npz.files}
+
+
+def _read_manifest(database: Path, label: str) -> dict[str, object]:
+    path = database / "manifest.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing {label} manifest: {path}")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} manifest must be a JSON object")
+    return value
 
 
 def _require_index(index: Mapping[str, np.ndarray], keys: set[str], label: str = "Store") -> None:
@@ -370,15 +429,8 @@ class FeatureStore:
         target_stop = target_start + int(request.target_frames)
         if target_start < range_start or target_stop > range_stop:
             raise IndexError("SampleRequest target exceeds its source range")
-        actual_start = target_start
         array = cache.get(shard_idx)
-        if array.ndim != 2 or array.dtype != np.float32 or array.shape[1] != self.motion_dim:
-            raise ValueError(f"Motion shard has dtype/shape {array.dtype}/{array.shape}, expected float32/[N,{self.motion_dim}]")
-        values = np.asarray(array[actual_start:target_stop], dtype=np.float32)
-        expected = int(request.target_frames)
-        if values.shape != (expected, self.motion_dim):
-            raise RuntimeError(f"Feature read returned {values.shape}, expected {(expected, self.motion_dim)}")
-        return np.ascontiguousarray(values, dtype=np.float32)
+        return np.ascontiguousarray(array[target_start:target_stop], dtype=np.float32)
 
     def read_motion(self, request: SampleRequest) -> np.ndarray:
         if not isinstance(request, SampleRequest):
@@ -410,27 +462,14 @@ class FeatureStore:
         return state
 
 
-def _read_manifest(database: Path) -> dict[str, object]:
-    path = database / "manifest.json"
-    if not path.exists():
-        raise FileNotFoundError(f"Missing feature manifest: {path}")
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError("Feature manifest must be a JSON object")
-    return value
-
-
 def open_feature_store(database: str | Path, *, max_open_shards: int = 32) -> FeatureStore:
     database = Path(database)
-    manifest = _read_manifest(database)
+    manifest = _read_manifest(database, "Feature")
     _require_manifest(manifest, "feature")
     index = _load_index(database)
-    shard_files = [database / str(value) for value in manifest["shard_files"]]
+    shard_files = _manifest_files(database, manifest, label="Feature")
     if len(shard_files) != int(manifest["num_shards"]):
         raise ValueError("Feature manifest shard count is invalid")
-    if any(not path.exists() for path in shard_files):
-        missing = [str(path) for path in shard_files if not path.exists()]
-        raise FileNotFoundError(f"Missing feature shards: {missing[:3]}")
     common = _check_common_index(index, manifest, len(shard_files), "Feature")
     _, clip_ids, source_clip_ids, range_shards, range_starts, range_stops, range_mirror, split_ids = common
     schema = manifest.get("feature_schema")
@@ -443,11 +482,13 @@ def open_feature_store(database: str | Path, *, max_open_shards: int = 32) -> Fe
     motion_dim = int(manifest.get("motion_dim", schema.get("motion_dim", 0)))
     if motion_dim != MOTION_DIM:
         raise ValueError(f"FeatureStore motion_dim must be {MOTION_DIM}, got {motion_dim}")
-    for path, expected_frames in zip(shard_files, index["shard_num_frames"].tolist()):
-        array = np.load(path, mmap_mode="r", allow_pickle=False)
-        if array.dtype != np.float32 or array.ndim != 2 or array.shape != (int(expected_frames), motion_dim):
-            raise ValueError(f"Feature shard {path} has dtype/shape {array.dtype}/{array.shape}")
-        del array
+    _validate_shard_arrays(
+        shard_files,
+        index["shard_num_frames"],
+        dtype=np.float32,
+        tail_shape=(motion_dim,),
+        label="Feature",
+    )
     _require_index(index, {"offset", "scale", "weights", "ref_pos"}, "Feature")
     stats = MotionFeatureStats(
         offset=np.asarray(index["offset"], dtype=np.float32),

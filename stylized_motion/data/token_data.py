@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-import json
 
 import numpy as np
 import torch
@@ -16,8 +15,11 @@ from .feature_data import (
     MMapShardCache,
     _check_common_index,
     _load_index,
+    _manifest_files,
+    _read_manifest,
     _require_manifest,
     _require_relative_path,
+    _validate_shard_arrays,
     sha256_file,
 )
 from .sampling import SampleRequest
@@ -175,11 +177,7 @@ class TokenStore:
         stop = start + int(sequence_frames)
         if start < int(self.range_starts[variant_idx]) or stop > int(self.range_stops[variant_idx]):
             raise IndexError("Token sequence exceeds its source range")
-        array = cache.get(shard_idx)
-        expected = (int(self.shard_num_frames[shard_idx]), self.num_coordinates)
-        if array.dtype != np.uint8 or array.ndim != 2 or array.shape != expected:
-            raise ValueError(f"Token shard has dtype/shape {array.dtype}/{array.shape}, expected uint8/{expected}")
-        return np.ascontiguousarray(array[start:stop], dtype=np.uint8)
+        return np.ascontiguousarray(cache.get(shard_idx)[start:stop], dtype=np.uint8)
 
     def read_indices(self, request: SampleRequest, sequence_frames: int) -> np.ndarray:
         if self._token_cache is None:
@@ -206,11 +204,7 @@ class TokenStore:
             raise ValueError("SampleRequest shard_idx does not match variant_idx")
         if start < int(self.range_starts[variant_idx]) or stop > int(self.range_stops[variant_idx]):
             raise IndexError("Token code sequence exceeds its source range")
-        array = self._code_cache.get(shard_idx)
-        expected = (int(self.shard_num_frames[shard_idx]), self.num_coordinates)
-        if array.dtype != np.float16 or array.shape != expected:
-            raise ValueError(f"Code shard has dtype/shape {array.dtype}/{array.shape}, expected float16/{expected}")
-        return np.ascontiguousarray(array[start:stop], dtype=np.float32)
+        return np.ascontiguousarray(self._code_cache.get(shard_idx)[start:stop], dtype=np.float32)
 
     def split_intervals(self, split: str) -> np.ndarray:
         split_id = {"train": 0, "val": 1, "test": 2}.get(split)
@@ -247,21 +241,14 @@ def _metadata_value(manifest: Mapping[str, object], key: str, default: Any = Non
 
 def open_token_store(database: str | Path, *, max_open_shards: int = 32) -> TokenStore:
     database = Path(database)
-    manifest_path = database / "manifest.json"
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Missing token manifest: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise ValueError("Token manifest must be a JSON object")
+    manifest = _read_manifest(database, "Token")
     if "context_left" in manifest or (
         isinstance(manifest.get("representation"), Mapping)
         and "context_left" in manifest["representation"]
     ):
         raise ValueError("TokenStore manifests must not contain context_left metadata")
     _require_manifest(manifest, "token")
-    shard_files = [database / str(value) for value in manifest["shard_files"]]
-    if any(not path.exists() for path in shard_files):
-        raise FileNotFoundError("Token manifest references a missing shard")
+    shard_files = _manifest_files(database, manifest, label="Token")
     code_values = manifest.get("code_shard_files")
     code_hashes = manifest.get("code_shard_sha256")
     if code_values is not None and not isinstance(code_values, list):
@@ -278,8 +265,10 @@ def open_token_store(database: str | Path, *, max_open_shards: int = 32) -> Toke
             _require_relative_path(value, "code shard")
         if any(not isinstance(value, str) or not value for value in code_hashes):
             raise ValueError("code_shard_sha256 entries must be non-empty strings")
-    if code_files is not None and any(path is not None and not path.exists() for path in code_files):
-        raise FileNotFoundError("Token manifest references a missing code shard")
+    if code_files is not None:
+        missing = [str(path) for path in code_files if path is not None and not path.exists()]
+        if missing:
+            raise FileNotFoundError(f"Token manifest references missing code shards: {missing[:3]}")
     index = _load_index(database)
     common = _check_common_index(index, manifest, len(shard_files), "Token")
     _, clip_ids, source_clip_ids, range_shards, range_starts, range_stops, range_mirror, split_ids = common
@@ -293,21 +282,22 @@ def open_token_store(database: str | Path, *, max_open_shards: int = 32) -> Toke
     action_ids = np.asarray(index.get("action_ids", np.zeros(len(range_names), dtype=np.int32)), dtype=np.int32)
     if len(style_ids) != len(range_names) or len(action_ids) != len(range_names):
         raise ValueError("Token style/action index arrays have invalid lengths")
-    for path, frames in zip(shard_files, index["shard_num_frames"].tolist()):
-        array = np.load(path, mmap_mode="r", allow_pickle=False)
-        expected = (int(frames), int(manifest.get("num_coordinates", 40)))
-        if array.dtype != np.uint8 or array.ndim != 2 or array.shape != expected:
-            raise ValueError(f"Token shard {path} has dtype/shape {array.dtype}/{array.shape}, expected uint8/{expected}")
-        del array
+    num_coordinates = int(manifest.get("num_coordinates", 40))
+    _validate_shard_arrays(
+        shard_files,
+        index["shard_num_frames"],
+        dtype=np.uint8,
+        tail_shape=(num_coordinates,),
+        label="Token",
+    )
     if code_files is not None:
-        for path, frames in zip(code_files, index["shard_num_frames"].tolist()):
-            if path is None:
-                continue
-            array = np.load(path, mmap_mode="r", allow_pickle=False)
-            expected = (int(frames), int(manifest.get("num_coordinates", 40)))
-            if array.dtype != np.float16 or array.ndim != 2 or array.shape != expected:
-                raise ValueError(f"Code shard {path} has dtype/shape {array.dtype}/{array.shape}")
-            del array
+        _validate_shard_arrays(
+            [path for path in code_files if path is not None],
+            index["shard_num_frames"],
+            dtype=np.float16,
+            tail_shape=(num_coordinates,),
+            label="Token code",
+        )
     coordinate_counts = _metadata_value(manifest, "coordinate_counts", {})
     if not isinstance(coordinate_counts, Mapping):
         raise ValueError("coordinate_counts must be a JSON object")
@@ -336,7 +326,7 @@ def open_token_store(database: str | Path, *, max_open_shards: int = 32) -> Toke
         action_ids=action_ids,
         frame_rate=int(manifest["frame_rate"]),
         motion_dim=int(_metadata_value(manifest, "motion_dim", 230)),
-        num_coordinates=int(_metadata_value(manifest, "num_coordinates", 40)),
+        num_coordinates=num_coordinates,
         num_levels=int(_metadata_value(manifest, "num_levels", 9)),
         temporal_downsample=int(_metadata_value(manifest, "temporal_downsample", 1)),
         receptive_field=int(_metadata_value(manifest, "receptive_field", 64)),

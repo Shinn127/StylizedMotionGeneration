@@ -20,14 +20,6 @@ from .trajectory_data import ConditionalTokenDataset, TrajectoryStore
 DataKind = Literal["representation", "generator", "conditional_generator"]
 
 
-class _EmptySampler(Sampler[SampleRequest]):
-    def __len__(self) -> int:
-        return 0
-
-    def __iter__(self):
-        return iter(())
-
-
 @dataclass
 class DataLoaders:
     train: DataLoader
@@ -97,21 +89,16 @@ def _build_sampler(
             rank=rank,
             world_size=world_size,
         )
-    try:
-        return FixedWindowSampler(
-            store,
-            split,
-            target_frames=target_frames,
-            required_frames=required_frames,
-            stride=int(sampling.get("stride", 64)),
-            include_tail=bool(sampling.get("include_tail", False)),
-            rank=rank,
-            world_size=world_size,
-        )
-    except ValueError as error:
-        if "contains no ranges" in str(error) or "no valid" in str(error):
-            return _EmptySampler()
-        raise
+    return FixedWindowSampler(
+        store,
+        split,
+        target_frames=target_frames,
+        required_frames=required_frames,
+        stride=int(sampling.get("stride", 64)),
+        include_tail=bool(sampling.get("include_tail", False)),
+        rank=rank,
+        world_size=world_size,
+    )
 
 
 def _validate_sampling_contract(sampling: Mapping[str, object], kind: DataKind) -> int:

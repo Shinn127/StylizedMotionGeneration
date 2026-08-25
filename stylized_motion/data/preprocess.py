@@ -21,7 +21,14 @@ from tqdm import tqdm
 
 from stylized_motion.anim import bvh, quat
 from stylized_motion.anim.features import MotionFeatureStats, build_motion_feature_components, default_joint_weights, serialize_motion_feature_stats
-from stylized_motion.data.feature_data import MOTION_DIM, canonical_json_bytes, open_feature_cache, open_feature_store, sha256_file
+from stylized_motion.data.feature_data import (
+    MOTION_DIM,
+    _validate_shard_hashes,
+    canonical_json_bytes,
+    open_feature_cache,
+    open_feature_store,
+    sha256_file,
+)
 from stylized_motion.data.trajectory_data import open_trajectory_store
 from stylized_motion.data.token_data import open_token_store
 from stylized_motion.util.paths import DATA_DIR
@@ -1488,20 +1495,19 @@ def validate_data(
             for store in stores:
                 shard_paths = getattr(store, "motion_files", None)
                 if shard_paths is None:
-                    shard_paths = [store.database / str(value) for value in store.manifest["shard_files"]]
-                for path, expected in zip(shard_paths, store.manifest["shard_sha256"]):
-                    if sha256_file(path) != str(expected):
-                        raise ValueError(f"Shard checksum mismatch: {path}")
+                    shard_paths = getattr(store, "token_files", None)
+                if shard_paths is None:
+                    shard_paths = store.trajectory_files
+                _validate_shard_hashes(shard_paths, store.manifest["shard_sha256"], "Shard")
                 if store.manifest.get("store_type") == "token" and store.manifest.get("code_shard_files") is not None:
-                    for relative, expected in zip(store.manifest["code_shard_files"], store.manifest["code_shard_sha256"]):
-                        path = store.database / str(relative)
-                        if sha256_file(path) != str(expected):
-                            raise ValueError(f"Code shard checksum mismatch: {path}")
+                    code_paths = [store.database / str(value) for value in store.manifest["code_shard_files"]]
+                    _validate_shard_hashes(code_paths, store.manifest["code_shard_sha256"], "Code shard")
                 if store.manifest.get("store_type") == "trajectory":
-                    for relative, expected in zip(store.manifest["valid_shard_files"], store.manifest["valid_shard_sha256"]):
-                        path = store.database / str(relative)
-                        if sha256_file(path) != str(expected):
-                            raise ValueError(f"Trajectory valid shard checksum mismatch: {path}")
+                    _validate_shard_hashes(
+                        store.valid_files,
+                        store.manifest["valid_shard_sha256"],
+                        "Trajectory valid shard",
+                    )
             if feature_store is not None:
                 if "normalization_train_frames" in feature_store.manifest and int(feature_store.manifest["normalization_train_frames"]) <= 0:
                     raise ValueError("FeatureStore has no recorded training statistics coverage")

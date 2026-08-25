@@ -5,13 +5,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
-import json
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .feature_data import MMapShardCache, _check_common_index, _load_index, _require_manifest, _require_relative_path
+from .feature_data import (
+    MMapShardCache,
+    _check_common_index,
+    _load_index,
+    _manifest_files,
+    _read_manifest,
+    _require_manifest,
+    _require_relative_path,
+    _validate_shard_arrays,
+)
 from .sampling import SampleRequest
 from .token_data import TokenDataset, TokenStore
 
@@ -110,11 +118,6 @@ class TrajectoryStore:
             self._valid_cache = MMapShardCache(self.valid_files, self.max_open_shards)
         values = self._value_cache.get(shard_idx)
         valid = self._valid_cache.get(shard_idx)
-        expected = (int(self.shard_num_frames[shard_idx]), self.trajectory_dim)
-        if values.dtype != np.float32 or values.shape != expected:
-            raise ValueError(f"Trajectory shard has dtype/shape {values.dtype}/{values.shape}, expected float32/{expected}")
-        if valid.dtype != np.bool_ or valid.shape != (int(self.shard_num_frames[shard_idx]),):
-            raise ValueError("Trajectory valid shard has invalid dtype/shape")
         return (
             np.ascontiguousarray(values[start:stop], dtype=np.float32),
             np.ascontiguousarray(valid[start:stop], dtype=bool),
@@ -165,12 +168,7 @@ def open_trajectory_store(
     max_open_shards: int = 32,
 ) -> TrajectoryStore:
     database = Path(database)
-    manifest_path = database / "manifest.json"
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Missing trajectory manifest: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise ValueError("Trajectory manifest must be a JSON object")
+    manifest = _read_manifest(database, "Trajectory")
     _require_manifest(manifest, "trajectory")
     valid_values = manifest.get("valid_shard_files")
     if not isinstance(valid_values, list) or len(valid_values) != len(manifest["shard_files"]):
@@ -180,10 +178,8 @@ def open_trajectory_store(
         raise ValueError("Trajectory manifest must contain valid_shard_sha256 for every valid shard")
     for value in valid_values:
         _require_relative_path(value, "valid shard")
-    trajectory_files = [database / str(value) for value in manifest["shard_files"]]
-    valid_files = [database / str(value) for value in valid_values]
-    if any(not path.exists() for path in [*trajectory_files, *valid_files]):
-        raise FileNotFoundError("Trajectory manifest references a missing shard")
+    trajectory_files = _manifest_files(database, manifest, label="Trajectory")
+    valid_files = _manifest_files(database, {"shard_files": valid_values}, label="Trajectory valid")
     index = _load_index(database)
     common = _check_common_index(index, manifest, len(trajectory_files), "Trajectory")
     _, clip_ids, source_clip_ids, range_shards, range_starts, range_stops, range_mirror, split_ids = common
@@ -199,14 +195,19 @@ def open_trajectory_store(
         raise ValueError("Trajectory manifest future_frames must be positive and non-empty")
     if not str(manifest.get("feature_order", "")):
         raise ValueError("Trajectory manifest feature_order must be non-empty")
-    for values_path, valid_path, frames in zip(trajectory_files, valid_files, index["shard_num_frames"].tolist()):
-        values = np.load(values_path, mmap_mode="r", allow_pickle=False)
-        valid = np.load(valid_path, mmap_mode="r", allow_pickle=False)
-        if values.dtype != np.float32 or values.shape != (int(frames), trajectory_dim):
-            raise ValueError(f"Trajectory shard {values_path} has invalid dtype/shape")
-        if valid.dtype != np.bool_ or valid.shape != (int(frames),):
-            raise ValueError(f"Trajectory valid shard {valid_path} has invalid dtype/shape")
-        del values, valid
+    _validate_shard_arrays(
+        trajectory_files,
+        index["shard_num_frames"],
+        dtype=np.float32,
+        tail_shape=(trajectory_dim,),
+        label="Trajectory",
+    )
+    _validate_shard_arrays(
+        valid_files,
+        index["shard_num_frames"],
+        dtype=np.bool_,
+        label="Trajectory valid",
+    )
     required = {"normalization_mean", "normalization_std"}
     if not required.issubset(index):
         raise ValueError("Trajectory index is missing normalization arrays")
