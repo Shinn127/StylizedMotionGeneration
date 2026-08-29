@@ -32,6 +32,7 @@ def load(filename, order=None):
     orients = np.array([]).reshape((0, 4))
     offsets = np.array([]).reshape((0, 3))
     parents = np.array([], dtype=int)
+    joint_channels: list[int] = []
 
     for line in f:
         if "HIERARCHY" in line:
@@ -45,6 +46,7 @@ def load(filename, order=None):
             offsets = np.append(offsets, np.array([[0, 0, 0]]), axis=0)
             orients = np.append(orients, np.array([[1, 0, 0, 0]]), axis=0)
             parents = np.append(parents, active)
+            joint_channels.append(-1)
             active = len(parents) - 1
             continue
 
@@ -67,6 +69,8 @@ def load(filename, order=None):
         chanmatch = re.match(r"\s*CHANNELS\s+(\d+)", line)
         if chanmatch:
             channels = int(chanmatch.group(1))
+            if joint_channels and 0 <= active < len(joint_channels):
+                joint_channels[active] = channels
             if order is None:
                 channelis = 0 if channels == 3 else 3
                 channelie = 3 if channels == 3 else 6
@@ -82,6 +86,7 @@ def load(filename, order=None):
             offsets = np.append(offsets, np.array([[0, 0, 0]]), axis=0)
             orients = np.append(orients, np.array([[1, 0, 0, 0]]), axis=0)
             parents = np.append(parents, active)
+            joint_channels.append(-1)
             active = len(parents) - 1
             continue
 
@@ -106,20 +111,39 @@ def load(filename, order=None):
             data_block = np.array(list(map(float, dmatch)))
             n_bones = len(parents)
             fi = i
-            if channels == 3:
+            # ``channels`` holds the last-seen CHANNELS declaration; files with
+            # a uniform layout match it exactly, while mixed layouts (e.g.
+            # soma_uniform motions: 6-channel Root and Hips plus 3-channel
+            # joints) fall through to the per-joint walk below.
+            uniform_three = channels == 3 and data_block.shape[0] == 3 + 3 * n_bones
+            uniform_six = channels == 6 and data_block.shape[0] == 6 * n_bones
+            uniform_nine = channels == 9 and data_block.shape[0] == 3 + 9 * (n_bones - 1)
+            mixed_total = sum(3 if count == 3 else 6 for count in joint_channels)
+            if uniform_three:
                 positions[fi, 0:1] = data_block[0:3]
                 rotations[fi, :] = data_block[3:].reshape(n_bones, 3)
-            elif channels == 6:
+            elif uniform_six:
                 data_block = data_block.reshape(n_bones, 6)
                 positions[fi, :] = data_block[:, 0:3]
                 rotations[fi, :] = data_block[:, 3:6]
-            elif channels == 9:
+            elif uniform_nine:
                 positions[fi, 0] = data_block[0:3]
                 data_block = data_block[3:].reshape(n_bones - 1, 9)
                 rotations[fi, 1:] = data_block[:, 3:6]
                 positions[fi, 1:] += data_block[:, 0:3] * data_block[:, 6:9]
+            elif data_block.shape[0] == mixed_total and -1 not in joint_channels:
+                # Each joint consumes its own channel count in file order.
+                cursor = 0
+                for bone, joint_channel_count in enumerate(joint_channels):
+                    if joint_channel_count == 3:
+                        rotations[fi, bone] = data_block[cursor : cursor + 3]
+                        cursor += 3
+                    else:
+                        positions[fi, bone] = data_block[cursor : cursor + 3]
+                        rotations[fi, bone] = data_block[cursor + 3 : cursor + 6]
+                        cursor += 6
             else:
-                raise Exception(f"Too many channels! {channels}")
+                raise Exception(f"Unsupported channel layout: {data_block.shape[0]} values for {n_bones} bones")
 
             i += 1
 
