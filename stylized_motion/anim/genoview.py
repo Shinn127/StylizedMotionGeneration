@@ -1,5 +1,6 @@
 import argparse
 import struct
+from dataclasses import dataclass
 from pathlib import Path
 
 import cffi
@@ -16,6 +17,33 @@ from stylized_motion.util.paths import RESOURCE_DIR
 
 
 ffi = cffi.FFI()
+
+
+@dataclass(frozen=True)
+class RigSpec:
+    """Character assets and skeleton conventions used by the viewer.
+
+    ``sim_position_joint``/``sim_rotation_joint`` define the simulation-root
+    convention shared with the preprocess pipeline; ``unit_scale`` converts
+    BVH offsets to the mesh's unit (Geno.bin and SOMA meshes are in meters).
+    """
+
+    model_filename: str
+    bind_bvh_filename: str
+    sim_position_joint: str
+    sim_rotation_joint: str
+    unit_scale: float
+    window_title: bytes
+
+
+GENO_RIG = RigSpec(
+    model_filename="Geno.bin",
+    bind_bvh_filename="Geno_bind.bvh",
+    sim_position_joint="Spine2",
+    sim_rotation_joint="Hips",
+    unit_scale=0.01,
+    window_title=b"GenoView",
+)
 
 
 class Camera:
@@ -406,14 +434,14 @@ def update_model_pose_from_numpy_arrays(model, bind_pos, bind_rot, anim_pos, ani
     mat_array[:, :3, 3] = mesh_pos
 
 
-def build_simulation_root_skeleton_from_bind(bind_bvh_path: Path):
+def build_simulation_root_skeleton_from_bind(bind_bvh_path: Path, rig: RigSpec = GENO_RIG):
     bind_data = load_bvh_data(bind_bvh_path)
-    positions = bind_data["positions"].astype(np.float32) * 0.01
+    positions = bind_data["positions"].astype(np.float32) * rig.unit_scale
     rotations = quat.unroll(quat.from_euler(np.radians(bind_data["rotations"]), order=bind_data["order"])).astype(np.float32)
 
     global_rotations, global_positions = quat.fk(rotations, positions, bind_data["parents"])
-    sim_position_joint = bind_data["names"].index("Spine2")
-    sim_rotation_joint = bind_data["names"].index("Hips")
+    sim_position_joint = bind_data["names"].index(rig.sim_position_joint)
+    sim_rotation_joint = bind_data["names"].index(rig.sim_rotation_joint)
 
     sim_position = np.array([1.0, 0.0, 1.0], dtype=np.float32) * global_positions[:, sim_position_joint : sim_position_joint + 1]
     sim_direction = np.array([1.0, 0.0, 1.0], dtype=np.float32) * quat.mul_vec(
@@ -438,31 +466,31 @@ def load_bvh_data(path: Path):
     return bvh.load(str(path))
 
 
-def build_database_from_bvh(bvh_path: Path, range_name: str | None = None) -> dict[str, np.ndarray]:
+def build_database_from_bvh(bvh_path: Path, range_name: str | None = None, rig: RigSpec = GENO_RIG) -> dict[str, np.ndarray]:
     """Convert one BVH clip into the database contract consumed by GenoView."""
     data = load_bvh_data(Path(bvh_path))
-    positions = data["positions"].astype(np.float32) * 0.01
+    positions = data["positions"].astype(np.float32) * rig.unit_scale
     rotations = quat.unroll(
         quat.from_euler(np.radians(data["rotations"]), order=data["order"])
     ).astype(np.float32)
     names = list(data["names"])
     parents = np.asarray(data["parents"], dtype=np.int32)
 
-    required = ("Hips", "Spine2")
+    required = (rig.sim_position_joint, rig.sim_rotation_joint)
     missing = [name for name in required if name not in names]
     if missing:
         raise ValueError(
-            f"BVH {bvh_path} is incompatible with GenoView; missing joints: {missing}"
+            f"BVH {bvh_path} is incompatible with the {rig.window_title.decode()} skeleton; missing joints: {missing}"
         )
 
     # Match the project's simulation-root convention without importing the
     # dataset-building pipeline (which would also pull in its CLI machinery).
     global_rotations, global_positions = quat.fk(rotations, positions, parents)
     sim_position = np.array([1.0, 0.0, 1.0], dtype=np.float32) * global_positions[
-        :, names.index("Spine2") : names.index("Spine2") + 1
+        :, names.index(rig.sim_position_joint) : names.index(rig.sim_position_joint) + 1
     ]
     sim_direction = quat.mul_vec(
-        global_rotations[:, names.index("Hips") : names.index("Hips") + 1],
+        global_rotations[:, names.index(rig.sim_rotation_joint) : names.index(rig.sim_rotation_joint) + 1],
         np.array([0.0, 0.0, 1.0], dtype=np.float32),
     )
     sim_direction = sim_direction / np.maximum(
@@ -643,7 +671,9 @@ class GenoView:
         left_label: str = "Source",
         right_label: str = "Recon",
         compare_spacing: float = 2.0,
+        rig: RigSpec = GENO_RIG,
     ):
+        self.rig = rig
         self.database = database
         self.positions = self.database["positions"].astype(np.float32)
         self.rotations = self.database["rotations"].astype(np.float32)
@@ -826,17 +856,17 @@ class GenoView:
         ground_mesh = GenMeshPlane(20.0, 20.0, 10, 10)
         self.ground_model = LoadModelFromMesh(ground_mesh)
 
-        self.geno_model = load_geno_model(self.resources_root / "Geno.bin")
+        self.geno_model = load_geno_model(self.resources_root / self.rig.model_filename)
         self.bind_pos, self.bind_rot = get_model_bind_pose_as_numpy_arrays(self.geno_model)
         if self.compare_mode:
-            self.compare_model = load_geno_model(self.resources_root / "Geno.bin")
+            self.compare_model = load_geno_model(self.resources_root / self.rig.model_filename)
             self.compare_bind_pos, self.compare_bind_rot = get_model_bind_pose_as_numpy_arrays(self.compare_model)
         (
             self.full_names,
             self.full_parents,
             self.full_bind_local_positions,
             self.full_bind_local_rotations,
-        ) = build_simulation_root_skeleton_from_bind(self.resources_root / "Geno_bind.bvh")
+        ) = build_simulation_root_skeleton_from_bind(self.resources_root / self.rig.bind_bvh_filename, self.rig)
         self.full_name_to_index = {name: idx for idx, name in enumerate(self.full_names)}
 
         if len(self.full_names) - 1 != self.geno_model.boneCount:
@@ -945,7 +975,7 @@ class GenoView:
         screen_width = 1280
         screen_height = 720
         SetConfigFlags(FLAG_VSYNC_HINT)
-        InitWindow(screen_width, screen_height, b"GenoView")
+        InitWindow(screen_width, screen_height, self.rig.window_title)
         SetTargetFPS(self.fps)
         rlSetClipPlanes(0.01, 50.0)
         self._initialize_rendering(screen_width, screen_height)
@@ -1253,6 +1283,7 @@ class GenoViewCompare(GenoView):
         left_label: str = "Source",
         right_label: str = "Recon",
         compare_spacing: float = 2.0,
+        rig: RigSpec = GENO_RIG,
     ):
         super().__init__(
             database=left_database,
@@ -1263,6 +1294,7 @@ class GenoViewCompare(GenoView):
             left_label=left_label,
             right_label=right_label,
             compare_spacing=compare_spacing,
+            rig=rig,
         )
 
 

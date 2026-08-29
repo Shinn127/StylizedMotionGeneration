@@ -8,3 +8,4 @@ PROJECT_ROOT = PACKAGE_ROOT.parent
 DATA_DIR = PROJECT_ROOT / "data"
 CONFIG_DIR = DATA_DIR / "configs"
 RESOURCE_DIR = DATA_DIR / "assets" / "genoview"
+SOMA_RESOURCE_DIR = DATA_DIR / "assets" / "somaview"

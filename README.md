@@ -463,7 +463,50 @@ Part-FSQ 和 Residual Part-FSQ 还会保存 `edited_indices.npy`。终端输出�
 
 `target-range-idx` 和 `donor-range-idx` 是 FeatureStore range index，`target-start` 和 `donor-start` 是各自 range 内的相对帧。checkpoint 与 FeatureStore 必须具有相同的 structural feature schema 和 skeleton；如果 normalization statistics 不同，pipeline 会先还原 raw feature，再按 checkpoint statistics 重新标准化。
 
-### 10.3 GenoView
+### 10.3 SomaView
+
+SomaView 用 GenoView 的同一渲染管线播放 BONES-SEED 数据集的 SOMA 骨架动作。SOMA rig 与 Geno 共享 simulation-root 约定(同为 `Hips`/`Spine2` 关节、厘米 BVH、ZYX 欧拉角),因此查看器直接复用,只需替换资产。
+
+资产需要从 BONES-SEED 的 `soma_shapes` 生成一次(gated 数据集,需先在 HuggingFace 上接受 license;只下载 `soma_shapes` 子目录,约 5MB,不含动作数据):
+
+```bash
+hf download bones-studio/seed --repo-type dataset --include "soma_shapes/*" \
+  --local-dir data/raw/bones_seed
+
+python -m stylized_motion.run \
+  --mode preprocess --pipeline soma-assets \
+  --usd data/raw/bones_seed/soma_shapes/soma_base_rig/soma_base_skel_minimal.usd \
+  --bvh data/raw/bones_seed/soma_shapes/soma_base_rig/soma_base_skel_minimal.bvh \
+  --output-dir data/assets/somaview --overwrite
+```
+
+转换器从 USD 提取 78 关节骨架和 18056 顶点蒙皮网格(每顶点 8 影响,截断为 top-4 重归一),bind pose 采用 USD `bindTransforms` 的蒙皮 rest pose(与 bind BVH 的 T-pose 是不同姿态),写出 GenoView 二进制契约的 `SOMA.bin` 并拷贝着色器。资产与 Geno 相同被 gitignore,删库后用上面命令再生成。
+
+播放 soma_uniform 动作(SOMA 采集帧率 120fps):
+
+```bash
+python -m stylized_motion.run \
+  --mode visualize --pipeline somaview \
+  --bvh data/raw/bones_seed/soma_uniform/bvh/<clip>.bvh --fps 120
+```
+
+在下载动作数据之前,可以先检查两个标准姿态(转换时一并生成,均无窗口冒烟通过):
+
+```bash
+# T-pose:bind BVH 的第 0 帧,定义骨架层级
+python -m stylized_motion.run --mode visualize --pipeline somaview \
+  --bvh data/assets/somaview/SOMA_bind.bvh
+
+# A-pose:USD bindTransforms 的蒙皮 rest pose,由转换器导出
+python -m stylized_motion.run --mode visualize --pipeline somaview \
+  --bvh data/assets/somaview/SOMA_apose.bvh
+```
+
+A-pose BVH 从 USD 世界 bind 变换反解局部旋转和平移再写回 ZYX 欧拉,经 FK 闭环校验(与 USD 逐关节零误差)。
+
+也支持 `--database` npz;`--features` 需要尚不存在的 SOMA 特征库,为预留接口。关节名校验要求数据库关节是 SOMA bind 骨架(78 关节)的子集,缺失部位保持 bind pose。
+
+### 10.4 GenoView
 
 ```bash
 python -m stylized_motion.run \
@@ -494,7 +537,7 @@ python -m stylized_motion.run \
 
 GenoView 支持播放、暂停、逐帧移动、速度调整、时间轴拖拽和相机交互。
 
-### 10.4 实时 FSQ rollout
+### 10.5 实时 FSQ rollout
 
 ```bash
 python -m stylized_motion.run \

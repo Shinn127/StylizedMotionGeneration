@@ -40,8 +40,10 @@ COMMANDS: dict[tuple[str, str], str] = {
     ("visualize", "motion"): "stylized_motion.anim.view_motion_sequence",
     ("visualize", "part-edit"): "stylized_motion.anim.view_part_edit",
     ("visualize", "genoview"): "stylized_motion.anim.genoview",
+    ("visualize", "somaview"): "stylized_motion.anim.somaview",
     ("visualize", "realtime"): "stylized_motion.anim.realtime_fsq_controller",
     ("visualize", "plot"): "stylized_motion.anim.visualization",
+    ("preprocess", "soma-assets"): "stylized_motion.anim.soma_assets",
 }
 
 
