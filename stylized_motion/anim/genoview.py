@@ -447,7 +447,9 @@ def build_simulation_root_skeleton_from_bind(bind_bvh_path: Path, rig: RigSpec =
     sim_direction = np.array([1.0, 0.0, 1.0], dtype=np.float32) * quat.mul_vec(
         global_rotations[:, sim_rotation_joint : sim_rotation_joint + 1], np.array([0.0, 0.0, 1.0], dtype=np.float32)
     )
-    sim_direction = sim_direction / np.sqrt(np.sum(np.square(sim_direction), axis=-1))[..., np.newaxis]
+    sim_direction = sim_direction / np.maximum(
+        np.sqrt(np.sum(np.square(sim_direction), axis=-1))[..., np.newaxis], 1e-8
+    )
     sim_rotation = quat.normalize(quat.between(np.array([0.0, 0.0, 1.0], dtype=np.float32), sim_direction))
 
     positions[:, 0:1] = quat.mul_vec(quat.inv(sim_rotation), positions[:, 0:1] - sim_position)
@@ -522,6 +524,7 @@ def build_database_from_bvh(bvh_path: Path, range_name: str | None = None, rig: 
         "range_names": np.asarray([range_name], dtype=object),
         "range_mirror": np.asarray([False], dtype=bool),
         "joint_subset": np.asarray("full", dtype=object),
+        "frame_time": np.asarray(float(data["frametime"] or (1.0 / 60.0)), dtype=np.float32),
     }
 
 
@@ -666,7 +669,7 @@ class GenoView:
         database: dict[str, np.ndarray],
         trajectory_path: Path | None,
         resources_root: Path,
-        fps: int = 60,
+        fps: int | None = None,
         compare_database: dict[str, np.ndarray] | None = None,
         left_label: str = "Source",
         right_label: str = "Recon",
@@ -683,7 +686,8 @@ class GenoView:
         self.range_names = self.database["range_names"]
         self.range_starts = self.database["range_starts"].astype(np.int32)
         self.range_stops = self.database["range_stops"].astype(np.int32)
-        self.fps = fps
+        frame_time = float(np.asarray(self.database.get("frame_time", 1.0 / 60.0)).item())
+        self.fps = int(fps) if fps is not None else int(round(1.0 / frame_time))
         self.resources_root = resources_root
         self.compare_database = compare_database
         self.compare_mode = compare_database is not None
@@ -932,7 +936,14 @@ class GenoView:
         if self.use_pruned_reconstruction:
             local_rotations, local_positions = self._reconstruct_full_local_pose_for(positions, rotations, frame_index)
             return quat.fk(local_rotations[None], local_positions[None], self.full_parents)
-        return quat.fk(rotations[frame_index][None], positions[frame_index][None], parents)
+        global_rot, global_pos = quat.fk(rotations[frame_index][None], positions[frame_index][None], parents)
+        names = self.names if positions is self.positions else self.compare_names
+        if [str(name) for name in names.tolist()] != self.full_names:
+            name_to_index = {str(name): index for index, name in enumerate(names.tolist())}
+            order = [name_to_index[name] for name in self.full_names]
+            global_rot = global_rot[:, order]
+            global_pos = global_pos[:, order]
+        return global_rot, global_pos
 
     def _current_globals(self):
         return self._current_globals_for(self.positions, self.rotations, self.parents, self.frame_index)
@@ -1316,7 +1327,7 @@ def main():
         default=RESOURCE_DIR,
         help="Directory containing Geno.bin and shader files",
     )
-    parser.add_argument("--fps", type=int, default=60, help="Playback FPS")
+    parser.add_argument("--fps", type=int, default=None, help="Playback FPS (defaults to the BVH frame time)")
     args = parser.parse_args()
 
     selected_inputs = [args.database is not None, args.bvh is not None, args.features is not None]

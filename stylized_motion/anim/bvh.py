@@ -27,6 +27,7 @@ def load(filename, order=None):
     i = 0
     active = -1
     end_site = False
+    frametime = None
 
     names = []
     orients = np.array([]).reshape((0, 4))
@@ -156,6 +157,7 @@ def load(filename, order=None):
         "parents": parents,
         "names": names,
         "order": order,
+        "frametime": frametime,
     }
 
 

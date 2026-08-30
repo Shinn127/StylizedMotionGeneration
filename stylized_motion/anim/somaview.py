@@ -54,7 +54,7 @@ def main():
         default=SOMA_RESOURCE_DIR,
         help="Directory containing SOMA.bin, SOMA_bind.bvh and shader files",
     )
-    parser.add_argument("--fps", type=int, default=SOMA_FPS, help="Playback FPS (SOMA captures at 120)")
+    parser.add_argument("--fps", type=int, default=None, help="Playback FPS (defaults to the input frame time; SOMA is 120 Hz)")
     args = parser.parse_args()
 
     selected_inputs = [args.database is not None, args.bvh is not None, args.features is not None]

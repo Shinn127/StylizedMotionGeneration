@@ -10,6 +10,7 @@ from stylized_motion.anim.soma_assets import (
     build_viewer_mesh,
     parse_soma_usd,
     write_apose_bvh,
+    write_soma_bin,
     _build_bvh_bind_pose,
     _quat_to_zyx_euler_degrees,
 )
@@ -151,6 +152,14 @@ def test_parse_and_mesh_conversion(mini_rig):
     assert names == ["Simulation", "Root", "Hips", "Spine2", "Head"]
     assert np.allclose(bind["global_positions"][names.index("Hips")], [0.0, 1.0, 0.0], atol=1e-6)
     assert np.allclose(bind["global_positions"][names.index("Head")], [0.0, 1.6, 0.0], atol=1e-6)
+
+    output = usd.parent / "mini.bin"
+    write_soma_bin(output, viewer, bind)
+    raw = output.read_bytes()
+    vertex_count, triangle_count, bone_count = struct.unpack_from("<III", raw)
+    bone_offset = 12 + vertex_count * (12 + 8 + 12 + 4 + 16) + triangle_count * 6
+    parents = [struct.unpack_from("<i", raw, bone_offset + index * 36 + 32)[0] for index in range(bone_count)]
+    assert parents == [-1, 0, 1, 2]
 
 
 def test_bind_pose_is_identity_skinnable(mini_rig):

@@ -136,9 +136,13 @@ def _validate_soma_usd(skeleton: SomaSkeleton, mesh: SomaMesh) -> None:
 
 def _build_bvh_bind_pose(bind_bvh_path: Path, unit_scale: float) -> dict[str, object]:
     """Bind skeleton in the viewer's sim-root convention plus its frame-0 globals."""
-    from stylized_motion.anim.genoview import build_simulation_root_skeleton_from_bind
+    from dataclasses import replace
 
-    names, parents, local_positions, local_rotations = build_simulation_root_skeleton_from_bind(bind_bvh_path)
+    from stylized_motion.anim.genoview import GENO_RIG, build_simulation_root_skeleton_from_bind
+
+    names, parents, local_positions, local_rotations = build_simulation_root_skeleton_from_bind(
+        bind_bvh_path, replace(GENO_RIG, unit_scale=unit_scale)
+    )
     global_rotations, global_positions = quat.fk(local_rotations[None], local_positions[None], parents)
     return {
         "names": names,
@@ -299,7 +303,7 @@ def _pack_transform(position: np.ndarray, rotation_wxyz: np.ndarray) -> bytes:
 def write_soma_bin(path: Path, viewer_mesh: dict[str, np.ndarray], bind: dict[str, object]) -> None:
     """Write the GenoView-compatible binary for the SOMA mesh and bind pose."""
     bone_count = len(bind["names"]) - 1
-    bvh_parents = np.asarray(bind["parents"], dtype=np.int32)[1:]  # drop Simulation's parent slot
+    bvh_parents = np.asarray(bind["parents"], dtype=np.int32)[1:] - 1  # drop Simulation and remap model indices
     global_rotations = bind["global_rotations"]
     global_positions = bind["global_positions"]
 
