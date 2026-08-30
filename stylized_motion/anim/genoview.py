@@ -674,9 +674,19 @@ class GenoView:
         left_label: str = "Source",
         right_label: str = "Recon",
         compare_spacing: float = 2.0,
+        shading: str = "pbr",
+        metallic: float = 0.0,
+        roughness: float = 0.58,
+        exposure: float = 0.9,
+        debug_view: str = "final",
         rig: RigSpec = GENO_RIG,
     ):
         self.rig = rig
+        self.shading = shading
+        self.metallic = float(metallic)
+        self.roughness = float(roughness)
+        self.exposure = float(exposure)
+        self.debug_view = debug_view
         self.database = database
         self.positions = self.database["positions"].astype(np.float32)
         self.rotations = self.database["rotations"].astype(np.float32)
@@ -783,13 +793,15 @@ class GenoView:
         return str((self.resources_root / name).resolve()).encode()
 
     def _initialize_rendering(self, screen_width: int, screen_height: int):
-        self.shaders["basic"] = LoadShader(self._res("basic.vs"), self._res("basic.fs"))
-        self.shaders["skinned_basic"] = LoadShader(self._res("skinnedBasic.vs"), self._res("basic.fs"))
+        gbuffer_fs = "pbr.fs" if self.shading == "pbr" else "basic.fs"
+        lighting_fs = "pbrLighting.fs" if self.shading == "pbr" else "lighting.fs"
+        self.shaders["basic"] = LoadShader(self._res("basic.vs"), self._res(gbuffer_fs))
+        self.shaders["skinned_basic"] = LoadShader(self._res("skinnedBasic.vs"), self._res(gbuffer_fs))
         self.shaders["shadow"] = LoadShader(self._res("shadow.vs"), self._res("shadow.fs"))
         self.shaders["skinned_shadow"] = LoadShader(self._res("skinnedShadow.vs"), self._res("shadow.fs"))
         self.shaders["ssao"] = LoadShader(self._res("post.vs"), self._res("ssao.fs"))
         self.shaders["blur"] = LoadShader(self._res("post.vs"), self._res("blur.fs"))
-        self.shaders["lighting"] = LoadShader(self._res("post.vs"), self._res("lighting.fs"))
+        self.shaders["lighting"] = LoadShader(self._res("post.vs"), self._res(lighting_fs))
         self.shaders["fxaa"] = LoadShader(self._res("post.vs"), self._res("fxaa.fs"))
 
         self.shader_locs["basic_specularity"] = GetShaderLocation(self.shaders["basic"], b"specularity")
@@ -801,6 +813,10 @@ class GenoView:
         self.shader_locs["skinned_basic_glossiness"] = GetShaderLocation(self.shaders["skinned_basic"], b"glossiness")
         self.shader_locs["skinned_basic_cam_clip_near"] = GetShaderLocation(self.shaders["skinned_basic"], b"camClipNear")
         self.shader_locs["skinned_basic_cam_clip_far"] = GetShaderLocation(self.shaders["skinned_basic"], b"camClipFar")
+        self.shader_locs["basic_metallic"] = GetShaderLocation(self.shaders["basic"], b"pbrMetallic")
+        self.shader_locs["basic_roughness"] = GetShaderLocation(self.shaders["basic"], b"pbrRoughness")
+        self.shader_locs["skinned_basic_metallic"] = GetShaderLocation(self.shaders["skinned_basic"], b"pbrMetallic")
+        self.shader_locs["skinned_basic_roughness"] = GetShaderLocation(self.shaders["skinned_basic"], b"pbrRoughness")
 
         self.shader_locs["shadow_light_clip_near"] = GetShaderLocation(self.shaders["shadow"], b"lightClipNear")
         self.shader_locs["shadow_light_clip_far"] = GetShaderLocation(self.shaders["shadow"], b"lightClipFar")
@@ -1077,22 +1093,13 @@ class GenoView:
                 specularity_ptr[0] = 0.5
                 glossiness_ptr[0] = 10.0
 
-                SetShaderValue(self.shaders["basic"], self.shader_locs["basic_specularity"], specularity_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(self.shaders["basic"], self.shader_locs["basic_glossiness"], glossiness_ptr, SHADER_UNIFORM_FLOAT)
                 SetShaderValue(self.shaders["basic"], self.shader_locs["basic_cam_clip_near"], cam_clip_near_ptr, SHADER_UNIFORM_FLOAT)
                 SetShaderValue(self.shaders["basic"], self.shader_locs["basic_cam_clip_far"], cam_clip_far_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(
-                    self.shaders["skinned_basic"],
-                    self.shader_locs["skinned_basic_specularity"],
-                    specularity_ptr,
-                    SHADER_UNIFORM_FLOAT,
-                )
-                SetShaderValue(
-                    self.shaders["skinned_basic"],
-                    self.shader_locs["skinned_basic_glossiness"],
-                    glossiness_ptr,
-                    SHADER_UNIFORM_FLOAT,
-                )
+                if self.shading == "legacy":
+                    SetShaderValue(self.shaders["basic"], self.shader_locs["basic_specularity"], specularity_ptr, SHADER_UNIFORM_FLOAT)
+                    SetShaderValue(self.shaders["basic"], self.shader_locs["basic_glossiness"], glossiness_ptr, SHADER_UNIFORM_FLOAT)
+                    SetShaderValue(self.shaders["skinned_basic"], self.shader_locs["skinned_basic_specularity"], specularity_ptr, SHADER_UNIFORM_FLOAT)
+                    SetShaderValue(self.shaders["skinned_basic"], self.shader_locs["skinned_basic_glossiness"], glossiness_ptr, SHADER_UNIFORM_FLOAT)
                 SetShaderValue(
                     self.shaders["skinned_basic"],
                     self.shader_locs["skinned_basic_cam_clip_near"],
@@ -1210,7 +1217,7 @@ class GenoView:
                 sky_strength_ptr[0] = 0.15
                 ground_strength_ptr[0] = 0.1
                 ambient_strength_ptr[0] = 1.0
-                exposure_ptr[0] = 0.9
+                exposure_ptr[0] = self.exposure
 
                 SetShaderValueTexture(self.shaders["lighting"], self.shader_locs["lighting_gbuffer_color"], self.gbuffer.color)
                 SetShaderValueTexture(self.shaders["lighting"], self.shader_locs["lighting_gbuffer_normal"], self.gbuffer.normal)
@@ -1244,25 +1251,41 @@ class GenoView:
                     EndMode3D()
                 EndTextureMode()
 
-                BeginShaderMode(self.shaders["fxaa"])
-                fxaa_inv_texture_resolution = Vector2(1.0 / self.lighted.texture.width, 1.0 / self.lighted.texture.height)
-                SetShaderValueTexture(self.shaders["fxaa"], self.shader_locs["fxaa_input_texture"], self.lighted.texture)
-                SetShaderValue(
-                    self.shaders["fxaa"],
-                    self.shader_locs["fxaa_inv_texture_resolution"],
-                    ffi.addressof(fxaa_inv_texture_resolution),
-                    SHADER_UNIFORM_VEC2,
-                )
-                DrawTextureRec(
-                    self.lighted.texture,
-                    Rectangle(0, 0, self.lighted.texture.width, -self.lighted.texture.height),
-                    Vector2(0, 0),
-                    WHITE,
-                )
-                EndShaderMode()
+                debug_texture = {
+                    "albedo": self.gbuffer.color,
+                    "normal": self.gbuffer.normal,
+                    "depth": self.gbuffer.depth,
+                    "ssao": self.ssao_front.texture,
+                    "lighting": self.lighted.texture,
+                }.get(self.debug_view)
+                if self.debug_view == "final":
+                    BeginShaderMode(self.shaders["fxaa"])
+                    fxaa_inv_texture_resolution = Vector2(1.0 / self.lighted.texture.width, 1.0 / self.lighted.texture.height)
+                    SetShaderValueTexture(self.shaders["fxaa"], self.shader_locs["fxaa_input_texture"], self.lighted.texture)
+                    SetShaderValue(
+                        self.shaders["fxaa"],
+                        self.shader_locs["fxaa_inv_texture_resolution"],
+                        ffi.addressof(fxaa_inv_texture_resolution),
+                        SHADER_UNIFORM_VEC2,
+                    )
+                    DrawTextureRec(
+                        self.lighted.texture,
+                        Rectangle(0, 0, self.lighted.texture.width, -self.lighted.texture.height),
+                        Vector2(0, 0),
+                        WHITE,
+                    )
+                    EndShaderMode()
+                else:
+                    DrawTextureRec(
+                        debug_texture,
+                        Rectangle(0, 0, debug_texture.width, -debug_texture.height),
+                        Vector2(0, 0),
+                        WHITE,
+                    )
 
                 rlEnableColorBlend()
                 DrawFPS(10, 10)
+                DrawText(f"Debug: {self.debug_view}".encode(), 10, 232, 18, BLACK)
                 status = "Paused" if not self.playback.playing else f"Playing {self.playback.current_speed:.2f}x"
                 DrawText(f"Frame: {self.frame_index}".encode(), 10, 34, 20, BLACK)
                 DrawText(f"Range: {self._frame_range_name()}".encode(), 10, 58, 20, DARKGRAY)
@@ -1294,6 +1317,11 @@ class GenoViewCompare(GenoView):
         left_label: str = "Source",
         right_label: str = "Recon",
         compare_spacing: float = 2.0,
+        shading: str = "pbr",
+        metallic: float = 0.0,
+        roughness: float = 0.58,
+        exposure: float = 0.9,
+        debug_view: str = "final",
         rig: RigSpec = GENO_RIG,
     ):
         super().__init__(
@@ -1306,6 +1334,11 @@ class GenoViewCompare(GenoView):
             right_label=right_label,
             compare_spacing=compare_spacing,
             rig=rig,
+            shading=shading,
+            metallic=metallic,
+            roughness=roughness,
+            exposure=exposure,
+            debug_view=debug_view,
         )
 
 
@@ -1328,6 +1361,16 @@ def main():
         help="Directory containing Geno.bin and shader files",
     )
     parser.add_argument("--fps", type=int, default=None, help="Playback FPS (defaults to the BVH frame time)")
+    parser.add_argument("--shading", choices=("legacy", "pbr"), default="pbr")
+    parser.add_argument("--metallic", type=float, default=0.0)
+    parser.add_argument("--roughness", type=float, default=0.58)
+    parser.add_argument("--exposure", type=float, default=0.9)
+    parser.add_argument(
+        "--debug-view",
+        choices=("final", "albedo", "normal", "depth", "ssao", "lighting"),
+        default="final",
+        help="Display an intermediate render target for pipeline diagnosis.",
+    )
     args = parser.parse_args()
 
     selected_inputs = [args.database is not None, args.bvh is not None, args.features is not None]
@@ -1357,6 +1400,11 @@ def main():
         trajectory_path=args.trajectory,
         resources_root=args.resources_root,
         fps=args.fps,
+        shading=args.shading,
+        metallic=args.metallic,
+        roughness=args.roughness,
+        exposure=args.exposure,
+        debug_view=args.debug_view,
     )
     viewer.run()
 

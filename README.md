@@ -535,7 +535,7 @@ python -m stylized_motion.run \
   --stats-source data/processed/100style_pruned_90/feature_database
 ```
 
-GenoView 支持播放、暂停、逐帧移动、速度调整、时间轴拖拽和相机交互。
+GenoView 支持播放、暂停、逐帧移动、速度调整、时间轴拖拽和相机交互。渲染默认使用 PBR，可通过 `--shading legacy` 回退到旧版光照模型；`--shading pbr` 显式启用 Cook-Torrance 光照和 ACES tone mapping。使用 `--debug-view albedo|normal|depth|ssao|lighting` 可查看中间缓冲，用于定位颜色和光照问题。
 
 ### 10.5 实时 FSQ rollout
 

@@ -55,6 +55,16 @@ def main():
         help="Directory containing SOMA.bin, SOMA_bind.bvh and shader files",
     )
     parser.add_argument("--fps", type=int, default=None, help="Playback FPS (defaults to the input frame time; SOMA is 120 Hz)")
+    parser.add_argument("--shading", choices=("legacy", "pbr"), default="pbr")
+    parser.add_argument("--metallic", type=float, default=0.0)
+    parser.add_argument("--roughness", type=float, default=0.58)
+    parser.add_argument("--exposure", type=float, default=0.9)
+    parser.add_argument(
+        "--debug-view",
+        choices=("final", "albedo", "normal", "depth", "ssao", "lighting"),
+        default="final",
+        help="Display an intermediate render target for pipeline diagnosis.",
+    )
     args = parser.parse_args()
 
     selected_inputs = [args.database is not None, args.bvh is not None, args.features is not None]
@@ -85,6 +95,11 @@ def main():
         resources_root=args.resources_root,
         fps=args.fps,
         rig=SOMA_RIG,
+        shading=args.shading,
+        metallic=args.metallic,
+        roughness=args.roughness,
+        exposure=args.exposure,
+        debug_view=args.debug_view,
     )
     viewer.run()
 
