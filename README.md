@@ -490,6 +490,22 @@ python -m stylized_motion.run \
   --bvh data/raw/bones_seed/soma_uniform/bvh/<clip>.bvh --fps 120
 ```
 
+如果需要将 SOMA 的 120 FPS BVH 下采样为 60 FPS，可使用仓库内的批处理脚本。脚本保留原始骨架层级和通道布局，默认每隔一帧取一帧，并自动将 `Frame Time` 加倍：
+
+```bash
+# 单个文件
+python scripts/downsample_bvh.py \
+  data/raw/bones_seed/bvh/soma_uniform/210531/jump_and_land_heavy_001__A001_M.bvh \
+  data/raw/bones_seed/bvh/soma_uniform_60fps/210531/jump_and_land_heavy_001__A001_M.bvh
+
+# 整个目录，递归保留相对目录结构
+python scripts/downsample_bvh.py \
+  data/raw/bones_seed/bvh/soma_uniform \
+  data/raw/bones_seed/bvh/soma_uniform_60fps
+```
+
+输出文件已存在时加 `--overwrite`；其他倍率可用 `--factor N` 指定。例如 `--factor 4` 表示保留每 4 帧中的第 1 帧。
+
 在下载动作数据之前,可以先检查两个标准姿态(转换时一并生成,均无窗口冒烟通过):
 
 ```bash
@@ -535,7 +551,7 @@ python -m stylized_motion.run \
   --stats-source data/processed/100style_pruned_90/feature_database
 ```
 
-GenoView 支持播放、暂停、逐帧移动、速度调整、时间轴拖拽和相机交互。渲染默认使用 PBR，可通过 `--shading legacy` 回退到旧版光照模型；`--shading pbr` 显式启用 Cook-Torrance 光照和 ACES tone mapping。使用 `--debug-view albedo|normal|depth|ssao|lighting` 可查看中间缓冲，用于定位颜色和光照问题。
+GenoView 支持播放、暂停、逐帧移动、速度调整、时间轴拖拽和相机交互。渲染默认使用 legacy 光照模型；`--shading pbr` 显式启用 Cook-Torrance 光照和 ACES tone mapping。使用 `--debug-view albedo|normal|depth|ssao|lighting` 可查看中间缓冲，用于定位颜色和光照问题。
 
 ### 10.5 实时 FSQ rollout
 
