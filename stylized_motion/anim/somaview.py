@@ -59,12 +59,11 @@ def main():
     parser.add_argument("--metallic", type=float, default=0.0)
     parser.add_argument("--roughness", type=float, default=0.58)
     parser.add_argument("--exposure", type=float, default=0.9)
-    parser.add_argument(
-        "--debug-view",
-        choices=("final", "albedo", "normal", "depth", "ssao", "lighting"),
-        default="final",
-        help="Display an intermediate render target for pipeline diagnosis.",
-    )
+    parser.add_argument("--ssao-intensity", type=float, default=0.15)
+    parser.add_argument("--ibl-strength", type=float, default=0.35)
+    parser.add_argument("--disable-ibl", action="store_true")
+    parser.add_argument("--shadow-resolution", type=int, default=2048)
+    parser.add_argument("--output-video", type=Path, default=None, help="Render the full clip to an MP4 at this path.")
     args = parser.parse_args()
 
     selected_inputs = [args.database is not None, args.bvh is not None, args.features is not None]
@@ -99,7 +98,11 @@ def main():
         metallic=args.metallic,
         roughness=args.roughness,
         exposure=args.exposure,
-        debug_view=args.debug_view,
+        ssao_intensity=args.ssao_intensity,
+        ibl_strength=args.ibl_strength,
+        ibl_enabled=not args.disable_ibl,
+        shadow_resolution=args.shadow_resolution,
+        output_video=args.output_video,
     )
     viewer.run()
 

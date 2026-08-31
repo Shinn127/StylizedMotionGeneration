@@ -9,20 +9,9 @@ uniform sampler2D gbufferDepth;
 uniform mat4 camView;
 uniform mat4 camProj;
 uniform mat4 camInvProj;
-uniform mat4 camInvViewProj;
-uniform mat4 lightViewProj;
-uniform sampler2D shadowMap;
-uniform vec2 shadowInvResolution;
 uniform float camClipNear;
 uniform float camClipFar;
-uniform float lightClipNear;
-uniform float lightClipFar;
-uniform vec3 lightDir;
-
-float LinearDepth(float depth, float near, float far)
-{
-    return (2.0 * near) / (far + near - depth * (far - near));
-}
+uniform float ssaoIntensity;
 
 float NonlinearDepth(float depth, float near, float far)
 {
@@ -52,43 +41,16 @@ out vec4 finalColor;
 
 void main()
 {
-    // Compute Shadows
-    
     float depth = texture(gbufferDepth, fragTexCoord).r;
     if (depth == 1.0f) { discard; }
 
-    vec3 positionClip = vec3(fragTexCoord, NonlinearDepth(depth, camClipNear, camClipFar)) * 2.0f - 1.0f;
-    vec4 fragPositionHomo = camInvViewProj * vec4(positionClip, 1);
-    vec3 fragPosition = fragPositionHomo.xyz / fragPositionHomo.w;
     vec3 fragNormal = texture(gbufferNormal, fragTexCoord).xyz * 2.0 - 1.0;
     
     vec3 seed = Rand(fragTexCoord);
     
-    float shadowNormalBias = 0.01;
-    
-    vec4 fragPosLightSpace = lightViewProj * vec4(fragPosition + shadowNormalBias * fragNormal, 1);
-    fragPosLightSpace.xyz /= fragPosLightSpace.w;
-    fragPosLightSpace.xyz = (fragPosLightSpace.xyz + 1.0f) / 2.0f;
-    
-    float shadowDepthBias = 0.000005;
-    float shadowClip = float(
-        fragPosLightSpace.x < +1.0 &&
-        fragPosLightSpace.x >  0.0 &&
-        fragPosLightSpace.y < +1.0 &&
-        fragPosLightSpace.y >  0.0);
-        
-    float shadow = 1.0 - shadowClip * float(
-        LinearDepth(fragPosLightSpace.z, lightClipNear, lightClipFar) - shadowDepthBias > 
-        texture(shadowMap, fragPosLightSpace.xy + shadowInvResolution * seed.xy).r);
-    
-    //shadow = texture(shadowMap, fragPosLightSpace.xy).r;
-    
-    // Compute SSAO
-    
     float bias = 0.025f;
     float radius = 0.5f;
     float turns = 7.0f;
-    float intensity = 0.15f;
 
     vec3 norm = mat3(camView) * fragNormal;
     vec3 base = CameraSpace(fragTexCoord, texture(gbufferDepth, fragTexCoord).r);
@@ -107,11 +69,10 @@ void main()
     }
     occ = occ / pow(radius, 6.0);
 
-    float ssao = max(0.0, 1.0 - occ * intensity * (5.0 / float(SSAO_SAMPLE_NUM)));
+    float ssao = max(0.0, 1.0 - occ * ssaoIntensity * (5.0 / float(SSAO_SAMPLE_NUM)));
 
     finalColor.r = ssao;
-    finalColor.g = shadow;
-    finalColor.b = 0.0f;
+    finalColor.g = 1.0f;
+    finalColor.b = 1.0f;
     finalColor.a = 1.0f;
 }
-

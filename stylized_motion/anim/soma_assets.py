@@ -334,7 +334,7 @@ def write_soma_bin(path: Path, viewer_mesh: dict[str, np.ndarray], bind: dict[st
 
 SHADER_FILES = (
     "basic.fs", "basic.vs", "blur.fs", "fxaa.fs", "lighting.fs", "post.vs",
-    "pbr.fs", "pbrLighting.fs", "shadow.fs", "shadow.vs", "skinnedBasic.vs", "skinnedShadow.vs", "ssao.fs",
+    "pbr.fs", "pbrLighting.fs", "shadow.fs", "shadow.vs", "skinnedBasic.vs", "skinnedShadow.vs", "ssao.fs", "tonemap.fs",
 )
 
 

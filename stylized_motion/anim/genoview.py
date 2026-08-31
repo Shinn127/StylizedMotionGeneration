@@ -1,17 +1,25 @@
 import argparse
+import os
+import shutil
 import struct
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import cffi
 import numpy as np
 import torch
-from pyray import BoneInfo, Camera3D, Color, Matrix, Mesh, Model, Rectangle, RenderTexture, Texture, Transform, Vector2, Vector3
+from pyray import BoneInfo, Camera3D, Color, Matrix, Mesh, Model, Rectangle, Transform, Vector2, Vector3, take_screenshot
 from raylib import *
 from raylib.defines import *
 
 from stylized_motion.anim.features import deserialize_motion_feature_stats, reconstruct_motion_state_from_features
 from stylized_motion.anim import quat
+from stylized_motion.anim.environment import IBLResources
+from stylized_motion.anim.materials import Material
+from stylized_motion.anim.render_targets import RenderTargets
+from stylized_motion.anim.scene import DirectionalLight, RenderObject, Scene
 from stylized_motion.data import open_feature_store
 from stylized_motion.util.paths import RESOURCE_DIR
 
@@ -88,14 +96,6 @@ class ShadowLight:
         self.height = 0.0
         self.near = 0.0
         self.far = 1.0
-
-
-class GBuffer:
-    def __init__(self):
-        self.id = 0
-        self.color = Texture()
-        self.normal = Texture()
-        self.depth = Texture()
 
 
 class PlaybackController:
@@ -208,146 +208,6 @@ def file_read(out, size, f):
     ffi.memmove(out, f.read(size), size)
 
 
-def load_shadow_map(width, height):
-    target = RenderTexture()
-    target.id = rlLoadFramebuffer()
-    target.texture.width = width
-    target.texture.height = height
-    assert target.id != 0
-
-    rlEnableFramebuffer(target.id)
-    target.depth.id = rlLoadTextureDepth(width, height, False)
-    target.depth.width = width
-    target.depth.height = height
-    target.depth.format = 19
-    target.depth.mipmaps = 1
-    rlFramebufferAttach(target.id, target.depth.id, RL_ATTACHMENT_DEPTH, RL_ATTACHMENT_TEXTURE2D, 0)
-    assert rlFramebufferComplete(target.id)
-    rlDisableFramebuffer()
-    return target
-
-
-def unload_shadow_map(target):
-    if target.id > 0:
-        rlUnloadFramebuffer(target.id)
-
-
-def begin_shadow_map(target, shadow_light):
-    BeginTextureMode(target)
-    ClearBackground(WHITE)
-    rlDrawRenderBatchActive()
-    rlMatrixMode(RL_PROJECTION)
-    rlPushMatrix()
-    rlLoadIdentity()
-    rlOrtho(
-        -shadow_light.width / 2,
-        shadow_light.width / 2,
-        -shadow_light.height / 2,
-        shadow_light.height / 2,
-        shadow_light.near,
-        shadow_light.far,
-    )
-    rlMatrixMode(RL_MODELVIEW)
-    rlLoadIdentity()
-    mat_view = MatrixLookAt(shadow_light.position, shadow_light.target, shadow_light.up)
-    rlMultMatrixf(MatrixToFloatV(mat_view).v)
-    rlEnableDepthTest()
-
-
-def end_shadow_map():
-    rlDrawRenderBatchActive()
-    rlMatrixMode(RL_PROJECTION)
-    rlPopMatrix()
-    rlMatrixMode(RL_MODELVIEW)
-    rlLoadIdentity()
-    rlDisableDepthTest()
-    EndTextureMode()
-
-
-def set_shader_value_shadow_map(shader, loc_index, target):
-    if loc_index > -1:
-        rlEnableShader(shader.id)
-        slot_ptr = ffi.new("int*")
-        slot_ptr[0] = 10
-        rlActiveTextureSlot(slot_ptr[0])
-        rlEnableTexture(target.depth.id)
-        rlSetUniform(loc_index, slot_ptr, SHADER_UNIFORM_INT, 1)
-
-
-def load_gbuffer(width, height):
-    target = GBuffer()
-    target.id = rlLoadFramebuffer()
-    assert target.id
-    rlEnableFramebuffer(target.id)
-
-    target.color.id = rlLoadTexture(ffi.NULL, width, height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1)
-    target.color.width = width
-    target.color.height = height
-    target.color.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8
-    target.color.mipmaps = 1
-    rlFramebufferAttach(target.id, target.color.id, RL_ATTACHMENT_COLOR_CHANNEL0, RL_ATTACHMENT_TEXTURE2D, 0)
-
-    target.normal.id = rlLoadTexture(ffi.NULL, width, height, PIXELFORMAT_UNCOMPRESSED_R16G16B16A16, 1)
-    target.normal.width = width
-    target.normal.height = height
-    target.normal.format = PIXELFORMAT_UNCOMPRESSED_R16G16B16A16
-    target.normal.mipmaps = 1
-    rlFramebufferAttach(target.id, target.normal.id, RL_ATTACHMENT_COLOR_CHANNEL1, RL_ATTACHMENT_TEXTURE2D, 0)
-
-    target.depth.id = rlLoadTextureDepth(width, height, False)
-    target.depth.width = width
-    target.depth.height = height
-    target.depth.format = 19
-    target.depth.mipmaps = 1
-    rlFramebufferAttach(target.id, target.depth.id, RL_ATTACHMENT_DEPTH, RL_ATTACHMENT_TEXTURE2D, 0)
-    assert rlFramebufferComplete(target.id)
-    rlDisableFramebuffer()
-    return target
-
-
-def unload_gbuffer(target):
-    if target.id > 0:
-        rlUnloadFramebuffer(target.id)
-
-
-def begin_gbuffer(target, camera):
-    rlDrawRenderBatchActive()
-    rlEnableFramebuffer(target.id)
-    rlActiveDrawBuffers(2)
-    rlViewport(0, 0, target.color.width, target.color.height)
-    rlSetFramebufferWidth(target.color.width)
-    rlSetFramebufferHeight(target.color.height)
-    ClearBackground(BLACK)
-
-    rlMatrixMode(RL_PROJECTION)
-    rlPushMatrix()
-    rlLoadIdentity()
-
-    aspect = float(target.color.width) / float(target.color.height)
-    top = rlGetCullDistanceNear() * np.tan(camera.fovy * 0.5 * DEG2RAD)
-    right = top * aspect
-    rlFrustum(-right, right, -top, top, rlGetCullDistanceNear(), rlGetCullDistanceFar())
-
-    rlMatrixMode(RL_MODELVIEW)
-    rlLoadIdentity()
-    mat_view = MatrixLookAt(camera.position, camera.target, camera.up)
-    rlMultMatrixf(MatrixToFloatV(mat_view).v)
-    rlEnableDepthTest()
-
-
-def end_gbuffer(window_width, window_height):
-    rlDrawRenderBatchActive()
-    rlDisableDepthTest()
-    rlActiveDrawBuffers(1)
-    rlDisableFramebuffer()
-    rlMatrixMode(RL_PROJECTION)
-    rlPopMatrix()
-    rlLoadIdentity()
-    rlOrtho(0, window_width, window_height, 0, 0.0, 1.0)
-    rlMatrixMode(RL_MODELVIEW)
-    rlLoadIdentity()
-
-
 def load_geno_model(filename: Path):
     material_size = ffi.sizeof(Mesh())
     mesh_size = ffi.sizeof(Mesh())
@@ -402,6 +262,7 @@ def load_geno_model(filename: Path):
         for i in range(model.boneCount):
             model.meshes[0].boneMatrices[i] = MatrixIdentity()
 
+    GenMeshTangents(ffi.addressof(model.meshes[0]))
     UploadMesh(ffi.addressof(model.meshes[0]), True)
     return model
 
@@ -678,7 +539,11 @@ class GenoView:
         metallic: float = 0.0,
         roughness: float = 0.58,
         exposure: float = 0.9,
-        debug_view: str = "final",
+        ssao_intensity: float = 0.15,
+        ibl_strength: float = 0.35,
+        ibl_enabled: bool = True,
+        shadow_resolution: int = 2048,
+        output_video: Path | None = None,
         rig: RigSpec = GENO_RIG,
     ):
         self.rig = rig
@@ -686,7 +551,11 @@ class GenoView:
         self.metallic = float(metallic)
         self.roughness = float(roughness)
         self.exposure = float(exposure)
-        self.debug_view = debug_view
+        self.ssao_intensity = float(ssao_intensity)
+        self.ibl_strength = float(ibl_strength)
+        self.ibl_enabled = bool(ibl_enabled)
+        self.shadow_resolution = int(shadow_resolution)
+        self.output_video = Path(output_video).resolve() if output_video is not None else None
         self.database = database
         self.positions = self.database["positions"].astype(np.float32)
         self.rotations = self.database["rotations"].astype(np.float32)
@@ -756,6 +625,16 @@ class GenoView:
 
         self.camera = Camera()
         self.light_dir = Vector3Normalize(Vector3(0.35, -1.0, -0.35))
+        self.sun_color = Vector3(253.0 / 255.0, 255.0 / 255.0, 232.0 / 255.0)
+        self.sky_color = Vector3(174.0 / 255.0, 183.0 / 255.0, 190.0 / 255.0)
+        self.default_material = Material(metallic=self.metallic, roughness=self.roughness)
+        self.scene = Scene(
+            directional_light=DirectionalLight(
+                direction=self.light_dir,
+                color=self.sun_color,
+                intensity=0.25,
+            )
+        )
         self.shadow_light = ShadowLight()
         self.shadow_light.target = Vector3Zero()
         self.shadow_light.position = Vector3Scale(self.light_dir, -5.0)
@@ -768,8 +647,11 @@ class GenoView:
         self.shadow_map = None
         self.gbuffer = None
         self.lighted = None
+        self.tonemapped = None
         self.ssao_front = None
         self.ssao_back = None
+        self.render_targets = None
+        self.ibl = None
         self.ground_model = None
         self.geno_model = None
         self.compare_model = None
@@ -786,8 +668,64 @@ class GenoView:
         self.full_name_to_index = None
         self.use_pruned_reconstruction = False
         self.shader_locs = {}
-        self.shadow_inv_resolution = Vector2(1.0 / 1024.0, 1.0 / 1024.0)
         self.ground_position = Vector3(0.0, -0.01, 0.0)
+
+        self.light_clip_near_ptr = ffi.new("float*")
+        self.light_clip_far_ptr = ffi.new("float*")
+        self.cam_clip_near_ptr = ffi.new("float*")
+        self.cam_clip_far_ptr = ffi.new("float*")
+        self.specularity_ptr = ffi.new("float*")
+        self.glossiness_ptr = ffi.new("float*")
+        self.metallic_ptr = ffi.new("float*")
+        self.roughness_ptr = ffi.new("float*")
+        self.sun_strength_ptr = ffi.new("float*")
+        self.sky_strength_ptr = ffi.new("float*")
+        self.ground_strength_ptr = ffi.new("float*")
+        self.ambient_strength_ptr = ffi.new("float*")
+        self.material_ao_ptr = ffi.new("float*")
+        self.ibl_strength_ptr = ffi.new("float*")
+        self.use_ibl_ptr = ffi.new("int*")
+        self.exposure_ptr = ffi.new("float*")
+        self.ssao_intensity_ptr = ffi.new("float*")
+        self.shadow_texture_slot_ptr = ffi.new("int*")
+        self.environment_texture_slot_ptr = ffi.new("int*")
+        self.irradiance_texture_slot_ptr = ffi.new("int*")
+        self.prefilter_texture_slot_ptr = ffi.new("int*")
+        self.brdf_lut_texture_slot_ptr = ffi.new("int*")
+        self.prefilter_max_lod_ptr = ffi.new("float*")
+        self.material_base_color_ptr = ffi.new("float[4]")
+        self.ground_pattern_ptr = ffi.new("int*")
+        self.use_base_color_map_ptr = ffi.new("int*")
+        self.use_metallic_roughness_map_ptr = ffi.new("int*")
+        self.use_normal_map_ptr = ffi.new("int*")
+        self.shadow_texture_slot_ptr[0] = 10
+        self.environment_texture_slot_ptr[0] = 11
+        self.irradiance_texture_slot_ptr[0] = 12
+        self.prefilter_texture_slot_ptr[0] = 13
+        self.brdf_lut_texture_slot_ptr[0] = 14
+        self.prefilter_max_lod_ptr[0] = 5.0
+        self.ground_pattern_ptr[0] = 0
+        self.specularity_ptr[0] = 0.5
+        self.glossiness_ptr[0] = 10.0
+        self.metallic_ptr[0] = self.metallic
+        self.roughness_ptr[0] = self.roughness
+        self.sun_strength_ptr[0] = 0.25
+        self.sky_strength_ptr[0] = 0.15
+        self.ground_strength_ptr[0] = 0.1
+        self.ambient_strength_ptr[0] = 1.0
+        self.material_ao_ptr[0] = self.default_material.ao
+        self.ibl_strength_ptr[0] = self.ibl_strength
+        self.use_ibl_ptr[0] = int(self.ibl_enabled)
+        self.exposure_ptr[0] = self.exposure
+        self.ssao_intensity_ptr[0] = self.ssao_intensity
+        for index, channel in enumerate(self.default_material.base_color):
+            self.material_base_color_ptr[index] = channel
+        self.use_base_color_map_ptr[0] = 0
+        self.use_metallic_roughness_map_ptr[0] = 0
+        self.use_normal_map_ptr[0] = 0
+        self.blur_direction = Vector2(0.0, 0.0)
+        self.blur_inv_texture_resolution = Vector2(0.0, 0.0)
+        self.fxaa_inv_texture_resolution = Vector2(0.0, 0.0)
 
     def _res(self, name: str) -> bytes:
         return str((self.resources_root / name).resolve()).encode()
@@ -802,6 +740,8 @@ class GenoView:
         self.shaders["ssao"] = LoadShader(self._res("post.vs"), self._res("ssao.fs"))
         self.shaders["blur"] = LoadShader(self._res("post.vs"), self._res("blur.fs"))
         self.shaders["lighting"] = LoadShader(self._res("post.vs"), self._res(lighting_fs))
+        if self.shading == "pbr":
+            self.shaders["tonemap"] = LoadShader(self._res("post.vs"), self._res("tonemap.fs"))
         self.shaders["fxaa"] = LoadShader(self._res("post.vs"), self._res("fxaa.fs"))
 
         self.shader_locs["basic_specularity"] = GetShaderLocation(self.shaders["basic"], b"specularity")
@@ -817,6 +757,17 @@ class GenoView:
         self.shader_locs["basic_roughness"] = GetShaderLocation(self.shaders["basic"], b"pbrRoughness")
         self.shader_locs["skinned_basic_metallic"] = GetShaderLocation(self.shaders["skinned_basic"], b"pbrMetallic")
         self.shader_locs["skinned_basic_roughness"] = GetShaderLocation(self.shaders["skinned_basic"], b"pbrRoughness")
+        if self.shading == "pbr":
+            for shader_key, prefix in (("basic", "basic"), ("skinned_basic", "skinned_basic")):
+                self.shader_locs[f"{prefix}_material_base_color"] = GetShaderLocation(self.shaders[shader_key], b"materialBaseColor")
+                self.shader_locs[f"{prefix}_ao"] = GetShaderLocation(self.shaders[shader_key], b"pbrAo")
+                self.shader_locs[f"{prefix}_base_color_map"] = GetShaderLocation(self.shaders[shader_key], b"baseColorMap")
+                self.shader_locs[f"{prefix}_metallic_roughness_map"] = GetShaderLocation(self.shaders[shader_key], b"metallicRoughnessMap")
+                self.shader_locs[f"{prefix}_normal_map"] = GetShaderLocation(self.shaders[shader_key], b"normalMap")
+                self.shader_locs[f"{prefix}_use_base_color_map"] = GetShaderLocation(self.shaders[shader_key], b"useBaseColorMap")
+                self.shader_locs[f"{prefix}_use_metallic_roughness_map"] = GetShaderLocation(self.shaders[shader_key], b"useMetallicRoughnessMap")
+                self.shader_locs[f"{prefix}_use_normal_map"] = GetShaderLocation(self.shaders[shader_key], b"useNormalMap")
+                self.shader_locs[f"{prefix}_ground_pattern"] = GetShaderLocation(self.shaders[shader_key], b"pbrGroundPattern")
 
         self.shader_locs["shadow_light_clip_near"] = GetShaderLocation(self.shaders["shadow"], b"lightClipNear")
         self.shader_locs["shadow_light_clip_far"] = GetShaderLocation(self.shaders["shadow"], b"lightClipFar")
@@ -828,15 +779,9 @@ class GenoView:
         self.shader_locs["ssao_cam_view"] = GetShaderLocation(self.shaders["ssao"], b"camView")
         self.shader_locs["ssao_cam_proj"] = GetShaderLocation(self.shaders["ssao"], b"camProj")
         self.shader_locs["ssao_cam_inv_proj"] = GetShaderLocation(self.shaders["ssao"], b"camInvProj")
-        self.shader_locs["ssao_cam_inv_view_proj"] = GetShaderLocation(self.shaders["ssao"], b"camInvViewProj")
-        self.shader_locs["ssao_light_view_proj"] = GetShaderLocation(self.shaders["ssao"], b"lightViewProj")
-        self.shader_locs["ssao_shadow_map"] = GetShaderLocation(self.shaders["ssao"], b"shadowMap")
-        self.shader_locs["ssao_shadow_inv_resolution"] = GetShaderLocation(self.shaders["ssao"], b"shadowInvResolution")
         self.shader_locs["ssao_cam_clip_near"] = GetShaderLocation(self.shaders["ssao"], b"camClipNear")
         self.shader_locs["ssao_cam_clip_far"] = GetShaderLocation(self.shaders["ssao"], b"camClipFar")
-        self.shader_locs["ssao_light_clip_near"] = GetShaderLocation(self.shaders["ssao"], b"lightClipNear")
-        self.shader_locs["ssao_light_clip_far"] = GetShaderLocation(self.shaders["ssao"], b"lightClipFar")
-        self.shader_locs["ssao_light_dir"] = GetShaderLocation(self.shaders["ssao"], b"lightDir")
+        self.shader_locs["ssao_intensity"] = GetShaderLocation(self.shaders["ssao"], b"ssaoIntensity")
 
         self.shader_locs["blur_gbuffer_normal"] = GetShaderLocation(self.shaders["blur"], b"gbufferNormal")
         self.shader_locs["blur_gbuffer_depth"] = GetShaderLocation(self.shaders["blur"], b"gbufferDepth")
@@ -860,20 +805,47 @@ class GenoView:
         self.shader_locs["lighting_sky_strength"] = GetShaderLocation(self.shaders["lighting"], b"skyStrength")
         self.shader_locs["lighting_ground_strength"] = GetShaderLocation(self.shaders["lighting"], b"groundStrength")
         self.shader_locs["lighting_ambient_strength"] = GetShaderLocation(self.shaders["lighting"], b"ambientStrength")
-        self.shader_locs["lighting_exposure"] = GetShaderLocation(self.shaders["lighting"], b"exposure")
+        if self.shading == "legacy":
+            self.shader_locs["lighting_exposure"] = GetShaderLocation(self.shaders["lighting"], b"exposure")
         self.shader_locs["lighting_cam_clip_near"] = GetShaderLocation(self.shaders["lighting"], b"camClipNear")
         self.shader_locs["lighting_cam_clip_far"] = GetShaderLocation(self.shaders["lighting"], b"camClipFar")
+
+        self.shader_locs["lighting_shadow_map"] = GetShaderLocation(self.shaders["lighting"], b"shadowMap")
+        self.shader_locs["lighting_light_view_proj"] = GetShaderLocation(self.shaders["lighting"], b"lightViewProj")
+        self.shader_locs["lighting_light_clip_near"] = GetShaderLocation(self.shaders["lighting"], b"lightClipNear")
+        self.shader_locs["lighting_light_clip_far"] = GetShaderLocation(self.shaders["lighting"], b"lightClipFar")
+        if self.shading == "pbr":
+            self.shader_locs["lighting_environment_map"] = GetShaderLocation(self.shaders["lighting"], b"environmentMap")
+            self.shader_locs["lighting_irradiance_map"] = GetShaderLocation(self.shaders["lighting"], b"irradianceMap")
+            self.shader_locs["lighting_prefilter_map"] = GetShaderLocation(self.shaders["lighting"], b"prefilterMap")
+            self.shader_locs["lighting_brdf_lut"] = GetShaderLocation(self.shaders["lighting"], b"brdfLut")
+            self.shader_locs["lighting_prefilter_max_lod"] = GetShaderLocation(self.shaders["lighting"], b"prefilterMaxLod")
+            self.shader_locs["lighting_ibl_strength"] = GetShaderLocation(self.shaders["lighting"], b"iblStrength")
+            self.shader_locs["lighting_use_ibl"] = GetShaderLocation(self.shaders["lighting"], b"useIBL")
+
+        if self.shading == "pbr":
+            self.shader_locs["tonemap_input_texture"] = GetShaderLocation(self.shaders["tonemap"], b"inputTexture")
+            self.shader_locs["tonemap_exposure"] = GetShaderLocation(self.shaders["tonemap"], b"exposure")
+
+        if self.shading == "pbr":
+            self.ibl = IBLResources(strength=self.ibl_strength, enabled=self.ibl_enabled).initialize()
+            self.prefilter_max_lod_ptr[0] = self.ibl.prefilter_max_lod
 
         self.shader_locs["fxaa_input_texture"] = GetShaderLocation(self.shaders["fxaa"], b"inputTexture")
         self.shader_locs["fxaa_inv_texture_resolution"] = GetShaderLocation(self.shaders["fxaa"], b"invTextureResolution")
 
-        self.shadow_map = load_shadow_map(1024, 1024)
-        self.gbuffer = load_gbuffer(screen_width, screen_height)
-        self.lighted = LoadRenderTexture(screen_width, screen_height)
-        self.ssao_front = LoadRenderTexture(screen_width, screen_height)
-        self.ssao_back = LoadRenderTexture(screen_width, screen_height)
+        self.render_targets = RenderTargets(
+            screen_width, screen_height, self.shading, shadow_resolution=self.shadow_resolution
+        ).initialize()
+        self.shadow_map = self.render_targets.shadow_map
+        self.gbuffer = self.render_targets.gbuffer
+        self.lighted = self.render_targets.lighting
+        self.tonemapped = self.render_targets.tonemapped
+        self.ssao_front = self.render_targets.ssao_front
+        self.ssao_back = self.render_targets.ssao_back
 
         ground_mesh = GenMeshPlane(20.0, 20.0, 10, 10)
+        GenMeshTangents(ffi.addressof(ground_mesh))
         self.ground_model = LoadModelFromMesh(ground_mesh)
 
         self.geno_model = load_geno_model(self.resources_root / self.rig.model_filename)
@@ -881,6 +853,35 @@ class GenoView:
         if self.compare_mode:
             self.compare_model = load_geno_model(self.resources_root / self.rig.model_filename)
             self.compare_bind_pos, self.compare_bind_rot = get_model_bind_pose_as_numpy_arrays(self.compare_model)
+        self.scene.clear()
+        self.scene.add_object(
+            RenderObject(
+                model=self.ground_model,
+                material=Material(),
+                position=self.ground_position,
+                draw_color=Color(190, 190, 190, 255),
+                skinned=False,
+            )
+        )
+        self.scene.add_object(
+            RenderObject(
+                model=self.geno_model,
+                material=self.default_material,
+                position=self.left_model_offset,
+                draw_color=Color(70, 125, 255, 255) if self.compare_mode else ORANGE,
+                skinned=True,
+            )
+        )
+        if self.compare_mode:
+            self.scene.add_object(
+                RenderObject(
+                    model=self.compare_model,
+                    material=self.default_material,
+                    position=self.right_model_offset,
+                    draw_color=ORANGE,
+                    skinned=True,
+                )
+            )
         (
             self.full_names,
             self.full_parents,
@@ -904,16 +905,10 @@ class GenoView:
         self.use_pruned_reconstruction = len(self.names) != len(self.full_names)
 
     def _cleanup(self):
-        if self.lighted is not None:
-            UnloadRenderTexture(self.lighted)
-        if self.ssao_back is not None:
-            UnloadRenderTexture(self.ssao_back)
-        if self.ssao_front is not None:
-            UnloadRenderTexture(self.ssao_front)
-        if self.gbuffer is not None:
-            unload_gbuffer(self.gbuffer)
-        if self.shadow_map is not None:
-            unload_shadow_map(self.shadow_map)
+        if self.ibl is not None:
+            self.ibl.cleanup()
+        if self.render_targets is not None:
+            self.render_targets.cleanup()
         if self.geno_model is not None:
             UnloadModel(self.geno_model)
         if self.compare_model is not None:
@@ -1001,17 +996,30 @@ class GenoView:
     def run(self):
         screen_width = 1280
         screen_height = 720
-        SetConfigFlags(FLAG_VSYNC_HINT)
+        frame_dir = Path(tempfile.mkdtemp(prefix="somaview_frames_")) if self.output_video else None
+        recording_cwd = Path.cwd()
+        if frame_dir is not None:
+            os.chdir(frame_dir)
+        SetConfigFlags(FLAG_VSYNC_HINT | (FLAG_WINDOW_HIDDEN if frame_dir is not None else 0))
         InitWindow(screen_width, screen_height, self.rig.window_title)
         SetTargetFPS(self.fps)
         rlSetClipPlanes(0.01, 50.0)
+        self.screen_width = screen_width
+        self.screen_height = screen_height
         self._initialize_rendering(screen_width, screen_height)
+        from stylized_motion.anim.renderer import Renderer
+
+        self.renderer = Renderer(self)
+        recorded_frames = 0
 
         try:
             while not WindowShouldClose():
+                if frame_dir is not None:
+                    self.playback.set_current_frame(recorded_frames)
                 self.playback.handle_shortcuts()
-                self.playback.handle_scrub(screen_width, screen_height)
-                self.playback.update(GetFrameTime())
+                if frame_dir is None:
+                    self.playback.handle_scrub(screen_width, screen_height)
+                    self.playback.update(GetFrameTime())
                 self._sync_playback_frame()
 
                 global_rot, global_pos = self._update_model_pose()
@@ -1043,268 +1051,52 @@ class GenoView:
 
                 rlDisableColorBlend()
                 BeginDrawing()
+                self.renderer.render_frame(global_rot, global_pos, self.sample_index)
 
-                begin_shadow_map(self.shadow_map, self.shadow_light)
-                light_view_proj = MatrixMultiply(rlGetMatrixModelview(), rlGetMatrixProjection())
-                light_clip_near = rlGetCullDistanceNear()
-                light_clip_far = rlGetCullDistanceFar()
-                light_clip_near_ptr = ffi.new("float*")
-                light_clip_far_ptr = ffi.new("float*")
-                light_clip_near_ptr[0] = light_clip_near
-                light_clip_far_ptr[0] = light_clip_far
+                self.renderer.draw_output()
 
-                SetShaderValue(self.shaders["shadow"], self.shader_locs["shadow_light_clip_near"], light_clip_near_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(self.shaders["shadow"], self.shader_locs["shadow_light_clip_far"], light_clip_far_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(
-                    self.shaders["skinned_shadow"],
-                    self.shader_locs["skinned_shadow_light_clip_near"],
-                    light_clip_near_ptr,
-                    SHADER_UNIFORM_FLOAT,
-                )
-                SetShaderValue(
-                    self.shaders["skinned_shadow"],
-                    self.shader_locs["skinned_shadow_light_clip_far"],
-                    light_clip_far_ptr,
-                    SHADER_UNIFORM_FLOAT,
-                )
-
-                self.ground_model.materials[0].shader = self.shaders["shadow"]
-                DrawModel(self.ground_model, self.ground_position, 1.0, WHITE)
-                self.geno_model.materials[0].shader = self.shaders["skinned_shadow"]
-                DrawModel(self.geno_model, self.left_model_offset, 1.0, WHITE)
-                if self.compare_mode:
-                    self.compare_model.materials[0].shader = self.shaders["skinned_shadow"]
-                    DrawModel(self.compare_model, self.right_model_offset, 1.0, WHITE)
-                end_shadow_map()
-
-                begin_gbuffer(self.gbuffer, self.camera.cam3d)
-                cam_view = rlGetMatrixModelview()
-                cam_proj = rlGetMatrixProjection()
-                cam_inv_proj = MatrixInvert(cam_proj)
-                cam_inv_view_proj = MatrixInvert(MatrixMultiply(cam_view, cam_proj))
-                cam_clip_near = rlGetCullDistanceNear()
-                cam_clip_far = rlGetCullDistanceFar()
-                cam_clip_near_ptr = ffi.new("float*")
-                cam_clip_far_ptr = ffi.new("float*")
-                cam_clip_near_ptr[0] = cam_clip_near
-                cam_clip_far_ptr[0] = cam_clip_far
-                specularity_ptr = ffi.new("float*")
-                glossiness_ptr = ffi.new("float*")
-                specularity_ptr[0] = 0.5
-                glossiness_ptr[0] = 10.0
-
-                SetShaderValue(self.shaders["basic"], self.shader_locs["basic_cam_clip_near"], cam_clip_near_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(self.shaders["basic"], self.shader_locs["basic_cam_clip_far"], cam_clip_far_ptr, SHADER_UNIFORM_FLOAT)
-                if self.shading == "legacy":
-                    SetShaderValue(self.shaders["basic"], self.shader_locs["basic_specularity"], specularity_ptr, SHADER_UNIFORM_FLOAT)
-                    SetShaderValue(self.shaders["basic"], self.shader_locs["basic_glossiness"], glossiness_ptr, SHADER_UNIFORM_FLOAT)
-                    SetShaderValue(self.shaders["skinned_basic"], self.shader_locs["skinned_basic_specularity"], specularity_ptr, SHADER_UNIFORM_FLOAT)
-                    SetShaderValue(self.shaders["skinned_basic"], self.shader_locs["skinned_basic_glossiness"], glossiness_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(
-                    self.shaders["skinned_basic"],
-                    self.shader_locs["skinned_basic_cam_clip_near"],
-                    cam_clip_near_ptr,
-                    SHADER_UNIFORM_FLOAT,
-                )
-                SetShaderValue(
-                    self.shaders["skinned_basic"],
-                    self.shader_locs["skinned_basic_cam_clip_far"],
-                    cam_clip_far_ptr,
-                    SHADER_UNIFORM_FLOAT,
-                )
-
-                self.ground_model.materials[0].shader = self.shaders["basic"]
-                DrawModel(self.ground_model, self.ground_position, 1.0, Color(190, 190, 190, 255))
-                self.geno_model.materials[0].shader = self.shaders["skinned_basic"]
-                DrawModel(self.geno_model, self.left_model_offset, 1.0, Color(70, 125, 255, 255) if self.compare_mode else ORANGE)
-                if self.compare_mode:
-                    self.compare_model.materials[0].shader = self.shaders["skinned_basic"]
-                    DrawModel(self.compare_model, self.right_model_offset, 1.0, ORANGE)
-                end_gbuffer(screen_width, screen_height)
-
-                BeginTextureMode(self.ssao_front)
-                BeginShaderMode(self.shaders["ssao"])
-                SetShaderValueTexture(self.shaders["ssao"], self.shader_locs["ssao_gbuffer_normal"], self.gbuffer.normal)
-                SetShaderValueTexture(self.shaders["ssao"], self.shader_locs["ssao_gbuffer_depth"], self.gbuffer.depth)
-                SetShaderValueMatrix(self.shaders["ssao"], self.shader_locs["ssao_cam_view"], cam_view)
-                SetShaderValueMatrix(self.shaders["ssao"], self.shader_locs["ssao_cam_proj"], cam_proj)
-                SetShaderValueMatrix(self.shaders["ssao"], self.shader_locs["ssao_cam_inv_proj"], cam_inv_proj)
-                SetShaderValueMatrix(self.shaders["ssao"], self.shader_locs["ssao_cam_inv_view_proj"], cam_inv_view_proj)
-                SetShaderValueMatrix(self.shaders["ssao"], self.shader_locs["ssao_light_view_proj"], light_view_proj)
-                set_shader_value_shadow_map(self.shaders["ssao"], self.shader_locs["ssao_shadow_map"], self.shadow_map)
-                SetShaderValue(
-                    self.shaders["ssao"],
-                    self.shader_locs["ssao_shadow_inv_resolution"],
-                    ffi.addressof(self.shadow_inv_resolution),
-                    SHADER_UNIFORM_VEC2,
-                )
-                SetShaderValue(self.shaders["ssao"], self.shader_locs["ssao_cam_clip_near"], cam_clip_near_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(self.shaders["ssao"], self.shader_locs["ssao_cam_clip_far"], cam_clip_far_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(self.shaders["ssao"], self.shader_locs["ssao_light_clip_near"], light_clip_near_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(self.shaders["ssao"], self.shader_locs["ssao_light_clip_far"], light_clip_far_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(self.shaders["ssao"], self.shader_locs["ssao_light_dir"], ffi.addressof(self.light_dir), SHADER_UNIFORM_VEC3)
-
-                ClearBackground(WHITE)
-                DrawTextureRec(
-                    self.ssao_front.texture,
-                    Rectangle(0, 0, self.ssao_front.texture.width, -self.ssao_front.texture.height),
-                    Vector2(0.0, 0.0),
-                    WHITE,
-                )
-                EndShaderMode()
-                EndTextureMode()
-
-                BeginTextureMode(self.ssao_back)
-                BeginShaderMode(self.shaders["blur"])
-                blur_direction = Vector2(1.0, 0.0)
-                blur_inv_texture_resolution = Vector2(1.0 / self.ssao_front.texture.width, 1.0 / self.ssao_front.texture.height)
-                SetShaderValueTexture(self.shaders["blur"], self.shader_locs["blur_gbuffer_normal"], self.gbuffer.normal)
-                SetShaderValueTexture(self.shaders["blur"], self.shader_locs["blur_gbuffer_depth"], self.gbuffer.depth)
-                SetShaderValueTexture(self.shaders["blur"], self.shader_locs["blur_input_texture"], self.ssao_front.texture)
-                SetShaderValueMatrix(self.shaders["blur"], self.shader_locs["blur_cam_inv_proj"], cam_inv_proj)
-                SetShaderValue(self.shaders["blur"], self.shader_locs["blur_cam_clip_near"], cam_clip_near_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(self.shaders["blur"], self.shader_locs["blur_cam_clip_far"], cam_clip_far_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(
-                    self.shaders["blur"],
-                    self.shader_locs["blur_inv_texture_resolution"],
-                    ffi.addressof(blur_inv_texture_resolution),
-                    SHADER_UNIFORM_VEC2,
-                )
-                SetShaderValue(
-                    self.shaders["blur"],
-                    self.shader_locs["blur_direction"],
-                    ffi.addressof(blur_direction),
-                    SHADER_UNIFORM_VEC2,
-                )
-                DrawTextureRec(
-                    self.ssao_back.texture,
-                    Rectangle(0, 0, self.ssao_back.texture.width, -self.ssao_back.texture.height),
-                    Vector2(0, 0),
-                    WHITE,
-                )
-                EndShaderMode()
-                EndTextureMode()
-
-                BeginTextureMode(self.ssao_front)
-                BeginShaderMode(self.shaders["blur"])
-                blur_direction = Vector2(0.0, 1.0)
-                SetShaderValueTexture(self.shaders["blur"], self.shader_locs["blur_input_texture"], self.ssao_back.texture)
-                SetShaderValue(
-                    self.shaders["blur"],
-                    self.shader_locs["blur_direction"],
-                    ffi.addressof(blur_direction),
-                    SHADER_UNIFORM_VEC2,
-                )
-                DrawTextureRec(
-                    self.ssao_front.texture,
-                    Rectangle(0, 0, self.ssao_front.texture.width, -self.ssao_front.texture.height),
-                    Vector2(0, 0),
-                    WHITE,
-                )
-                EndShaderMode()
-                EndTextureMode()
-
-                BeginTextureMode(self.lighted)
-                BeginShaderMode(self.shaders["lighting"])
-                sun_color = Vector3(253.0 / 255.0, 255.0 / 255.0, 232.0 / 255.0)
-                sun_strength_ptr = ffi.new("float*")
-                sky_strength_ptr = ffi.new("float*")
-                ground_strength_ptr = ffi.new("float*")
-                ambient_strength_ptr = ffi.new("float*")
-                exposure_ptr = ffi.new("float*")
-                sun_strength_ptr[0] = 0.25
-                sky_color = Vector3(174.0 / 255.0, 183.0 / 255.0, 190.0 / 255.0)
-                sky_strength_ptr[0] = 0.15
-                ground_strength_ptr[0] = 0.1
-                ambient_strength_ptr[0] = 1.0
-                exposure_ptr[0] = self.exposure
-
-                SetShaderValueTexture(self.shaders["lighting"], self.shader_locs["lighting_gbuffer_color"], self.gbuffer.color)
-                SetShaderValueTexture(self.shaders["lighting"], self.shader_locs["lighting_gbuffer_normal"], self.gbuffer.normal)
-                SetShaderValueTexture(self.shaders["lighting"], self.shader_locs["lighting_gbuffer_depth"], self.gbuffer.depth)
-                SetShaderValueTexture(self.shaders["lighting"], self.shader_locs["lighting_ssao"], self.ssao_front.texture)
-                SetShaderValue(self.shaders["lighting"], self.shader_locs["lighting_cam_pos"], ffi.addressof(self.camera.cam3d.position), SHADER_UNIFORM_VEC3)
-                SetShaderValueMatrix(self.shaders["lighting"], self.shader_locs["lighting_cam_inv_view_proj"], cam_inv_view_proj)
-                SetShaderValue(self.shaders["lighting"], self.shader_locs["lighting_light_dir"], ffi.addressof(self.light_dir), SHADER_UNIFORM_VEC3)
-                SetShaderValue(self.shaders["lighting"], self.shader_locs["lighting_sun_color"], ffi.addressof(sun_color), SHADER_UNIFORM_VEC3)
-                SetShaderValue(self.shaders["lighting"], self.shader_locs["lighting_sun_strength"], sun_strength_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(self.shaders["lighting"], self.shader_locs["lighting_sky_color"], ffi.addressof(sky_color), SHADER_UNIFORM_VEC3)
-                SetShaderValue(self.shaders["lighting"], self.shader_locs["lighting_sky_strength"], sky_strength_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(self.shaders["lighting"], self.shader_locs["lighting_ground_strength"], ground_strength_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(self.shaders["lighting"], self.shader_locs["lighting_ambient_strength"], ambient_strength_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(self.shaders["lighting"], self.shader_locs["lighting_exposure"], exposure_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(self.shaders["lighting"], self.shader_locs["lighting_cam_clip_near"], cam_clip_near_ptr, SHADER_UNIFORM_FLOAT)
-                SetShaderValue(self.shaders["lighting"], self.shader_locs["lighting_cam_clip_far"], cam_clip_far_ptr, SHADER_UNIFORM_FLOAT)
-
-                ClearBackground(RAYWHITE)
-                DrawTextureRec(
-                    self.gbuffer.color,
-                    Rectangle(0, 0, self.gbuffer.color.width, -self.gbuffer.color.height),
-                    Vector2(0, 0),
-                    WHITE,
-                )
-                EndShaderMode()
-
-                if self.tpos is not None and self.tdir is not None:
-                    BeginMode3D(self.camera.cam3d)
-                    draw_trajectory(global_pos[0], global_rot[0], self.tpos[self.sample_index], self.tdir[self.sample_index])
-                    EndMode3D()
-                EndTextureMode()
-
-                debug_texture = {
-                    "albedo": self.gbuffer.color,
-                    "normal": self.gbuffer.normal,
-                    "depth": self.gbuffer.depth,
-                    "ssao": self.ssao_front.texture,
-                    "lighting": self.lighted.texture,
-                }.get(self.debug_view)
-                if self.debug_view == "final":
-                    BeginShaderMode(self.shaders["fxaa"])
-                    fxaa_inv_texture_resolution = Vector2(1.0 / self.lighted.texture.width, 1.0 / self.lighted.texture.height)
-                    SetShaderValueTexture(self.shaders["fxaa"], self.shader_locs["fxaa_input_texture"], self.lighted.texture)
-                    SetShaderValue(
-                        self.shaders["fxaa"],
-                        self.shader_locs["fxaa_inv_texture_resolution"],
-                        ffi.addressof(fxaa_inv_texture_resolution),
-                        SHADER_UNIFORM_VEC2,
-                    )
-                    DrawTextureRec(
-                        self.lighted.texture,
-                        Rectangle(0, 0, self.lighted.texture.width, -self.lighted.texture.height),
-                        Vector2(0, 0),
-                        WHITE,
-                    )
-                    EndShaderMode()
-                else:
-                    DrawTextureRec(
-                        debug_texture,
-                        Rectangle(0, 0, debug_texture.width, -debug_texture.height),
-                        Vector2(0, 0),
-                        WHITE,
-                    )
-
-                rlEnableColorBlend()
-                DrawFPS(10, 10)
-                DrawText(f"Debug: {self.debug_view}".encode(), 10, 232, 18, BLACK)
-                status = "Paused" if not self.playback.playing else f"Playing {self.playback.current_speed:.2f}x"
-                DrawText(f"Frame: {self.frame_index}".encode(), 10, 34, 20, BLACK)
-                DrawText(f"Range: {self._frame_range_name()}".encode(), 10, 58, 20, DARKGRAY)
-                DrawText(status.encode(), 10, 82, 20, BLUE)
-                mode_label = f"Skeleton: {'pruned->full reconstruction' if self.use_pruned_reconstruction else 'full direct'}"
-                DrawText(mode_label.encode(), 10, 106, 20, DARKGRAY)
-                if self.compare_mode:
-                    DrawText(f"Left: {self.left_label}".encode(), 10, 130, 20, Color(40, 90, 220, 255))
-                    DrawText(f"Right: {self.right_label}".encode(), 10, 154, 20, ORANGE)
-                if self.indices is not None:
-                    DrawText(f"Sample: {self.sample_index}".encode(), 10, 130, 20, DARKGRAY)
-                    DrawText(f"Mirror: {bool(self.sample_mirror[self.sample_index])}".encode(), 10, 154, 20, DARKGRAY)
-                DrawText(b"Ctrl+LMB/RMB+drag: camera | Wheel: zoom", 10, 184, 18, BLACK)
-                DrawText(self._control_hint(), 10, 208, 18, BLACK)
-                self.playback.draw_ui(screen_width, screen_height, "Sample" if self.indices is not None else "Frame")
+                if frame_dir is None:
+                    rlEnableColorBlend()
+                    DrawFPS(10, 10)
+                    status = "Paused" if not self.playback.playing else f"Playing {self.playback.current_speed:.2f}x"
+                    DrawText(f"Frame: {self.frame_index}".encode(), 10, 34, 20, BLACK)
+                    DrawText(f"Range: {self._frame_range_name()}".encode(), 10, 58, 20, DARKGRAY)
+                    DrawText(status.encode(), 10, 82, 20, BLUE)
+                    mode_label = f"Skeleton: {'pruned->full reconstruction' if self.use_pruned_reconstruction else 'full direct'}"
+                    DrawText(mode_label.encode(), 10, 106, 20, DARKGRAY)
+                    if self.compare_mode:
+                        DrawText(f"Left: {self.left_label}".encode(), 10, 130, 20, Color(40, 90, 220, 255))
+                        DrawText(f"Right: {self.right_label}".encode(), 10, 154, 20, ORANGE)
+                    if self.indices is not None:
+                        DrawText(f"Sample: {self.sample_index}".encode(), 10, 130, 20, DARKGRAY)
+                        DrawText(f"Mirror: {bool(self.sample_mirror[self.sample_index])}".encode(), 10, 154, 20, DARKGRAY)
+                    DrawText(b"Ctrl+LMB/RMB+drag: camera | Wheel: zoom", 10, 184, 18, BLACK)
+                    DrawText(self._control_hint(), 10, 208, 18, BLACK)
+                    self.playback.draw_ui(screen_width, screen_height, "Sample" if self.indices is not None else "Frame")
                 EndDrawing()
+                if frame_dir is not None:
+                    take_screenshot(str(frame_dir / f"frame_{recorded_frames:06d}.png"))
+                    recorded_frames += 1
+                    if recorded_frames >= self.playback.frame_count:
+                        break
         finally:
+            if frame_dir is not None:
+                os.chdir(recording_cwd)
             self._cleanup()
             CloseWindow()
+            if frame_dir is not None:
+                self.output_video.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-loglevel", "error",
+                        "-framerate", str(self.fps),
+                        "-i", str(frame_dir / "frame_%06d.png"),
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        str(self.output_video),
+                    ],
+                    check=True,
+                )
+                shutil.rmtree(frame_dir)
 
 
 class GenoViewCompare(GenoView):
@@ -1321,7 +1113,11 @@ class GenoViewCompare(GenoView):
         metallic: float = 0.0,
         roughness: float = 0.58,
         exposure: float = 0.9,
-        debug_view: str = "final",
+        ssao_intensity: float = 0.15,
+        ibl_strength: float = 0.35,
+        ibl_enabled: bool = True,
+        shadow_resolution: int = 2048,
+        output_video: Path | None = None,
         rig: RigSpec = GENO_RIG,
     ):
         super().__init__(
@@ -1338,7 +1134,11 @@ class GenoViewCompare(GenoView):
             metallic=metallic,
             roughness=roughness,
             exposure=exposure,
-            debug_view=debug_view,
+            ssao_intensity=ssao_intensity,
+            ibl_strength=ibl_strength,
+            ibl_enabled=ibl_enabled,
+            shadow_resolution=shadow_resolution,
+            output_video=output_video,
         )
 
 
@@ -1365,12 +1165,11 @@ def main():
     parser.add_argument("--metallic", type=float, default=0.0)
     parser.add_argument("--roughness", type=float, default=0.58)
     parser.add_argument("--exposure", type=float, default=0.9)
-    parser.add_argument(
-        "--debug-view",
-        choices=("final", "albedo", "normal", "depth", "ssao", "lighting"),
-        default="final",
-        help="Display an intermediate render target for pipeline diagnosis.",
-    )
+    parser.add_argument("--ssao-intensity", type=float, default=0.15)
+    parser.add_argument("--ibl-strength", type=float, default=0.35)
+    parser.add_argument("--disable-ibl", action="store_true")
+    parser.add_argument("--shadow-resolution", type=int, default=2048)
+    parser.add_argument("--output-video", type=Path, default=None, help="Render the full clip to an MP4 at this path.")
     args = parser.parse_args()
 
     selected_inputs = [args.database is not None, args.bvh is not None, args.features is not None]
@@ -1404,7 +1203,11 @@ def main():
         metallic=args.metallic,
         roughness=args.roughness,
         exposure=args.exposure,
-        debug_view=args.debug_view,
+        ssao_intensity=args.ssao_intensity,
+        ibl_strength=args.ibl_strength,
+        ibl_enabled=not args.disable_ibl,
+        shadow_resolution=args.shadow_resolution,
+        output_video=args.output_video,
     )
     viewer.run()
 

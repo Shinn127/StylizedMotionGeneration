@@ -81,6 +81,29 @@ def test_preprocess_dispatch_strips_outer_options(monkeypatch):
     ]
 
 
+def test_soma_asset_dispatch_does_not_add_a_preprocess_subcommand(monkeypatch):
+    captured = {}
+
+    def fake_run(module_name, forwarded_args):
+        captured["module"] = module_name
+        captured["args"] = forwarded_args
+
+    monkeypatch.setattr(run, "_run_module", fake_run)
+    run.main(
+        [
+            "--mode", "preprocess",
+            "--pipeline", "soma-assets",
+            "--usd", "soma.usd",
+            "--bvh", "soma.bvh",
+            "--output-dir", "assets/somaview",
+        ]
+    )
+    assert captured["module"] == "stylized_motion.anim.soma_assets"
+    assert captured["args"] == [
+        "--usd", "soma.usd", "--bvh", "soma.bvh", "--output-dir", "assets/somaview",
+    ]
+
+
 def test_canonical_tree_is_present_and_old_workflow_modules_are_absent():
     root = PROJECT_ROOT / "stylized_motion"
     for path in (

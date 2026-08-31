@@ -471,12 +471,12 @@ SomaView 用 GenoView 的同一渲染管线播放 BONES-SEED 数据集的 SOMA �
 
 ```bash
 hf download bones-studio/seed --repo-type dataset --include "soma_shapes/*" \
-  --local-dir data/raw/bones_seed
+  --local-dir data/raw/seed
 
 python -m stylized_motion.run \
   --mode preprocess --pipeline soma-assets \
-  --usd data/raw/bones_seed/soma_shapes/soma_base_rig/soma_base_skel_minimal.usd \
-  --bvh data/raw/bones_seed/soma_shapes/soma_base_rig/soma_base_skel_minimal.bvh \
+  --usd data/raw/seed/soma_shapes/soma_base_rig/soma_base_skel_minimal.usd \
+  --bvh data/raw/seed/soma_shapes/soma_base_rig/soma_base_skel_minimal.bvh \
   --output-dir data/assets/somaview --overwrite
 ```
 
@@ -487,21 +487,33 @@ python -m stylized_motion.run \
 ```bash
 python -m stylized_motion.run \
   --mode visualize --pipeline somaview \
-  --bvh data/raw/bones_seed/soma_uniform/bvh/<clip>.bvh --fps 120
+  --bvh data/raw/seed/bvh/soma_uniform/<date>/<clip>.bvh --fps 120
 ```
+
+将整段 BVH 逐帧渲染并编码为 MP4：
+
+```bash
+conda run -n mcc python -m stylized_motion.run \
+  --mode visualize --pipeline somaview \
+  --bvh data/raw/seed/bvh/soma_uniform/210531/jump_and_land_heavy_001__A001.bvh \
+  --shading legacy --fps 120 \
+  --output-video outputs/somaview_legacy.mp4
+```
+
+`--output-video` 会按输入帧率离线渲染完整 clip，使用 ffmpeg 写出 H.264 MP4；不指定时保持交互式实时播放。
 
 如果需要将 SOMA 的 120 FPS BVH 下采样为 60 FPS，可使用仓库内的批处理脚本。脚本保留原始骨架层级和通道布局，默认每隔一帧取一帧，并自动将 `Frame Time` 加倍：
 
 ```bash
 # 单个文件
 python scripts/downsample_bvh.py \
-  data/raw/bones_seed/bvh/soma_uniform/210531/jump_and_land_heavy_001__A001_M.bvh \
-  data/raw/bones_seed/bvh/soma_uniform_60fps/210531/jump_and_land_heavy_001__A001_M.bvh
+  data/raw/seed/bvh/soma_uniform/210531/jump_and_land_heavy_001__A001_M.bvh \
+  data/raw/seed/bvh/soma_uniform_60fps/210531/jump_and_land_heavy_001__A001_M.bvh
 
 # 整个目录，递归保留相对目录结构
 python scripts/downsample_bvh.py \
-  data/raw/bones_seed/bvh/soma_uniform \
-  data/raw/bones_seed/bvh/soma_uniform_60fps
+  data/raw/seed/bvh/soma_uniform \
+  data/raw/seed/bvh/soma_uniform_60fps
 ```
 
 输出文件已存在时加 `--overwrite`；其他倍率可用 `--factor N` 指定。例如 `--factor 4` 表示保留每 4 帧中的第 1 帧。
@@ -551,7 +563,9 @@ python -m stylized_motion.run \
   --stats-source data/processed/100style_pruned_90/feature_database
 ```
 
-GenoView 支持播放、暂停、逐帧移动、速度调整、时间轴拖拽和相机交互。渲染默认使用 legacy 光照模型；`--shading pbr` 显式启用 Cook-Torrance 光照和 ACES tone mapping。使用 `--debug-view albedo|normal|depth|ssao|lighting` 可查看中间缓冲，用于定位颜色和光照问题。
+GenoView 支持播放、暂停、逐帧移动、速度调整、时间轴拖拽和相机交互。渲染默认使用 PBR；`--shading legacy` 可切换到 legacy 光照模型。PBR 使用 Cook-Torrance 光照、独立 HDR/Tone Mapping 和 ACES approximation。可用 `--ssao-intensity` 调整 AO 强度（默认 `0.15`）。
+
+PBR Geometry Pass 的默认材质由 `Material` 描述，`Scene` 管理 `RenderObject` 和 `DirectionalLight`，`RenderTargets` 管理 GBuffer、HDR、Shadow 和 AO 资源。材质纹理约定为：`base_color_map` 使用 sRGB，`metallic_roughness_map` 的 RGB 分别为 Metallic/Roughness/AO，`normal_map` 使用线性 tangent-space 数据；加载材质纹理时会生成 mipmap。
 
 ### 10.5 实时 FSQ rollout
 

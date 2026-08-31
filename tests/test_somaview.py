@@ -29,11 +29,86 @@ def test_soma_resource_dir_is_separate_from_genoview():
     assert SOMA_RESOURCE_DIR != RESOURCE_DIR
 
 
+def test_pbr_shader_contract_is_shared_between_viewers():
+    for resource_dir in (RESOURCE_DIR, SOMA_RESOURCE_DIR):
+        pbr_gbuffer = (resource_dir / "pbr.fs").read_text(encoding="utf-8")
+        pbr_lighting = (resource_dir / "pbrLighting.fs").read_text(encoding="utf-8")
+        ssao = (resource_dir / "ssao.fs").read_text(encoding="utf-8")
+        assert (resource_dir / "tonemap.fs").exists()
+        assert "uniform sampler2D baseColorMap" in pbr_gbuffer
+        assert "uniform sampler2D metallicRoughnessMap" in pbr_gbuffer
+        assert "uniform int useBaseColorMap" in pbr_gbuffer
+        assert "uniform int useMetallicRoughnessMap" in pbr_gbuffer
+        assert "uniform int pbrGroundPattern" in pbr_gbuffer
+        assert "uniform sampler2D shadowMap" in pbr_lighting
+        assert "uniform float prefilterMaxLod" in pbr_lighting
+        assert "textureLod(prefilterMap" in pbr_lighting
+        assert "finalColor = vec4(direct + ambient, 1.0)" in pbr_lighting
+        assert "uniform float ssaoIntensity" in ssao
+        assert "shadowMap" not in ssao
+    for shader in ("pbr.fs", "lighting.fs", "pbrLighting.fs", "ssao.fs", "tonemap.fs"):
+        assert (RESOURCE_DIR / shader).read_bytes() == (SOMA_RESOURCE_DIR / shader).read_bytes()
+
+
+def test_material_scene_and_texture_contract():
+    from stylized_motion.anim.materials import Material, TEXTURE_CONTRACT
+    from stylized_motion.anim.scene import DirectionalLight, RenderObject, Scene
+
+    material = Material(metallic=2.0, roughness=0.0, ao=-1.0)
+    assert material.metallic == 1.0
+    assert material.roughness == 0.04
+    assert material.ao == 0.0
+    assert TEXTURE_CONTRACT["base_color_map"]["color_space"] == "sRGB"
+    assert TEXTURE_CONTRACT["metallic_roughness_map"]["channels"] == ("metallic", "roughness", "ao")
+    assert TEXTURE_CONTRACT["normal_map"]["color_space"] == "linear"
+
+    light = DirectionalLight(direction=None, color=None, intensity=0.25)
+    scene = Scene(directional_light=light)
+    obj = RenderObject(model=None, material=material)
+    assert scene.add_object(obj) is obj
+    assert scene.objects == [obj]
+
+
 def test_default_rig_stays_geno_for_existing_consumers():
     assert build_simulation_root_skeleton_from_bind.__defaults__ == (GENO_RIG,)
     import stylized_motion.anim.genoview as genoview
 
     assert genoview.GenoView.__init__.__defaults__[-1] is GENO_RIG
+
+
+def test_renderer_owns_render_passes_and_run_only_schedules_them():
+    import ast
+
+    import stylized_motion.anim.genoview as genoview
+    import stylized_motion.anim.render_targets as render_targets
+
+    renderer_source = (Path(genoview.__file__).parent / "renderer.py").read_text(encoding="utf-8")
+    renderer_tree = ast.parse(renderer_source)
+    renderer_methods = {
+        node.name
+        for node in ast.walk(renderer_tree)
+        if isinstance(node, ast.FunctionDef) and node.args.args and node.args.args[0].arg == "self"
+    }
+    assert {"render_shadow", "render_gbuffer", "render_ssao", "render_lighting", "render_frame"} <= renderer_methods
+
+    genoview_source = Path(genoview.__file__).read_text(encoding="utf-8")
+    genoview_tree = ast.parse(genoview_source)
+    run_node = next(node for node in ast.walk(genoview_tree) if isinstance(node, ast.FunctionDef) and node.name == "run")
+    run_calls = {
+        node.func.id
+        for node in ast.walk(run_node)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "render_frame" not in run_calls
+    assert "BeginTextureMode" not in run_calls
+    assert "ffi.new" not in genoview_source[genoview_source.index("    def run(self):"):]
+    render_target_methods = {
+        node.name
+        for node in ast.walk(ast.parse(Path(render_targets.__file__).read_text(encoding="utf-8")))
+        if isinstance(node, ast.FunctionDef) and node.args.args and node.args.args[0].arg == "self"
+    }
+    assert {"initialize", "cleanup"} <= render_target_methods
+    assert "RenderTargets" in genoview_source
 
 
 SOMA_BIND = Path(__file__).resolve().parents[1] / "data" / "assets" / "somaview" / "SOMA_bind.bvh"

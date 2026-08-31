@@ -5,9 +5,11 @@ uniform sampler2D gbufferColor;
 uniform sampler2D gbufferNormal;
 uniform sampler2D gbufferDepth;
 uniform sampler2D ssao;
+uniform sampler2D shadowMap;
 
 uniform vec3 camPos;
 uniform mat4 camInvViewProj;
+uniform mat4 lightViewProj;
 uniform vec3 lightDir;
 uniform vec3 sunColor;
 uniform float sunStrength;
@@ -18,6 +20,8 @@ uniform float ambientStrength;
 uniform float exposure;
 uniform float camClipNear;
 uniform float camClipFar;
+uniform float lightClipNear;
+uniform float lightClipFar;
 
 out vec4 finalColor;
 
@@ -43,6 +47,19 @@ float NonlinearDepth(float depth, float near, float far)
     return (((2.0 * near) / depth) - far - near) / (near - far);
 }
 
+float ShadowFactor(vec3 position, vec3 normal)
+{
+    vec4 lightPosition = lightViewProj * vec4(position + 0.01 * normal, 1.0);
+    lightPosition.xyz = (lightPosition.xyz / lightPosition.w + 1.0) * 0.5;
+    float inside = float(
+        lightPosition.x > 0.0 && lightPosition.x < 1.0 &&
+        lightPosition.y > 0.0 && lightPosition.y < 1.0 &&
+        lightPosition.z > 0.0 && lightPosition.z < 1.0);
+    float receiverDepth = LinearDepth(lightPosition.z, lightClipNear, lightClipFar);
+    float blockerDepth = texture(shadowMap, lightPosition.xy).r;
+    return 1.0 - inside * float(receiverDepth - 0.000005 > blockerDepth);
+}
+
 void main()
 {
     // Unpack GBuffer
@@ -60,8 +77,8 @@ void main()
     vec3 albedo = colorAndSpec.xyz;
     float specularity = colorAndSpec.w;
     float glossiness = normalAndGlossiness.w * 100.0f;
-    float sunShadow = ssaoData.g;
     float ambientShadow = ssaoData.r;
+    float sunShadow = ShadowFactor(fragPosition, normalize(fragNormal));
     
     // Compute lighting
     
@@ -104,4 +121,3 @@ void main()
     //finalColor = vec4(ToGamma(vec3(specular, specular, specular)), 1.0f);
     gl_FragDepth = NonlinearDepth(depth, camClipNear, camClipFar);
 }
-

@@ -3,6 +3,7 @@
 in vec3 vertexPosition;
 in vec2 vertexTexCoord;
 in vec3 vertexNormal;
+in vec4 vertexTangent;
 in vec4 vertexColor;
 in vec4 vertexBoneIds;
 in vec4 vertexBoneWeights;
@@ -16,6 +17,7 @@ out vec3 fragPosition;
 out vec2 fragTexCoord;
 out vec4 fragColor;
 out vec3 fragNormal;
+out vec4 fragTangent;
 
 void main()
 {
@@ -35,11 +37,17 @@ void main()
         vertexBoneWeights.y * (mat3(boneMatrices[boneIndex1]) * vertexNormal) +
         vertexBoneWeights.z * (mat3(boneMatrices[boneIndex2]) * vertexNormal) +
         vertexBoneWeights.w * (mat3(boneMatrices[boneIndex3]) * vertexNormal));
+    vec3 skinnedTangent =
+        vertexBoneWeights.x * (mat3(boneMatrices[boneIndex0]) * vertexTangent.xyz) +
+        vertexBoneWeights.y * (mat3(boneMatrices[boneIndex1]) * vertexTangent.xyz) +
+        vertexBoneWeights.z * (mat3(boneMatrices[boneIndex2]) * vertexTangent.xyz) +
+        vertexBoneWeights.w * (mat3(boneMatrices[boneIndex3]) * vertexTangent.xyz);
 
     fragPosition = skinnedPosition.xyz / skinnedPosition.w;
     fragTexCoord = vertexTexCoord;
     fragColor = vertexColor;
     fragNormal = skinnedNormal;
+    fragTangent = vec4(skinnedTangent, vertexTangent.w);
 
     gl_Position = mvp * vec4(fragPosition, 1.0f);
 }

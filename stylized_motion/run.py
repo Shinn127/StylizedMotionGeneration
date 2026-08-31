@@ -209,7 +209,7 @@ def main(argv: list[str] | None = None) -> None:
     if module_name is None:
         parser.error(f"pipeline {args.pipeline!r} is not available in mode {args.mode!r}")
     forwarded_args = _without_dispatch_options(forwarded_args)
-    if args.mode == "preprocess":
+    if args.mode == "preprocess" and module_name == "stylized_motion.data.preprocess":
         forwarded_args = [args.pipeline, *forwarded_args]
     if module_name == "stylized_motion.learning.runner":
         _validate_representation_dispatch(raw_args, parser)
