@@ -40,7 +40,12 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         assert "uniform int useBaseColorMap" in pbr_gbuffer
         assert "uniform int useMetallicRoughnessMap" in pbr_gbuffer
         assert "uniform int pbrGroundPattern" in pbr_gbuffer
+        assert "in vec4 fragTangent" in pbr_gbuffer
+        assert "layout (location = 2) out float gbufferMaterialAO" in pbr_gbuffer
+        assert "gbufferMaterialAO = ao;" in pbr_gbuffer
         assert "uniform sampler2D shadowMap" in pbr_lighting
+        assert "uniform sampler2D materialAO" in pbr_lighting
+        assert "texture(materialAO, fragTexCoord).r" in pbr_lighting
         assert "uniform float prefilterMaxLod" in pbr_lighting
         assert "textureLod(prefilterMap" in pbr_lighting
         assert "finalColor = vec4(direct + ambient, 1.0)" in pbr_lighting
@@ -73,6 +78,17 @@ def test_debug_view_contract_is_shared_between_viewers():
     assert "uniform int debugMode" in pbr_lighting
     assert "finalColor = vec4(vec3(shadow), 1.0)" in pbr_lighting
     assert "finalColor = vec4(ambient, 1.0)" in pbr_lighting
+
+
+def test_gbuffer_carries_material_ao_attachment():
+    import stylized_motion.anim.render_targets as render_targets
+
+    source = Path(render_targets.__file__).read_text(encoding="utf-8")
+    assert "RL_ATTACHMENT_COLOR_CHANNEL2" in source
+    assert "PIXELFORMAT_UNCOMPRESSED_GRAYSCALE" in source
+    assert "rlActiveDrawBuffers(3)" in source
+    gbuffer_init = render_targets.GBuffer()
+    assert hasattr(gbuffer_init, "material_ao")
 
 
 def test_material_scene_and_texture_contract():

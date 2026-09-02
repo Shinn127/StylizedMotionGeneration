@@ -17,7 +17,7 @@ from raylib.defines import *
 from stylized_motion.anim.features import deserialize_motion_feature_stats, reconstruct_motion_state_from_features
 from stylized_motion.anim import quat
 from stylized_motion.anim.environment import IBLResources
-from stylized_motion.anim.materials import Material
+from stylized_motion.anim.materials import Material, load_material_texture
 from stylized_motion.anim.render_targets import RenderTargets
 from stylized_motion.anim.scene import DirectionalLight, RenderObject, Scene
 from stylized_motion.data import open_feature_store
@@ -657,6 +657,8 @@ class GenoView:
         output_video: Path | None = None,
         draw_skeleton: bool = False,
         debug_view: str = "final",
+        normal_map: Path | None = None,
+        metallic_roughness_map: Path | None = None,
         rig: RigSpec = GENO_RIG,
     ):
         if debug_view not in DEBUG_MODES:
@@ -665,6 +667,8 @@ class GenoView:
         self.skeleton_enabled = bool(draw_skeleton)
         self.skeleton_color = GRAY
         self.debug_view = debug_view
+        self.normal_map_path = normal_map
+        self.metallic_roughness_map_path = metallic_roughness_map
         self.shading = shading
         self.metallic = float(metallic)
         self.roughness = float(roughness)
@@ -917,6 +921,7 @@ class GenoView:
         self.shader_locs["lighting_gbuffer_normal"] = GetShaderLocation(self.shaders["lighting"], b"gbufferNormal")
         self.shader_locs["lighting_gbuffer_depth"] = GetShaderLocation(self.shaders["lighting"], b"gbufferDepth")
         self.shader_locs["lighting_ssao"] = GetShaderLocation(self.shaders["lighting"], b"ssao")
+        self.shader_locs["lighting_material_ao"] = GetShaderLocation(self.shaders["lighting"], b"materialAO")
         self.shader_locs["lighting_cam_pos"] = GetShaderLocation(self.shaders["lighting"], b"camPos")
         self.shader_locs["lighting_cam_inv_view_proj"] = GetShaderLocation(self.shaders["lighting"], b"camInvViewProj")
         self.shader_locs["lighting_light_dir"] = GetShaderLocation(self.shaders["lighting"], b"lightDir")
@@ -959,6 +964,16 @@ class GenoView:
         if self.shading == "pbr":
             self.ibl = IBLResources(strength=self.ibl_strength, enabled=self.ibl_enabled).initialize()
             self.prefilter_max_lod_ptr[0] = self.ibl.prefilter_max_lod
+
+        # Material maps need the GL context, so they are loaded here instead of
+        # __init__; they ride on the default material of the skinned character.
+        if self.shading == "pbr":
+            if self.normal_map_path is not None:
+                self.default_material.normal_map = load_material_texture(self.normal_map_path, "normal_map")
+            if self.metallic_roughness_map_path is not None:
+                self.default_material.metallic_roughness_map = load_material_texture(
+                    self.metallic_roughness_map_path, "metallic_roughness_map"
+                )
 
         self.shader_locs["fxaa_input_texture"] = GetShaderLocation(self.shaders["fxaa"], b"inputTexture")
         self.shader_locs["fxaa_inv_texture_resolution"] = GetShaderLocation(self.shaders["fxaa"], b"invTextureResolution")
@@ -1043,6 +1058,14 @@ class GenoView:
             self.ibl.cleanup()
         if self.render_targets is not None:
             self.render_targets.cleanup()
+        if self.default_material is not None:
+            for texture in (
+                self.default_material.base_color_map,
+                self.default_material.metallic_roughness_map,
+                self.default_material.normal_map,
+            ):
+                if texture is not None:
+                    UnloadTexture(texture)
         if self.geno_model is not None:
             UnloadModel(self.geno_model)
         if self.compare_model is not None:
@@ -1262,6 +1285,8 @@ class GenoViewCompare(GenoView):
         output_video: Path | None = None,
         draw_skeleton: bool = False,
         debug_view: str = "final",
+        normal_map: Path | None = None,
+        metallic_roughness_map: Path | None = None,
         rig: RigSpec = GENO_RIG,
     ):
         super().__init__(
@@ -1285,6 +1310,8 @@ class GenoViewCompare(GenoView):
             output_video=output_video,
             draw_skeleton=draw_skeleton,
             debug_view=debug_view,
+            normal_map=normal_map,
+            metallic_roughness_map=metallic_roughness_map,
         )
 
 
@@ -1318,6 +1345,8 @@ def main():
     parser.add_argument("--output-video", type=Path, default=None, help="Render the full clip to an MP4 at this path.")
     parser.add_argument("--skeleton", action="store_true", help="Draw the character skeleton overlay (joints, bone links, per-joint XYZ frames). Toggle at runtime with B.")
     parser.add_argument("--debug-view", choices=DEBUG_MODES, default="final", help="Initial PBR debug view. Cycle at runtime with V (Shift+V to go back).")
+    parser.add_argument("--normal-map", type=Path, default=None, help="Optional tangent-space normal map applied to the character's default material.")
+    parser.add_argument("--metallic-roughness-map", type=Path, default=None, help="Optional linear map (R=metallic, G=roughness, B=AO) applied to the character's default material.")
     args = parser.parse_args()
 
     selected_inputs = [args.database is not None, args.bvh is not None, args.features is not None]
@@ -1358,6 +1387,8 @@ def main():
         output_video=args.output_video,
         draw_skeleton=args.skeleton,
         debug_view=args.debug_view,
+        normal_map=args.normal_map,
+        metallic_roughness_map=args.metallic_roughness_map,
     )
     viewer.run()
 

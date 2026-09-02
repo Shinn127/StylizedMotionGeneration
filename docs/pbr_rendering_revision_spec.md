@@ -14,6 +14,8 @@
 
 实施更新（2026-09-03）：Debug View 已落地，Phase 0 的 debug 参数交付项关闭。模式为 final/base_color/metallic/roughness/normal/depth/ao/shadow/diffuse/specular/ibl/hdr；运行时 `V`（`Shift+V` 反向）循环，`--debug-view` 指定初始模式。shadow/diffuse/specular/ibl 由 `pbrLighting.fs` 的 `debugMode` 输出到 HDR target，其余模式由新增 `debug.fs` 显示 pass 直接读取 GBuffer/SSAO/HDR 纹理；调试显示只做 exposure + linear→sRGB，不经过 ACES，且跳过 FXAA。
 
+实施更新（2026-09-03，Phase 4 前半）：normal mapping 与材质 AO 已落地。顶点切线管线（含蒙皮切线变换）此前已就绪；`pbr.fs` 现构建 TBN 并采样 `normalMap.rg`（z 分量由 xy 重建，兼容标准 RGB 法线贴图），退化切线回退几何法线。GBuffer 新增第三个 R8 attachment（`gbufferMaterialAO`），材质 ao（uniform 或 `metallicRoughnessMap.B`）经此进入 lighting，与 SSAO 相乘后仅作用于间接光。viewer CLI 新增 `--normal-map` 与 `--metallic-roughness-map`，应用到角色默认材质。材质测试场景（material grid）仍属 Phase 4 未完成项。
+
 ## 1. 目标
 
 本轮修订完成后，GenoView/SomaView 应具备一个结构清晰、可验证、可扩展的 Minimal Deferred PBR 管线：
@@ -116,6 +118,9 @@ GBuffer1: RGBA16F
   RGB = encoded world normal = normal * 0.5 + 0.5
   A   = Roughness
 
+GBuffer2: R8（Phase 4 修订新增）
+  R   = material AO，baked 材质级遮蔽项
+
 Depth: depth texture
   R   = linear depth，沿用当前 Position Reconstruction 契约
 ```
@@ -123,7 +128,7 @@ Depth: depth texture
 约束：
 
 - 不增加 Position、Velocity、Material ID、Emission attachment；
-- 不把 AO 挤入 GBuffer；
+- SSAO 结果不写入 GBuffer；材质 AO 使用独立的 R8 attachment，语义见 20.5 决策记录；
 - metallic、roughness 必须 clamp 到 `[0, 1]`，roughness 最小值暂定 `0.04`；
 - normal 在写入前必须 normalize，在 Lighting 解码后再次 normalize；
 - GBuffer 的 attachment 数量和 draw buffer 状态必须在 `begin_gbuffer/end_gbuffer` 中成对恢复。
@@ -208,7 +213,7 @@ pbr_gbuffer.vs / skinned_pbr_gbuffer.vs
   vertex transform、skinning、world position、normal、UV、future tangent
 
 pbr_gbuffer.fs
-  material resolve、sRGB/linear、normal resolve、GBuffer packing、linear depth
+  material resolve、sRGB/linear、TBN 构建与 normal map 采样、GBuffer packing、material AO 输出、linear depth
 
 shadow.vs / skinnedShadow.vs
   light-space transform、shadow skinning
@@ -223,14 +228,18 @@ blur.fs
   只 blur AO
 
 pbrLighting.fs
-  position reconstruction、GGX、Smith、Schlick、direct light、shadow、AO、IBL
-  输出 linear HDR
+  position reconstruction、GGX、Smith、Schlick、direct light、shadow、SSAO×material AO、IBL
+  输出 linear HDR；debugMode 输出 shadow/diffuse/specular/ibl 调试量
 
 tonemap.fs
   exposure、tone mapping、linear→sRGB
 
 fxaa.fs
   FXAA
+
+debug.fs
+  仅调试显示：读取 GBuffer/SSAO/HDR 纹理与 lighting debugMode 输出，
+  exposure + linear→sRGB 显示，不参与生产画面路径
 ```
 
 PBR Lighting 必须遵守：
@@ -433,6 +442,8 @@ columns = roughness: 0.0, 0.25, 0.5, 0.75, 1.0
 
 ### Phase 0：基线与诊断
 
+> 2026-09-03 进度：metallic/roughness/shadow 等 debug view 已交付；基线截图仍需用 `--debug-view` + `--output-video` 逐模式生成。
+
 - 固定当前 PBR 输出截图/参数作为 baseline；
 - 增加 metallic、roughness、shadow debug；
 - 修正 README 与代码默认 shading 不一致的问题；
@@ -469,6 +480,8 @@ columns = roughness: 0.0, 0.25, 0.5, 0.75, 1.0
 - 每一步都保留 debug view 和 fallback 对照。
 
 ### Phase 4：Normal Mapping 与测试场景
+
+> 2026-09-03 进度：tangent 数据管线、TBN/normal map 采样、材质 AO 的间接光接入已完成；material grid 与系统性纹理验证（颜色空间、mipmap）仍未完成，`--normal-map` / `--metallic-roughness-map` 提供手动验证入口。
 
 - 扩展模型/mesh 数据以提供可靠 tangent；
 - 在 GBuffer 中构造 TBN 并采样 normal map；
@@ -550,6 +563,10 @@ python -m stylized_motion.run --mode visualize --pipeline somaview --bvh <small_
 ### 20.4 当前默认值
 
 代码中的 `shading` 默认值目前是 `pbr`，README 仍描述为 legacy。Phase 0 必须统一文档、CLI help 和实际默认值；本 spec 选择保留代码现状，将 PBR 作为默认 viewer 模式，legacy 作为显式回退模式。
+
+### 20.5 材质 AO attachment（2026-09-03）
+
+Phase 4 落地材质 AO 时，GBuffer0/1 的既有布局没有空闲通道。评估了两个方案：albedo 预乘（零布局变更，但材质 AO 会错误地压暗 direct light，违反"AO 只影响间接光"验收项）与新增第三个 R8 attachment（布局最小增量，语义与 glTF occlusion texture 一致）。选择后者：GBuffer2 为 R8，仅存材质 AO；SSAO 结果仍不进入 GBuffer；lighting 中 `ao = ssao * materialAO`，仅作用于间接光。5.1 中原"不把 AO 挤入 GBuffer"约束按此口径修订为 SSAO/Material AO 语义分离。
 
 ## 20. 完成定义
 

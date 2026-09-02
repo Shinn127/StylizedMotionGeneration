@@ -17,6 +17,7 @@ class GBuffer:
         self.id = 0
         self.color = Texture()
         self.normal = Texture()
+        self.material_ao = Texture()
         self.depth = Texture()
 
 
@@ -115,6 +116,15 @@ def load_gbuffer(width, height):
     target.normal.format = PIXELFORMAT_UNCOMPRESSED_R16G16B16A16
     target.normal.mipmaps = 1
     rlFramebufferAttach(target.id, target.normal.id, RL_ATTACHMENT_COLOR_CHANNEL1, RL_ATTACHMENT_TEXTURE2D, 0)
+    # Phase 4 revision: a dedicated R8 attachment for baked per-material AO.
+    # SSAO never enters the GBuffer; this channel is the material-level
+    # occlusion term that scales indirect light in the lighting pass.
+    target.material_ao.id = rlLoadTexture(ffi.NULL, width, height, PIXELFORMAT_UNCOMPRESSED_GRAYSCALE, 1)
+    target.material_ao.width = width
+    target.material_ao.height = height
+    target.material_ao.format = PIXELFORMAT_UNCOMPRESSED_GRAYSCALE
+    target.material_ao.mipmaps = 1
+    rlFramebufferAttach(target.id, target.material_ao.id, RL_ATTACHMENT_COLOR_CHANNEL2, RL_ATTACHMENT_TEXTURE2D, 0)
     target.depth.id = rlLoadTextureDepth(width, height, False)
     target.depth.width = width
     target.depth.height = height
@@ -134,7 +144,7 @@ def unload_gbuffer(target):
 def begin_gbuffer(target, camera):
     rlDrawRenderBatchActive()
     rlEnableFramebuffer(target.id)
-    rlActiveDrawBuffers(2)
+    rlActiveDrawBuffers(3)
     rlViewport(0, 0, target.color.width, target.color.height)
     rlSetFramebufferWidth(target.color.width)
     rlSetFramebufferHeight(target.color.height)

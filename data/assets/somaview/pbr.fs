@@ -4,6 +4,7 @@ in vec3 fragPosition;
 in vec2 fragTexCoord;
 in vec4 fragColor;
 in vec3 fragNormal;
+in vec4 fragTangent;
 
 uniform vec4 colDiffuse;
 uniform vec4 materialBaseColor;
@@ -22,6 +23,7 @@ uniform float camClipFar;
 
 layout (location = 0) out vec4 gbufferColor;
 layout (location = 1) out vec4 gbufferNormal;
+layout (location = 2) out float gbufferMaterialAO;
 
 float LinearDepth(float depth, float near, float far)
 {
@@ -58,6 +60,23 @@ float Checker(in vec2 uv)
     return 0.5 - 0.5 * i.x * i.y;
 }
 
+vec3 ResolveNormal(vec3 geometricNormal, vec2 texcoord)
+{
+    // Gram-Schmidt re-orthogonalization keeps the TBN valid when interpolated
+    // tangents drift away from the normal; degenerate tangents fall back to
+    // the geometric normal instead of producing a garbage frame.
+    vec3 normal = normalize(geometricNormal);
+    vec3 tangent = fragTangent.xyz - normal * dot(normal, fragTangent.xyz);
+    float tangentLength = length(tangent);
+    if (tangentLength < 1e-5) { return normal; }
+    tangent /= tangentLength;
+    vec3 bitangent = cross(normal, tangent) * fragTangent.w;
+    mat3 tbn = mat3(tangent, bitangent, normal);
+    vec2 tangentNormalXY = texture(normalMap, texcoord).rg * 2.0 - 1.0;
+    float tangentNormalZ = sqrt(max(0.0, 1.0 - dot(tangentNormalXY, tangentNormalXY)));
+    return normalize(tbn * vec3(tangentNormalXY, tangentNormalZ));
+}
+
 void main()
 {
     vec3 albedo = SRGBToLinear((fragColor.rgb * colDiffuse.rgb) * materialBaseColor.rgb);
@@ -71,7 +90,7 @@ void main()
         float groundValue = mix(mix(mix(0.9, 0.95, check), 0.85, gridFine), 1.0, gridCoarse);
         albedo *= groundValue;
     }
-    vec3 normal = normalize(fragNormal);
+    vec3 normal = useNormalMap != 0 ? ResolveNormal(fragNormal, fragTexCoord) : normalize(fragNormal);
     float metallic = clamp(pbrMetallic, 0.0, 1.0);
     float roughness = clamp(pbrRoughness, 0.04, 1.0);
     float ao = clamp(pbrAo, 0.0, 1.0);
@@ -83,5 +102,6 @@ void main()
     }
     gbufferColor = vec4(albedo, metallic);
     gbufferNormal = vec4(normal * 0.5 + 0.5, roughness);
+    gbufferMaterialAO = ao;
     gl_FragDepth = LinearDepth(gl_FragCoord.z, camClipNear, camClipFar);
 }

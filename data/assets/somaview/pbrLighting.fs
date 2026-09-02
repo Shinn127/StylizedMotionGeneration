@@ -6,6 +6,7 @@ uniform sampler2D gbufferColor;
 uniform sampler2D gbufferNormal;
 uniform sampler2D gbufferDepth;
 uniform sampler2D ssao;
+uniform sampler2D materialAO;
 uniform sampler2D shadowMap;
 uniform samplerCube environmentMap;
 uniform samplerCube irradianceMap;
@@ -99,7 +100,9 @@ void main()
     vec3 position = positionHomo.xyz / positionHomo.w;
     vec4 colorMetallic = texture(gbufferColor, fragTexCoord);
     vec4 normalRoughness = texture(gbufferNormal, fragTexCoord);
-    float ao = texture(ssao, fragTexCoord).r;
+    // AO only scales indirect light: SSAO covers small-scale occlusion,
+    // the material AO attachment covers baked per-material occlusion.
+    float ao = texture(ssao, fragTexCoord).r * texture(materialAO, fragTexCoord).r;
 
     vec3 albedo = colorMetallic.rgb;
     float metallic = colorMetallic.a;

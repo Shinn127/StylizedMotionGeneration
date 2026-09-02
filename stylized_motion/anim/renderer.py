@@ -157,6 +157,7 @@ class Renderer:
         SetShaderValueTexture(view.shaders["lighting"], view.shader_locs["lighting_ssao"], view.ssao_front.texture)
         set_shader_value_shadow_map(view.shaders["lighting"], view.shader_locs["lighting_shadow_map"], view.shadow_map, view.shadow_texture_slot_ptr)
         if view.shading == "pbr":
+            SetShaderValueTexture(view.shaders["lighting"], view.shader_locs["lighting_material_ao"], view.gbuffer.material_ao)
             set_shader_value_cubemap(view.shaders["lighting"], view.shader_locs["lighting_environment_map"], view.ibl.environment, view.environment_texture_slot_ptr)
             set_shader_value_cubemap(view.shaders["lighting"], view.shader_locs["lighting_irradiance_map"], view.ibl.irradiance, view.irradiance_texture_slot_ptr)
             set_shader_value_cubemap(view.shaders["lighting"], view.shader_locs["lighting_prefilter_map"], view.ibl.prefilter, view.prefilter_texture_slot_ptr)
