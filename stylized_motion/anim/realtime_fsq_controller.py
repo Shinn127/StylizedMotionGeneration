@@ -932,8 +932,8 @@ class RealtimeGenoView(GenoView):
 
     def _control_hint(self) -> bytes:
         if self.controller.conditional:
-            return b"Space: pause/play | WASD: move | Q/E: turn | J/K: style | R: reset"
-        return b"Space: pause/play | R: reset | conditional checkpoint required for WASD/QE/J/K"
+            return b"Space: pause/play | WASD: move | Q/E: turn | J/K: style | R: reset | B: skeleton"
+        return b"Space: pause/play | R: reset | B: skeleton | conditional checkpoint required for WASD/QE/J/K"
 
 
 class RealtimePlaybackController(PlaybackController):

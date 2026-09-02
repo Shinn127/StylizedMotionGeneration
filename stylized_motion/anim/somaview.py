@@ -31,6 +31,7 @@ SOMA_RIG = RigSpec(
     sim_rotation_joint="Hips",
     unit_scale=0.01,
     window_title=b"SomaView",
+    skeleton_root_joint="Hips",
 )
 
 SOMA_FPS = 120
@@ -64,6 +65,7 @@ def main():
     parser.add_argument("--disable-ibl", action="store_true")
     parser.add_argument("--shadow-resolution", type=int, default=2048)
     parser.add_argument("--output-video", type=Path, default=None, help="Render the full clip to an MP4 at this path.")
+    parser.add_argument("--skeleton", action="store_true", help="Draw the character skeleton overlay (joints, bone links, per-joint XYZ frames). Toggle at runtime with B.")
     args = parser.parse_args()
 
     selected_inputs = [args.database is not None, args.bvh is not None, args.features is not None]
@@ -103,6 +105,7 @@ def main():
         ibl_enabled=not args.disable_ibl,
         shadow_resolution=args.shadow_resolution,
         output_video=args.output_video,
+        draw_skeleton=args.skeleton,
     )
     viewer.run()
 

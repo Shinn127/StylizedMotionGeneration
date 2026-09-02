@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 from pyray import Color, Rectangle, Vector2
 from raylib import *
 from raylib.defines import *
@@ -205,7 +206,7 @@ class Renderer:
         EndShaderMode()
         EndTextureMode()
 
-    def render_frame(self, global_rot, global_pos, sample_index):
+    def render_frame(self, global_rot, global_pos, sample_index, compare_global_rot=None, compare_global_pos=None):
         light_view_proj = self.render_shadow()
         cam_view, cam_proj, cam_inv_proj, cam_inv_view_proj = self.render_gbuffer()
         self.render_ssao(cam_view, cam_proj, cam_inv_proj)
@@ -218,7 +219,29 @@ class Renderer:
             draw_trajectory(global_pos[0], global_rot[0], view.tpos[sample_index], view.tdir[sample_index])
             EndMode3D()
             EndTextureMode()
+        if view.skeleton_enabled:
+            self.render_skeleton(global_rot, global_pos, view.left_model_offset)
+            if view.compare_mode and compare_global_rot is not None and compare_global_pos is not None:
+                self.render_skeleton(compare_global_rot, compare_global_pos, view.right_model_offset)
         self.render_tonemap()
+
+    def render_skeleton(self, global_rot, global_pos, model_offset):
+        """Overlay the character skeleton onto the lighting target, GenoView debug style.
+
+        ``skeleton_overlay_pose`` cuts the full simulation-root pose down to the
+        subtree rooted at the rig's character root joint, dropping the virtual
+        simulation root and static rig nodes pinned at the world origin.
+        """
+        view = self.view
+        positions, rotations, parents = skeleton_overlay_pose(
+            global_pos, global_rot, view.full_parents, view.skeleton_root_index
+        )
+        positions = positions + np.asarray([model_offset.x, model_offset.y, model_offset.z], dtype=np.float32)
+        BeginTextureMode(view.lighted)
+        BeginMode3D(view.camera.cam3d)
+        draw_skeleton(positions, rotations, parents, view.skeleton_color)
+        EndMode3D()
+        EndTextureMode()
 
     def draw_output(self):
         view = self.view
@@ -232,7 +255,7 @@ class Renderer:
         EndShaderMode()
 
 
-from stylized_motion.anim.genoview import draw_trajectory, ffi
+from stylized_motion.anim.genoview import draw_skeleton, draw_trajectory, ffi, skeleton_overlay_pose
 from stylized_motion.anim.render_targets import (
     begin_gbuffer,
     begin_shadow_map,

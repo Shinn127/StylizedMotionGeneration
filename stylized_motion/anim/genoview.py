@@ -10,7 +10,7 @@ from pathlib import Path
 import cffi
 import numpy as np
 import torch
-from pyray import BoneInfo, Camera3D, Color, Matrix, Mesh, Model, Rectangle, Transform, Vector2, Vector3, take_screenshot
+from pyray import BoneInfo, Camera3D, Color, Matrix, Mesh, Model, Rectangle, Transform, Vector2, Vector3, Vector4, take_screenshot
 from raylib import *
 from raylib.defines import *
 
@@ -34,6 +34,9 @@ class RigSpec:
     ``sim_position_joint``/``sim_rotation_joint`` define the simulation-root
     convention shared with the preprocess pipeline; ``unit_scale`` converts
     BVH offsets to the mesh's unit (Geno.bin and SOMA meshes are in meters).
+    ``skeleton_root_joint`` is where the skeleton overlay starts: joints above
+    it (the simulation root and static rig nodes such as SOMA's origin-pinned
+    ``Root``) are excluded so no overlay line reaches the world origin.
     """
 
     model_filename: str
@@ -42,6 +45,7 @@ class RigSpec:
     sim_rotation_joint: str
     unit_scale: float
     window_title: bytes
+    skeleton_root_joint: str = "Hips"
 
 
 GENO_RIG = RigSpec(
@@ -51,6 +55,7 @@ GENO_RIG = RigSpec(
     sim_rotation_joint="Hips",
     unit_scale=0.01,
     window_title=b"GenoView",
+    skeleton_root_joint="Hips",
 )
 
 
@@ -524,6 +529,78 @@ def draw_trajectory(root_pos, root_rot, tpos, tdir):
         DrawLine3D(Vector3(point[0], point[1], point[2]), Vector3(tip[0], tip[1], tip[2]), ORANGE)
 
 
+def skeleton_axis_endpoints(position, rotation, scale):
+    """World endpoints of a joint's local X/Y/Z axes for the skeleton overlay.
+
+    Project quaternions are (w, x, y, z) while raylib's ``QuaternionToMatrix``
+    expects (x, y, z, w), so the components are swizzled explicitly before the
+    call. This corrects the component-order bug in GenoViewPython's debug
+    draw, which passes the (w, x, y, z) quaternion through unchanged and
+    renders every axis frame from mismatched quaternion columns.
+    """
+    quat_wxyz = np.asarray(rotation, dtype=np.float32)
+    rot_matrix = QuaternionToMatrix(
+        Vector4(float(quat_wxyz[1]), float(quat_wxyz[2]), float(quat_wxyz[3]), float(quat_wxyz[0]))
+    )
+    origin = np.asarray(position, dtype=np.float32)
+    columns = (
+        (rot_matrix.m0, rot_matrix.m1, rot_matrix.m2),
+        (rot_matrix.m4, rot_matrix.m5, rot_matrix.m6),
+        (rot_matrix.m8, rot_matrix.m9, rot_matrix.m10),
+    )
+    return [origin + scale * np.asarray(column, dtype=np.float32) for column in columns]
+
+
+def draw_transform_axes(position, rotation, scale):
+    origin = Vector3(float(position[0]), float(position[1]), float(position[2]))
+    for endpoint, color in zip(skeleton_axis_endpoints(position, rotation, scale), (RED, GREEN, BLUE)):
+        DrawLine3D(origin, Vector3(float(endpoint[0]), float(endpoint[1]), float(endpoint[2])), color)
+
+
+def draw_skeleton(positions, rotations, parents, color):
+    """Draw joints, parent links, and per-joint frames, mirroring GenoViewPython's Debug Draw."""
+    for joint in range(len(positions)):
+        pos = positions[joint]
+        point = Vector3(float(pos[0]), float(pos[1]), float(pos[2]))
+        DrawSphereWires(point, 0.01, 4, 6, color)
+        draw_transform_axes(pos, rotations[joint], 0.1)
+        parent = int(parents[joint])
+        if parent != -1:
+            parent_pos = positions[parent]
+            DrawLine3D(
+                point,
+                Vector3(float(parent_pos[0]), float(parent_pos[1]), float(parent_pos[2])),
+                color,
+            )
+
+
+def skeleton_overlay_pose(global_pos, global_rot, parents, root_index):
+    """Character-skeleton slice of a full simulation-root pose for the overlay.
+
+    The overlay draws the subtree attached to the character root joint.
+    Joints above ``root_index`` — the virtual simulation root plus static rig
+    nodes like SOMA's origin-pinned ``Root`` — are excluded, and so is any
+    joint hanging off those excluded nodes, so no overlay joint or bone line
+    ever touches the world origin while the character walks away from it.
+    """
+    parents = np.asarray(parents, dtype=np.int32)
+    kept = []
+    for joint in range(root_index, len(parents)):
+        ancestor = joint
+        while ancestor > root_index:
+            ancestor = int(parents[ancestor])
+        if ancestor == root_index:
+            kept.append(joint)
+    remap = {old: new for new, old in enumerate(kept)}
+    overlay_parents = np.asarray(
+        [-1 if int(parents[old]) == -1 else remap.get(int(parents[old]), -1) for old in kept],
+        dtype=np.int32,
+    )
+    positions = np.asarray(global_pos)[kept]
+    rotations = np.asarray(global_rot)[kept]
+    return positions, rotations, overlay_parents
+
+
 class GenoView:
     def __init__(
         self,
@@ -544,9 +621,12 @@ class GenoView:
         ibl_enabled: bool = True,
         shadow_resolution: int = 2048,
         output_video: Path | None = None,
+        draw_skeleton: bool = False,
         rig: RigSpec = GENO_RIG,
     ):
         self.rig = rig
+        self.skeleton_enabled = bool(draw_skeleton)
+        self.skeleton_color = GRAY
         self.shading = shading
         self.metallic = float(metallic)
         self.roughness = float(roughness)
@@ -662,6 +742,7 @@ class GenoView:
         self.shaders = {}
         self.full_names = None
         self.full_parents = None
+        self.skeleton_root_index = 1
         self.full_bind_local_positions = None
         self.full_bind_local_rotations = None
         self.database_name_to_index = {str(name): idx for idx, name in enumerate(self.names.tolist())}
@@ -889,6 +970,11 @@ class GenoView:
             self.full_bind_local_rotations,
         ) = build_simulation_root_skeleton_from_bind(self.resources_root / self.rig.bind_bvh_filename, self.rig)
         self.full_name_to_index = {name: idx for idx, name in enumerate(self.full_names)}
+        if self.rig.skeleton_root_joint not in self.full_name_to_index:
+            raise ValueError(
+                f"Rig skeleton_root_joint {self.rig.skeleton_root_joint!r} is missing from the bind skeleton"
+            )
+        self.skeleton_root_index = self.full_name_to_index[self.rig.skeleton_root_joint]
 
         if len(self.full_names) - 1 != self.geno_model.boneCount:
             raise ValueError(
@@ -925,7 +1011,7 @@ class GenoView:
         return "unknown"
 
     def _control_hint(self) -> bytes:
-        return b"Space: play/pause | Left/Right: step | Up/Down: speed | Home/End | Drag timeline"
+        return b"Space: play/pause | Left/Right: step | Up/Down: speed | Home/End | Drag timeline | B: skeleton"
 
     def _reconstruct_full_local_pose_for(self, positions, rotations, frame_index):
         full_positions = self.full_bind_local_positions.copy()
@@ -1017,6 +1103,8 @@ class GenoView:
                 if frame_dir is not None:
                     self.playback.set_current_frame(recorded_frames)
                 self.playback.handle_shortcuts()
+                if IsKeyPressed(KEY_B):
+                    self.skeleton_enabled = not self.skeleton_enabled
                 if frame_dir is None:
                     self.playback.handle_scrub(screen_width, screen_height)
                     self.playback.update(GetFrameTime())
@@ -1051,14 +1139,15 @@ class GenoView:
 
                 rlDisableColorBlend()
                 BeginDrawing()
-                self.renderer.render_frame(global_rot, global_pos, self.sample_index)
+                self.renderer.render_frame(global_rot, global_pos, self.sample_index, compare_global_rot, compare_global_pos)
 
                 self.renderer.draw_output()
 
                 if frame_dir is None:
                     rlEnableColorBlend()
                     DrawFPS(10, 10)
-                    status = "Paused" if not self.playback.playing else f"Playing {self.playback.current_speed:.2f}x"
+                    play_state = "Paused" if not self.playback.playing else f"Playing {self.playback.current_speed:.2f}x"
+                    status = f"{play_state} | Skeleton: {'on' if self.skeleton_enabled else 'off'}"
                     DrawText(f"Frame: {self.frame_index}".encode(), 10, 34, 20, BLACK)
                     DrawText(f"Range: {self._frame_range_name()}".encode(), 10, 58, 20, DARKGRAY)
                     DrawText(status.encode(), 10, 82, 20, BLUE)
@@ -1118,6 +1207,7 @@ class GenoViewCompare(GenoView):
         ibl_enabled: bool = True,
         shadow_resolution: int = 2048,
         output_video: Path | None = None,
+        draw_skeleton: bool = False,
         rig: RigSpec = GENO_RIG,
     ):
         super().__init__(
@@ -1139,6 +1229,7 @@ class GenoViewCompare(GenoView):
             ibl_enabled=ibl_enabled,
             shadow_resolution=shadow_resolution,
             output_video=output_video,
+            draw_skeleton=draw_skeleton,
         )
 
 
@@ -1170,6 +1261,7 @@ def main():
     parser.add_argument("--disable-ibl", action="store_true")
     parser.add_argument("--shadow-resolution", type=int, default=2048)
     parser.add_argument("--output-video", type=Path, default=None, help="Render the full clip to an MP4 at this path.")
+    parser.add_argument("--skeleton", action="store_true", help="Draw the character skeleton overlay (joints, bone links, per-joint XYZ frames). Toggle at runtime with B.")
     args = parser.parse_args()
 
     selected_inputs = [args.database is not None, args.bvh is not None, args.features is not None]
@@ -1208,6 +1300,7 @@ def main():
         ibl_enabled=not args.disable_ibl,
         shadow_resolution=args.shadow_resolution,
         output_video=args.output_video,
+        draw_skeleton=args.skeleton,
     )
     viewer.run()
 
