@@ -572,6 +572,10 @@ Phase 4 落地材质 AO 时，GBuffer0/1 的既有布局没有空闲通道。评
 
 raylib 的 `SetShaderValueTexture` 以 `texture.id` 作为采样器 unit 键值；当渲染目标的 GL 纹理名恰好与手工管理的槽位（shadow map=10、environment/irradiance/prefilter=11-13、BRDF LUT=14）重合时发生冲突。新增 material AO attachment 使后续纹理 id 整体移位后，debug 显示 pass 的 `texLighted`（id=12 撞 irradiance 槽 12）实际采样到错误纹理，表现为 shadow/diffuse/ibl 调试视图内容异常。处理：多纹理 pass 一律改用显式槽绑定（新增 `render_targets.set_shader_value_texture_slot`），材质 AO=15、debug 五张输入=16-20、lighting SSAO=21（加固，防止未来再增纹理时 id 移位破坏 AO）。lighting 其余 sampler（gbufferColor/Normal/Depth）经验证输出逐像素不变，维持原绑定。此后新增 attachment 或纹理只需避开 10-21 已占槽位。
 
+### 20.7 PBR 灯光 rig 默认值（2026-09-03）
+
+从 legacy 迁移时沿用的灯光参数（sunStrength=0.25、ambientStrength=1.0、灰白 sun/sky 等）在 Cook-Torrance + IBL 路径下形成环境光主导的平淡画面：角色背光/受光线性比 ≈0.43，远高于真实室外晴天（约 0.15-0.25），且缺少暖阳光/冷天光的色温对比。处理：viewer 按 shading 模式选择灯光 rig（`LEGACY_LIGHT_RIG` 完整冻结 GenoViewPython 数值；`PBR_LIGHT_RIG` 重调）：sun 0.55、暖阳光 `(255,240,214)`、光向 `(0.45,-0.8,-0.35)`（仰角约 55°，拉长投影）、sky fallback `(150,180,220)`、fallback 权重 ambient/sky/ground = 0.15/0.35/0.25、地面反照率 `(160,160,160)`；IBL environment/irradiance/prefilter 色盘重调为"冷天顶、暗地面"结构。`--sun-strength` 作为直接光强的 CLI 覆盖（缺省取当前模式的 rig 值）。设计落点：白反照率上直接:间接 ≈3.5:1，角色背光/受光线性比 ≈0.2，曝光 0.9 下受光白不削波（ACES 后 ≈0.81 sRGB）。
+
 ## 20. 完成定义
 
 当 Phase 1 完成并满足以下条件时，称为“PBR 管线结构修订完成”：

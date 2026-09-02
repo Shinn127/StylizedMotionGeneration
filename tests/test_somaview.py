@@ -106,6 +106,22 @@ def test_multi_texture_passes_bind_explicit_slots():
         assert slot_ptr in genoview_source
 
 
+def test_pbr_light_rig_is_retuned_while_legacy_stays_frozen():
+    from stylized_motion.anim.genoview import LEGACY_LIGHT_RIG, PBR_LIGHT_RIG
+
+    # The legacy rig must keep the exact GenoViewPython values.
+    assert LEGACY_LIGHT_RIG["sun_strength"] == 0.25
+    assert LEGACY_LIGHT_RIG["ambient_strength"] == 1.0
+    assert LEGACY_LIGHT_RIG["sky_strength"] == 0.15
+    assert LEGACY_LIGHT_RIG["ground_strength"] == 0.1
+    # The PBR rig is sun-dominant with a much weaker omni ambient term.
+    assert PBR_LIGHT_RIG["sun_strength"] > LEGACY_LIGHT_RIG["sun_strength"]
+    assert PBR_LIGHT_RIG["ambient_strength"] < LEGACY_LIGHT_RIG["ambient_strength"]
+    # Warm sun against a cool sky carries the temperature contrast.
+    assert PBR_LIGHT_RIG["sun_color"][2] < PBR_LIGHT_RIG["sun_color"][0]
+    assert PBR_LIGHT_RIG["sky_color"][2] > PBR_LIGHT_RIG["sky_color"][0]
+
+
 def test_material_scene_and_texture_contract():
     from stylized_motion.anim.materials import Material, TEXTURE_CONTRACT
     from stylized_motion.anim.scene import DirectionalLight, RenderObject, Scene

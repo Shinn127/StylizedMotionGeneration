@@ -61,6 +61,36 @@ LIGHTING_DEBUG_MODES = {
 }
 
 
+# Lighting rig inherited from GenoViewPython, frozen so `--shading legacy`
+# keeps rendering exactly the way it always has.
+LEGACY_LIGHT_RIG = {
+    "light_dir": (0.35, -1.0, -0.35),
+    "sun_color": (253.0 / 255.0, 255.0 / 255.0, 232.0 / 255.0),
+    "sky_color": (174.0 / 255.0, 183.0 / 255.0, 190.0 / 255.0),
+    "sun_strength": 0.25,
+    "sky_strength": 0.15,
+    "ground_strength": 0.1,
+    "ambient_strength": 1.0,
+    "ground_albedo": (190, 190, 190),
+}
+
+# PBR rig, retuned for the physically-based path. Targets: direct:ambient
+# roughly 3.5:1 on white albedo (sun-dominant, outdoor), a shadow side around
+# a fifth of the lit side in linear terms so form stays readable, a warm sun
+# against a cool sky for temperature contrast, and a concrete-like ground
+# albedo that does not outshine the character.
+PBR_LIGHT_RIG = {
+    "light_dir": (0.45, -0.8, -0.35),
+    "sun_color": (1.0, 240.0 / 255.0, 214.0 / 255.0),
+    "sky_color": (150.0 / 255.0, 180.0 / 255.0, 220.0 / 255.0),
+    "sun_strength": 0.55,
+    "sky_strength": 0.35,
+    "ground_strength": 0.25,
+    "ambient_strength": 0.15,
+    "ground_albedo": (160, 160, 160),
+}
+
+
 @dataclass(frozen=True)
 class RigSpec:
     """Character assets and skeleton conventions used by the viewer.
@@ -659,6 +689,7 @@ class GenoView:
         debug_view: str = "final",
         normal_map: Path | None = None,
         metallic_roughness_map: Path | None = None,
+        sun_strength: float | None = None,
         rig: RigSpec = GENO_RIG,
     ):
         if debug_view not in DEBUG_MODES:
@@ -746,15 +777,18 @@ class GenoView:
         self.frame_index = int(self.indices[0]) if self.indices is not None else 0
 
         self.camera = Camera()
-        self.light_dir = Vector3Normalize(Vector3(0.35, -1.0, -0.35))
-        self.sun_color = Vector3(253.0 / 255.0, 255.0 / 255.0, 232.0 / 255.0)
-        self.sky_color = Vector3(174.0 / 255.0, 183.0 / 255.0, 190.0 / 255.0)
+        # Legacy keeps its frozen GenoViewPython rig; PBR uses the retuned one.
+        self.light_rig = PBR_LIGHT_RIG if shading == "pbr" else LEGACY_LIGHT_RIG
+        self.light_dir = Vector3Normalize(Vector3(*self.light_rig["light_dir"]))
+        self.sun_color = Vector3(*self.light_rig["sun_color"])
+        self.sky_color = Vector3(*self.light_rig["sky_color"])
+        self.sun_strength = float(sun_strength) if sun_strength is not None else float(self.light_rig["sun_strength"])
         self.default_material = Material(metallic=self.metallic, roughness=self.roughness)
         self.scene = Scene(
             directional_light=DirectionalLight(
                 direction=self.light_dir,
                 color=self.sun_color,
-                intensity=0.25,
+                intensity=self.sun_strength,
             )
         )
         self.shadow_light = ShadowLight()
@@ -849,10 +883,10 @@ class GenoView:
         self.glossiness_ptr[0] = 10.0
         self.metallic_ptr[0] = self.metallic
         self.roughness_ptr[0] = self.roughness
-        self.sun_strength_ptr[0] = 0.25
-        self.sky_strength_ptr[0] = 0.15
-        self.ground_strength_ptr[0] = 0.1
-        self.ambient_strength_ptr[0] = 1.0
+        self.sun_strength_ptr[0] = self.sun_strength
+        self.sky_strength_ptr[0] = float(self.light_rig["sky_strength"])
+        self.ground_strength_ptr[0] = float(self.light_rig["ground_strength"])
+        self.ambient_strength_ptr[0] = float(self.light_rig["ambient_strength"])
         self.material_ao_ptr[0] = self.default_material.ao
         self.ibl_strength_ptr[0] = self.ibl_strength
         self.use_ibl_ptr[0] = int(self.ibl_enabled)
@@ -1019,7 +1053,7 @@ class GenoView:
                 model=self.ground_model,
                 material=Material(),
                 position=self.ground_position,
-                draw_color=Color(190, 190, 190, 255),
+                draw_color=Color(*self.light_rig["ground_albedo"], 255),
                 skinned=False,
             )
         )
@@ -1303,6 +1337,7 @@ class GenoViewCompare(GenoView):
         debug_view: str = "final",
         normal_map: Path | None = None,
         metallic_roughness_map: Path | None = None,
+        sun_strength: float | None = None,
         rig: RigSpec = GENO_RIG,
     ):
         super().__init__(
@@ -1328,6 +1363,7 @@ class GenoViewCompare(GenoView):
             debug_view=debug_view,
             normal_map=normal_map,
             metallic_roughness_map=metallic_roughness_map,
+            sun_strength=sun_strength,
         )
 
 
@@ -1354,6 +1390,7 @@ def main():
     parser.add_argument("--metallic", type=float, default=0.0)
     parser.add_argument("--roughness", type=float, default=0.58)
     parser.add_argument("--exposure", type=float, default=0.9)
+    parser.add_argument("--sun-strength", type=float, default=None, help="Direct light intensity. Defaults to the per-shading light rig value (PBR: 0.55, legacy: 0.25).")
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
     parser.add_argument("--ibl-strength", type=float, default=0.35)
     parser.add_argument("--disable-ibl", action="store_true")
@@ -1405,6 +1442,7 @@ def main():
         debug_view=args.debug_view,
         normal_map=args.normal_map,
         metallic_roughness_map=args.metallic_roughness_map,
+        sun_strength=args.sun_strength,
     )
     viewer.run()
 

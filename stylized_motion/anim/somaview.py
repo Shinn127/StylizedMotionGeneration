@@ -70,6 +70,7 @@ def main():
     parser.add_argument("--debug-view", choices=DEBUG_MODES, default="final", help="Initial PBR debug view. Cycle at runtime with V (Shift+V to go back).")
     parser.add_argument("--normal-map", type=Path, default=None, help="Optional tangent-space normal map applied to the character's default material.")
     parser.add_argument("--metallic-roughness-map", type=Path, default=None, help="Optional linear map (R=metallic, G=roughness, B=AO) applied to the character's default material.")
+    parser.add_argument("--sun-strength", type=float, default=None, help="Direct light intensity. Defaults to the per-shading light rig value (PBR: 0.55, legacy: 0.25).")
     args = parser.parse_args()
 
     selected_inputs = [args.database is not None, args.bvh is not None, args.features is not None]
@@ -113,6 +114,7 @@ def main():
         debug_view=args.debug_view,
         normal_map=args.normal_map,
         metallic_roughness_map=args.metallic_roughness_map,
+        sun_strength=args.sun_strength,
     )
     viewer.run()
 

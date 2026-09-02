@@ -93,38 +93,41 @@ class IBLResources:
     prefilter_max_lod: float = 0.0
 
     def initialize(self) -> "IBLResources":
+        # Sky-driven palettes: cool blue-biased upper hemisphere, darker and
+        # neutral below the horizon, so indirect light carries the same
+        # directional temperature cue as a real outdoor environment.
         self.environment = _load_cubemap(
             32,
             (
-                Color(174, 183, 190, 255),
-                Color(185, 191, 194, 255),
-                Color(220, 224, 224, 255),
-                Color(135, 143, 148, 255),
-                Color(190, 194, 194, 255),
-                Color(160, 168, 172, 255),
+                Color(184, 192, 202, 255),
+                Color(172, 180, 190, 255),
+                Color(170, 190, 216, 255),
+                Color(104, 108, 112, 255),
+                Color(178, 186, 196, 255),
+                Color(170, 178, 188, 255),
             ),
         )
         GenTextureMipmaps(ffi.addressof(self.environment))
         self.irradiance = _load_cubemap(
             16,
             (
-                Color(157, 165, 170, 255),
-                Color(166, 173, 176, 255),
-                Color(198, 202, 202, 255),
-                Color(123, 130, 134, 255),
-                Color(170, 176, 178, 255),
-                Color(148, 155, 159, 255),
+                Color(152, 166, 186, 255),
+                Color(148, 162, 182, 255),
+                Color(152, 174, 206, 255),
+                Color(96, 100, 106, 255),
+                Color(150, 164, 184, 255),
+                Color(146, 160, 180, 255),
             ),
         )
         self.prefilter = _load_cubemap(
             32,
             (
-                Color(164, 173, 178, 255),
-                Color(176, 183, 186, 255),
-                Color(210, 214, 214, 255),
-                Color(128, 136, 141, 255),
-                Color(181, 188, 189, 255),
-                Color(153, 162, 166, 255),
+                Color(180, 188, 198, 255),
+                Color(168, 176, 186, 255),
+                Color(164, 184, 210, 255),
+                Color(100, 104, 108, 255),
+                Color(174, 182, 192, 255),
+                Color(166, 174, 184, 255),
             ),
         )
         GenTextureMipmaps(ffi.addressof(self.prefilter))
