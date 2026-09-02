@@ -77,8 +77,8 @@ LEGACY_LIGHT_RIG = {
 # PBR rig, retuned for the physically-based path. Targets: direct:ambient
 # roughly 3.5:1 on white albedo (sun-dominant, outdoor), a shadow side around
 # a fifth of the lit side in linear terms so form stays readable, a warm sun
-# against a cool sky for temperature contrast, and a concrete-like ground
-# albedo that does not outshine the character.
+# against a cool sky for temperature contrast, and a light gray-white ground
+# tone that keeps the scene airy without outshining the sky background.
 PBR_LIGHT_RIG = {
     "light_dir": (0.45, -0.8, -0.35),
     "sun_color": (1.0, 240.0 / 255.0, 214.0 / 255.0),
@@ -87,7 +87,7 @@ PBR_LIGHT_RIG = {
     "sky_strength": 0.35,
     "ground_strength": 0.25,
     "ambient_strength": 0.15,
-    "ground_albedo": (160, 160, 160),
+    "ground_albedo": (215, 215, 215),
 }
 
 

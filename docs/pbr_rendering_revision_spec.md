@@ -574,7 +574,7 @@ raylib 的 `SetShaderValueTexture` 以 `texture.id` 作为采样器 unit 键值�
 
 ### 20.7 PBR 灯光 rig 默认值（2026-09-03）
 
-从 legacy 迁移时沿用的灯光参数（sunStrength=0.25、ambientStrength=1.0、灰白 sun/sky 等）在 Cook-Torrance + IBL 路径下形成环境光主导的平淡画面：角色背光/受光线性比 ≈0.43，远高于真实室外晴天（约 0.15-0.25），且缺少暖阳光/冷天光的色温对比。处理：viewer 按 shading 模式选择灯光 rig（`LEGACY_LIGHT_RIG` 完整冻结 GenoViewPython 数值；`PBR_LIGHT_RIG` 重调）：sun 0.55、暖阳光 `(255,240,214)`、光向 `(0.45,-0.8,-0.35)`（仰角约 55°，拉长投影）、sky fallback `(150,180,220)`、fallback 权重 ambient/sky/ground = 0.15/0.35/0.25、地面反照率 `(160,160,160)`；IBL environment/irradiance/prefilter 色盘重调为"冷天顶、暗地面"结构。`--sun-strength` 作为直接光强的 CLI 覆盖（缺省取当前模式的 rig 值）。设计落点：白反照率上直接:间接 ≈3.5:1，角色背光/受光线性比 ≈0.2，曝光 0.9 下受光白不削波（ACES 后 ≈0.81 sRGB）。
+从 legacy 迁移时沿用的灯光参数（sunStrength=0.25、ambientStrength=1.0、灰白 sun/sky 等）在 Cook-Torrance + IBL 路径下形成环境光主导的平淡画面：角色背光/受光线性比 ≈0.43，远高于真实室外晴天（约 0.15-0.25），且缺少暖阳光/冷天光的色温对比。处理：viewer 按 shading 模式选择灯光 rig（`LEGACY_LIGHT_RIG` 完整冻结 GenoViewPython 数值；`PBR_LIGHT_RIG` 重调）：sun 0.55、暖阳光 `(255,240,214)`、光向 `(0.45,-0.8,-0.35)`（仰角约 55°，拉长投影）、sky fallback `(150,180,220)`、fallback 权重 ambient/sky/ground = 0.15/0.35/0.25、地面反照率 `(215,215,215)`（浅灰白整体色调，同日微调；渲染后约 0.72 显示亮度，低于背景 0.89 保持层次）；IBL environment/irradiance/prefilter 色盘重调为"冷天顶、暗地面"结构。`--sun-strength` 作为直接光强的 CLI 覆盖（缺省取当前模式的 rig 值）。设计落点：白反照率上直接:间接 ≈3.5:1，角色背光/受光线性比 ≈0.2，曝光 0.9 下受光白不削波（ACES 后 ≈0.81 sRGB）。
 
 ## 20. 完成定义
 
