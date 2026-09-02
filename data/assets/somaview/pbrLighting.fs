@@ -29,6 +29,8 @@ uniform float lightClipFar;
 uniform float iblStrength;
 uniform float prefilterMaxLod;
 uniform int useIBL;
+// 0 final image, 1 shadow, 2 direct diffuse, 3 direct specular, 4 indirect light
+uniform int debugMode;
 
 out vec4 finalColor;
 
@@ -145,5 +147,9 @@ void main()
     }
 
     finalColor = vec4(direct + ambient, 1.0);
+    if (debugMode == 1) { finalColor = vec4(vec3(shadow), 1.0); }
+    else if (debugMode == 2) { finalColor = vec4(diffuse * sunRadiance * nDotL * shadow, 1.0); }
+    else if (debugMode == 3) { finalColor = vec4(specular * sunRadiance * nDotL * shadow, 1.0); }
+    else if (debugMode == 4) { finalColor = vec4(ambient, 1.0); }
     gl_FragDepth = NonlinearDepth(depth, camClipNear, camClipFar);
 }

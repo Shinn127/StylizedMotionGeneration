@@ -27,6 +27,40 @@ from stylized_motion.util.paths import RESOURCE_DIR
 ffi = cffi.FFI()
 
 
+DEBUG_MODES = (
+    "final",
+    "base_color",
+    "metallic",
+    "roughness",
+    "normal",
+    "depth",
+    "ao",
+    "shadow",
+    "diffuse",
+    "specular",
+    "ibl",
+    "hdr",
+)
+
+# debugMode consumed by pbrLighting.fs. Only shadow/diffuse/specular/ibl exist
+# inside the lighting pass; every other mode renders the final image and the
+# debug display shader reads the GBuffer/SSAO attachments directly.
+LIGHTING_DEBUG_MODES = {
+    "final": 0,
+    "base_color": 0,
+    "metallic": 0,
+    "roughness": 0,
+    "normal": 0,
+    "depth": 0,
+    "ao": 0,
+    "shadow": 1,
+    "diffuse": 2,
+    "specular": 3,
+    "ibl": 4,
+    "hdr": 0,
+}
+
+
 @dataclass(frozen=True)
 class RigSpec:
     """Character assets and skeleton conventions used by the viewer.
@@ -622,11 +656,15 @@ class GenoView:
         shadow_resolution: int = 2048,
         output_video: Path | None = None,
         draw_skeleton: bool = False,
+        debug_view: str = "final",
         rig: RigSpec = GENO_RIG,
     ):
+        if debug_view not in DEBUG_MODES:
+            raise ValueError(f"Unknown debug view {debug_view!r}; expected one of {DEBUG_MODES}")
         self.rig = rig
         self.skeleton_enabled = bool(draw_skeleton)
         self.skeleton_color = GRAY
+        self.debug_view = debug_view
         self.shading = shading
         self.metallic = float(metallic)
         self.roughness = float(roughness)
@@ -779,6 +817,7 @@ class GenoView:
         self.use_base_color_map_ptr = ffi.new("int*")
         self.use_metallic_roughness_map_ptr = ffi.new("int*")
         self.use_normal_map_ptr = ffi.new("int*")
+        self.debug_mode_ptr = ffi.new("int*")
         self.shadow_texture_slot_ptr[0] = 10
         self.environment_texture_slot_ptr[0] = 11
         self.irradiance_texture_slot_ptr[0] = 12
@@ -823,6 +862,7 @@ class GenoView:
         self.shaders["lighting"] = LoadShader(self._res("post.vs"), self._res(lighting_fs))
         if self.shading == "pbr":
             self.shaders["tonemap"] = LoadShader(self._res("post.vs"), self._res("tonemap.fs"))
+            self.shaders["debug"] = LoadShader(self._res("post.vs"), self._res("debug.fs"))
         self.shaders["fxaa"] = LoadShader(self._res("post.vs"), self._res("fxaa.fs"))
 
         self.shader_locs["basic_specularity"] = GetShaderLocation(self.shaders["basic"], b"specularity")
@@ -903,10 +943,18 @@ class GenoView:
             self.shader_locs["lighting_prefilter_max_lod"] = GetShaderLocation(self.shaders["lighting"], b"prefilterMaxLod")
             self.shader_locs["lighting_ibl_strength"] = GetShaderLocation(self.shaders["lighting"], b"iblStrength")
             self.shader_locs["lighting_use_ibl"] = GetShaderLocation(self.shaders["lighting"], b"useIBL")
+            self.shader_locs["lighting_debug_mode"] = GetShaderLocation(self.shaders["lighting"], b"debugMode")
 
         if self.shading == "pbr":
             self.shader_locs["tonemap_input_texture"] = GetShaderLocation(self.shaders["tonemap"], b"inputTexture")
             self.shader_locs["tonemap_exposure"] = GetShaderLocation(self.shaders["tonemap"], b"exposure")
+            self.shader_locs["debug_gbuffer_color"] = GetShaderLocation(self.shaders["debug"], b"texGbufferColor")
+            self.shader_locs["debug_gbuffer_normal"] = GetShaderLocation(self.shaders["debug"], b"texGbufferNormal")
+            self.shader_locs["debug_gbuffer_depth"] = GetShaderLocation(self.shaders["debug"], b"texGbufferDepth")
+            self.shader_locs["debug_ssao"] = GetShaderLocation(self.shaders["debug"], b"texSSAO")
+            self.shader_locs["debug_lighted"] = GetShaderLocation(self.shaders["debug"], b"texLighted")
+            self.shader_locs["debug_mode"] = GetShaderLocation(self.shaders["debug"], b"debugMode")
+            self.shader_locs["debug_exposure"] = GetShaderLocation(self.shaders["debug"], b"exposure")
 
         if self.shading == "pbr":
             self.ibl = IBLResources(strength=self.ibl_strength, enabled=self.ibl_enabled).initialize()
@@ -1105,6 +1153,9 @@ class GenoView:
                 self.playback.handle_shortcuts()
                 if IsKeyPressed(KEY_B):
                     self.skeleton_enabled = not self.skeleton_enabled
+                if self.shading == "pbr" and IsKeyPressed(KEY_V):
+                    step = -1 if IsKeyDown(KEY_LEFT_SHIFT) or IsKeyDown(KEY_RIGHT_SHIFT) else 1
+                    self.debug_view = DEBUG_MODES[(DEBUG_MODES.index(self.debug_view) + step) % len(DEBUG_MODES)]
                 if frame_dir is None:
                     self.playback.handle_scrub(screen_width, screen_height)
                     self.playback.update(GetFrameTime())
@@ -1161,6 +1212,8 @@ class GenoView:
                         DrawText(f"Mirror: {bool(self.sample_mirror[self.sample_index])}".encode(), 10, 154, 20, DARKGRAY)
                     DrawText(b"Ctrl+LMB/RMB+drag: camera | Wheel: zoom", 10, 184, 18, BLACK)
                     DrawText(self._control_hint(), 10, 208, 18, BLACK)
+                    if self.shading == "pbr":
+                        DrawText(f"Debug: {self.debug_view} (V / Shift+V)".encode(), 10, 232, 18, DARKGRAY)
                     self.playback.draw_ui(screen_width, screen_height, "Sample" if self.indices is not None else "Frame")
                 EndDrawing()
                 if frame_dir is not None:
@@ -1208,6 +1261,7 @@ class GenoViewCompare(GenoView):
         shadow_resolution: int = 2048,
         output_video: Path | None = None,
         draw_skeleton: bool = False,
+        debug_view: str = "final",
         rig: RigSpec = GENO_RIG,
     ):
         super().__init__(
@@ -1230,6 +1284,7 @@ class GenoViewCompare(GenoView):
             shadow_resolution=shadow_resolution,
             output_video=output_video,
             draw_skeleton=draw_skeleton,
+            debug_view=debug_view,
         )
 
 
@@ -1262,6 +1317,7 @@ def main():
     parser.add_argument("--shadow-resolution", type=int, default=2048)
     parser.add_argument("--output-video", type=Path, default=None, help="Render the full clip to an MP4 at this path.")
     parser.add_argument("--skeleton", action="store_true", help="Draw the character skeleton overlay (joints, bone links, per-joint XYZ frames). Toggle at runtime with B.")
+    parser.add_argument("--debug-view", choices=DEBUG_MODES, default="final", help="Initial PBR debug view. Cycle at runtime with V (Shift+V to go back).")
     args = parser.parse_args()
 
     selected_inputs = [args.database is not None, args.bvh is not None, args.features is not None]
@@ -1301,6 +1357,7 @@ def main():
         shadow_resolution=args.shadow_resolution,
         output_video=args.output_video,
         draw_skeleton=args.skeleton,
+        debug_view=args.debug_view,
     )
     viewer.run()
 

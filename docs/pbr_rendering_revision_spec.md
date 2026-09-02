@@ -12,6 +12,8 @@
 
 当前实施记录（2026-08-31）：Phase 1、Phase 2 已完成，Phase 3 已落地程序化 environment/irradiance 资源、environment/prefilter mip 链、GGX split-sum BRDF LUT 以及独立 IBL 采样路径。Phase 4 仍负责 normal map 的 TBN 应用、AO map 的材质级间接光接入和材质测试场景；legacy 地面网格调制保留在 PBR GBuffer 中作为视觉兼容项。
 
+实施更新（2026-09-03）：Debug View 已落地，Phase 0 的 debug 参数交付项关闭。模式为 final/base_color/metallic/roughness/normal/depth/ao/shadow/diffuse/specular/ibl/hdr；运行时 `V`（`Shift+V` 反向）循环，`--debug-view` 指定初始模式。shadow/diffuse/specular/ibl 由 `pbrLighting.fs` 的 `debugMode` 输出到 HDR target，其余模式由新增 `debug.fs` 显示 pass 直接读取 GBuffer/SSAO/HDR 纹理；调试显示只做 exposure + linear→sRGB，不经过 ACES，且跳过 FXAA。
+
 ## 1. 目标
 
 本轮修订完成后，GenoView/SomaView 应具备一个结构清晰、可验证、可扩展的 Minimal Deferred PBR 管线：

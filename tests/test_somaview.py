@@ -46,8 +46,33 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         assert "finalColor = vec4(direct + ambient, 1.0)" in pbr_lighting
         assert "uniform float ssaoIntensity" in ssao
         assert "shadowMap" not in ssao
-    for shader in ("pbr.fs", "lighting.fs", "pbrLighting.fs", "ssao.fs", "tonemap.fs"):
+    for shader in ("pbr.fs", "lighting.fs", "pbrLighting.fs", "ssao.fs", "tonemap.fs", "debug.fs"):
         assert (RESOURCE_DIR / shader).read_bytes() == (SOMA_RESOURCE_DIR / shader).read_bytes()
+
+
+def test_debug_view_contract_is_shared_between_viewers():
+    from stylized_motion.anim.genoview import DEBUG_MODES, LIGHTING_DEBUG_MODES
+
+    assert DEBUG_MODES[0] == "final"
+    assert len(set(DEBUG_MODES)) == len(DEBUG_MODES)
+    assert set(LIGHTING_DEBUG_MODES) == set(DEBUG_MODES)
+    # Only quantities that exist inside the lighting pass are lighting-side
+    # debug modes; everything else reads the GBuffer/SSAO attachments directly.
+    assert LIGHTING_DEBUG_MODES["shadow"] == 1
+    assert LIGHTING_DEBUG_MODES["diffuse"] == 2
+    assert LIGHTING_DEBUG_MODES["specular"] == 3
+    assert LIGHTING_DEBUG_MODES["ibl"] == 4
+    assert LIGHTING_DEBUG_MODES["final"] == 0
+    for resource_dir in (RESOURCE_DIR, SOMA_RESOURCE_DIR):
+        debug_fs = (resource_dir / "debug.fs").read_text(encoding="utf-8")
+        assert "uniform int debugMode" in debug_fs
+        assert "uniform sampler2D texGbufferDepth" in debug_fs
+        assert "uniform sampler2D texLighted" in debug_fs
+        assert "vec3(1.0 - depth)" in debug_fs
+    pbr_lighting = (RESOURCE_DIR / "pbrLighting.fs").read_text(encoding="utf-8")
+    assert "uniform int debugMode" in pbr_lighting
+    assert "finalColor = vec4(vec3(shadow), 1.0)" in pbr_lighting
+    assert "finalColor = vec4(ambient, 1.0)" in pbr_lighting
 
 
 def test_material_scene_and_texture_contract():
@@ -89,7 +114,7 @@ def test_renderer_owns_render_passes_and_run_only_schedules_them():
         for node in ast.walk(renderer_tree)
         if isinstance(node, ast.FunctionDef) and node.args.args and node.args.args[0].arg == "self"
     }
-    assert {"render_shadow", "render_gbuffer", "render_ssao", "render_lighting", "render_frame"} <= renderer_methods
+    assert {"render_shadow", "render_gbuffer", "render_ssao", "render_lighting", "render_tonemap", "render_debug", "render_frame"} <= renderer_methods
 
     genoview_source = Path(genoview.__file__).read_text(encoding="utf-8")
     genoview_tree = ast.parse(genoview_source)

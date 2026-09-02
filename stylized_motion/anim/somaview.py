@@ -15,6 +15,7 @@ import argparse
 from pathlib import Path
 
 from stylized_motion.anim.genoview import (
+    DEBUG_MODES,
     RigSpec,
     GenoView,
     build_database_from_bvh,
@@ -66,6 +67,7 @@ def main():
     parser.add_argument("--shadow-resolution", type=int, default=2048)
     parser.add_argument("--output-video", type=Path, default=None, help="Render the full clip to an MP4 at this path.")
     parser.add_argument("--skeleton", action="store_true", help="Draw the character skeleton overlay (joints, bone links, per-joint XYZ frames). Toggle at runtime with B.")
+    parser.add_argument("--debug-view", choices=DEBUG_MODES, default="final", help="Initial PBR debug view. Cycle at runtime with V (Shift+V to go back).")
     args = parser.parse_args()
 
     selected_inputs = [args.database is not None, args.bvh is not None, args.features is not None]
@@ -106,6 +108,7 @@ def main():
         shadow_resolution=args.shadow_resolution,
         output_video=args.output_video,
         draw_skeleton=args.skeleton,
+        debug_view=args.debug_view,
     )
     viewer.run()
 

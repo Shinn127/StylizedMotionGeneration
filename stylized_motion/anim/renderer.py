@@ -187,6 +187,8 @@ class Renderer:
             SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_ibl_strength"], view.ibl_strength_ptr, SHADER_UNIFORM_FLOAT)
             view.use_ibl_ptr[0] = int(view.ibl.enabled)
             SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_use_ibl"], view.use_ibl_ptr, SHADER_UNIFORM_INT)
+            view.debug_mode_ptr[0] = LIGHTING_DEBUG_MODES[view.debug_view]
+            SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_debug_mode"], view.debug_mode_ptr, SHADER_UNIFORM_INT)
         ClearBackground(RAYWHITE)
         DrawTextureRec(view.gbuffer.color, Rectangle(0, 0, view.gbuffer.color.width, -view.gbuffer.color.height), Vector2(0, 0), WHITE)
         EndShaderMode()
@@ -196,6 +198,9 @@ class Renderer:
         view = self.view
         if view.shading != "pbr":
             return
+        if view.debug_view != "final":
+            self.render_debug()
+            return
         BeginTextureMode(view.tonemapped)
         BeginShaderMode(view.shaders["tonemap"])
         view.exposure_ptr[0] = view.exposure
@@ -203,6 +208,30 @@ class Renderer:
         SetShaderValue(view.shaders["tonemap"], view.shader_locs["tonemap_exposure"], view.exposure_ptr, SHADER_UNIFORM_FLOAT)
         ClearBackground(BLACK)
         DrawTextureRec(view.lighted.texture, Rectangle(0, 0, view.lighted.texture.width, -view.lighted.texture.height), Vector2(0, 0), WHITE)
+        EndShaderMode()
+        EndTextureMode()
+
+    def render_debug(self):
+        """Render the active debug view into the display target.
+
+        Debug output deliberately bypasses ACES tonemapping and FXAA so the
+        raw debug quantities stay readable; the display shader applies only
+        exposure and linear-to-sRGB where radiance-like quantities need it.
+        """
+        view = self.view
+        BeginTextureMode(view.tonemapped)
+        BeginShaderMode(view.shaders["debug"])
+        SetShaderValueTexture(view.shaders["debug"], view.shader_locs["debug_gbuffer_color"], view.gbuffer.color)
+        SetShaderValueTexture(view.shaders["debug"], view.shader_locs["debug_gbuffer_normal"], view.gbuffer.normal)
+        SetShaderValueTexture(view.shaders["debug"], view.shader_locs["debug_gbuffer_depth"], view.gbuffer.depth)
+        SetShaderValueTexture(view.shaders["debug"], view.shader_locs["debug_ssao"], view.ssao_front.texture)
+        SetShaderValueTexture(view.shaders["debug"], view.shader_locs["debug_lighted"], view.lighted.texture)
+        view.debug_mode_ptr[0] = DEBUG_MODES.index(view.debug_view)
+        SetShaderValue(view.shaders["debug"], view.shader_locs["debug_mode"], view.debug_mode_ptr, SHADER_UNIFORM_INT)
+        view.exposure_ptr[0] = view.exposure
+        SetShaderValue(view.shaders["debug"], view.shader_locs["debug_exposure"], view.exposure_ptr, SHADER_UNIFORM_FLOAT)
+        ClearBackground(BLACK)
+        DrawTextureRec(view.gbuffer.color, Rectangle(0, 0, view.gbuffer.color.width, -view.gbuffer.color.height), Vector2(0, 0), WHITE)
         EndShaderMode()
         EndTextureMode()
 
@@ -246,6 +275,9 @@ class Renderer:
     def draw_output(self):
         view = self.view
         output_texture = view.tonemapped.texture if view.shading == "pbr" else view.lighted.texture
+        if view.shading == "pbr" and view.debug_view != "final":
+            DrawTextureRec(output_texture, Rectangle(0, 0, output_texture.width, -output_texture.height), Vector2(0, 0), WHITE)
+            return
         view.fxaa_inv_texture_resolution.x = 1.0 / output_texture.width
         view.fxaa_inv_texture_resolution.y = 1.0 / output_texture.height
         BeginShaderMode(view.shaders["fxaa"])
@@ -255,7 +287,7 @@ class Renderer:
         EndShaderMode()
 
 
-from stylized_motion.anim.genoview import draw_skeleton, draw_trajectory, ffi, skeleton_overlay_pose
+from stylized_motion.anim.genoview import DEBUG_MODES, LIGHTING_DEBUG_MODES, draw_skeleton, draw_trajectory, ffi, skeleton_overlay_pose
 from stylized_motion.anim.render_targets import (
     begin_gbuffer,
     begin_shadow_map,
