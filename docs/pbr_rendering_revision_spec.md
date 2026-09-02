@@ -568,6 +568,10 @@ python -m stylized_motion.run --mode visualize --pipeline somaview --bvh <small_
 
 Phase 4 落地材质 AO 时，GBuffer0/1 的既有布局没有空闲通道。评估了两个方案：albedo 预乘（零布局变更，但材质 AO 会错误地压暗 direct light，违反"AO 只影响间接光"验收项）与新增第三个 R8 attachment（布局最小增量，语义与 glTF occlusion texture 一致）。选择后者：GBuffer2 为 R8，仅存材质 AO；SSAO 结果仍不进入 GBuffer；lighting 中 `ao = ssao * materialAO`，仅作用于间接光。5.1 中原"不把 AO 挤入 GBuffer"约束按此口径修订为 SSAO/Material AO 语义分离。
 
+### 20.6 纹理槽绑定（2026-09-03）
+
+raylib 的 `SetShaderValueTexture` 以 `texture.id` 作为采样器 unit 键值；当渲染目标的 GL 纹理名恰好与手工管理的槽位（shadow map=10、environment/irradiance/prefilter=11-13、BRDF LUT=14）重合时发生冲突。新增 material AO attachment 使后续纹理 id 整体移位后，debug 显示 pass 的 `texLighted`（id=12 撞 irradiance 槽 12）实际采样到错误纹理，表现为 shadow/diffuse/ibl 调试视图内容异常。处理：多纹理 pass 一律改用显式槽绑定（新增 `render_targets.set_shader_value_texture_slot`），材质 AO=15、debug 五张输入=16-20、lighting SSAO=21（加固，防止未来再增纹理时 id 移位破坏 AO）。lighting 其余 sampler（gbufferColor/Normal/Depth）经验证输出逐像素不变，维持原绑定。此后新增 attachment 或纹理只需避开 10-21 已占槽位。
+
 ## 20. 完成定义
 
 当 Phase 1 完成并满足以下条件时，称为“PBR 管线结构修订完成”：

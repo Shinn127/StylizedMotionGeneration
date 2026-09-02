@@ -6,8 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import cffi
 from pyray import Texture
 from raylib import GenTextureMipmaps, LoadTexture
+
+
+ffi = cffi.FFI()
 
 
 TEXTURE_CONTRACT = {
@@ -65,8 +69,8 @@ def load_material_texture(path: Path, semantic: str) -> Texture:
     """
 
     TEXTURE_CONTRACT[semantic]
-    texture = LoadTexture(str(path))
-    GenTextureMipmaps(texture)
+    texture = LoadTexture(str(path).encode("utf-8"))
+    GenTextureMipmaps(ffi.addressof(texture))
     return texture
 
 

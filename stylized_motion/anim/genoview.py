@@ -827,6 +827,22 @@ class GenoView:
         self.irradiance_texture_slot_ptr[0] = 12
         self.prefilter_texture_slot_ptr[0] = 13
         self.brdf_lut_texture_slot_ptr[0] = 14
+        # Dedicated slots beyond the lighting pass's 10-14: render-target GL
+        # texture names collide with SetShaderValueTexture's id-keyed samplers.
+        self.material_ao_texture_slot_ptr = ffi.new("int*")
+        self.material_ao_texture_slot_ptr[0] = 15
+        self.ssao_texture_slot_ptr = ffi.new("int*")
+        self.ssao_texture_slot_ptr[0] = 21
+        self.debug_gbuffer_color_slot_ptr = ffi.new("int*")
+        self.debug_gbuffer_normal_slot_ptr = ffi.new("int*")
+        self.debug_gbuffer_depth_slot_ptr = ffi.new("int*")
+        self.debug_ssao_slot_ptr = ffi.new("int*")
+        self.debug_lighted_slot_ptr = ffi.new("int*")
+        self.debug_gbuffer_color_slot_ptr[0] = 16
+        self.debug_gbuffer_normal_slot_ptr[0] = 17
+        self.debug_gbuffer_depth_slot_ptr[0] = 18
+        self.debug_ssao_slot_ptr[0] = 19
+        self.debug_lighted_slot_ptr[0] = 20
         self.prefilter_max_lod_ptr[0] = 5.0
         self.ground_pattern_ptr[0] = 0
         self.specularity_ptr[0] = 0.5

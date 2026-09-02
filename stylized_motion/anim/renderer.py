@@ -154,10 +154,16 @@ class Renderer:
         SetShaderValueTexture(view.shaders["lighting"], view.shader_locs["lighting_gbuffer_color"], view.gbuffer.color)
         SetShaderValueTexture(view.shaders["lighting"], view.shader_locs["lighting_gbuffer_normal"], view.gbuffer.normal)
         SetShaderValueTexture(view.shaders["lighting"], view.shader_locs["lighting_gbuffer_depth"], view.gbuffer.depth)
-        SetShaderValueTexture(view.shaders["lighting"], view.shader_locs["lighting_ssao"], view.ssao_front.texture)
+        set_shader_value_texture_slot(
+            view.shaders["lighting"], view.shader_locs["lighting_ssao"],
+            view.ssao_front.texture, view.ssao_texture_slot_ptr,
+        )
         set_shader_value_shadow_map(view.shaders["lighting"], view.shader_locs["lighting_shadow_map"], view.shadow_map, view.shadow_texture_slot_ptr)
         if view.shading == "pbr":
-            SetShaderValueTexture(view.shaders["lighting"], view.shader_locs["lighting_material_ao"], view.gbuffer.material_ao)
+            set_shader_value_texture_slot(
+                view.shaders["lighting"], view.shader_locs["lighting_material_ao"],
+                view.gbuffer.material_ao, view.material_ao_texture_slot_ptr,
+            )
             set_shader_value_cubemap(view.shaders["lighting"], view.shader_locs["lighting_environment_map"], view.ibl.environment, view.environment_texture_slot_ptr)
             set_shader_value_cubemap(view.shaders["lighting"], view.shader_locs["lighting_irradiance_map"], view.ibl.irradiance, view.irradiance_texture_slot_ptr)
             set_shader_value_cubemap(view.shaders["lighting"], view.shader_locs["lighting_prefilter_map"], view.ibl.prefilter, view.prefilter_texture_slot_ptr)
@@ -222,11 +228,26 @@ class Renderer:
         view = self.view
         BeginTextureMode(view.tonemapped)
         BeginShaderMode(view.shaders["debug"])
-        SetShaderValueTexture(view.shaders["debug"], view.shader_locs["debug_gbuffer_color"], view.gbuffer.color)
-        SetShaderValueTexture(view.shaders["debug"], view.shader_locs["debug_gbuffer_normal"], view.gbuffer.normal)
-        SetShaderValueTexture(view.shaders["debug"], view.shader_locs["debug_gbuffer_depth"], view.gbuffer.depth)
-        SetShaderValueTexture(view.shaders["debug"], view.shader_locs["debug_ssao"], view.ssao_front.texture)
-        SetShaderValueTexture(view.shaders["debug"], view.shader_locs["debug_lighted"], view.lighted.texture)
+        set_shader_value_texture_slot(
+            view.shaders["debug"], view.shader_locs["debug_gbuffer_color"],
+            view.gbuffer.color, view.debug_gbuffer_color_slot_ptr,
+        )
+        set_shader_value_texture_slot(
+            view.shaders["debug"], view.shader_locs["debug_gbuffer_normal"],
+            view.gbuffer.normal, view.debug_gbuffer_normal_slot_ptr,
+        )
+        set_shader_value_texture_slot(
+            view.shaders["debug"], view.shader_locs["debug_gbuffer_depth"],
+            view.gbuffer.depth, view.debug_gbuffer_depth_slot_ptr,
+        )
+        set_shader_value_texture_slot(
+            view.shaders["debug"], view.shader_locs["debug_ssao"],
+            view.ssao_front.texture, view.debug_ssao_slot_ptr,
+        )
+        set_shader_value_texture_slot(
+            view.shaders["debug"], view.shader_locs["debug_lighted"],
+            view.lighted.texture, view.debug_lighted_slot_ptr,
+        )
         view.debug_mode_ptr[0] = DEBUG_MODES.index(view.debug_view)
         SetShaderValue(view.shaders["debug"], view.shader_locs["debug_mode"], view.debug_mode_ptr, SHADER_UNIFORM_INT)
         view.exposure_ptr[0] = view.exposure
@@ -295,4 +316,5 @@ from stylized_motion.anim.render_targets import (
     end_gbuffer,
     end_shadow_map,
     set_shader_value_shadow_map,
+    set_shader_value_texture_slot,
 )

@@ -99,6 +99,21 @@ def set_shader_value_shadow_map(shader, loc_index, target, slot_ptr):
         rlSetUniform(loc_index, slot_ptr, SHADER_UNIFORM_INT, 1)
 
 
+def set_shader_value_texture_slot(shader, loc_index, texture, slot_ptr):
+    """Bind a 2D texture to an explicit texture slot.
+
+    raylib's SetShaderValueTexture keys samplers off texture.id, which collides
+    with the manually managed slots (shadow map 10, environment 11-13, BRDF
+    LUT 14) whenever a render target's GL texture name lands on those numbers.
+    Multi-texture passes must bind their textures to dedicated slots instead.
+    """
+    if loc_index > -1:
+        rlEnableShader(shader.id)
+        rlActiveTextureSlot(slot_ptr[0])
+        rlEnableTexture(texture.id)
+        rlSetUniform(loc_index, slot_ptr, SHADER_UNIFORM_INT, 1)
+
+
 def load_gbuffer(width, height):
     target = GBuffer()
     target.id = rlLoadFramebuffer()

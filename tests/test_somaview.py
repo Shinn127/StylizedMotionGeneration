@@ -91,6 +91,21 @@ def test_gbuffer_carries_material_ao_attachment():
     assert hasattr(gbuffer_init, "material_ao")
 
 
+def test_multi_texture_passes_bind_explicit_slots():
+    # raylib keys SetShaderValueTexture samplers off texture.id, which collides
+    # with the manually managed slots 10-14 whenever a render target's GL
+    # texture name lands on those numbers (see spec 20.6).
+    import stylized_motion.anim.render_targets as render_targets
+
+    assert "def set_shader_value_texture_slot" in Path(render_targets.__file__).read_text(encoding="utf-8")
+
+    import stylized_motion.anim.genoview as genoview_module
+
+    genoview_source = Path(genoview_module.__file__).read_text(encoding="utf-8")
+    for slot_ptr in ("material_ao_texture_slot_ptr", "ssao_texture_slot_ptr", "debug_lighted_slot_ptr"):
+        assert slot_ptr in genoview_source
+
+
 def test_material_scene_and_texture_contract():
     from stylized_motion.anim.materials import Material, TEXTURE_CONTRACT
     from stylized_motion.anim.scene import DirectionalLight, RenderObject, Scene
