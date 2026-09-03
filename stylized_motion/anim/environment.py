@@ -46,13 +46,14 @@ def _procedural_sky_array(face_size: int = 32) -> np.ndarray:
 
     Values are linear radiance (not display sRGB), consumed as-is by the
     lighting pass — the background and the IBL terms must agree on that
-    contract. Bright blue zenith (~HDR, B>1) into a pale warm horizon with a
-    darker neutral ground bounce.
+    contract. Linear ~1.0 reads as a dull gray after the ACES toe, so the
+    palette lives around 1-3: bright blue zenith (~3 blue) into a near-white
+    warm horizon (~3) with a dimmer neutral ground bounce for layering.
     """
 
-    zenith = np.array([0.58, 0.74, 1.32], dtype=np.float32)
-    horizon = np.array([0.92, 0.96, 1.06], dtype=np.float32)
-    ground = np.array([0.42, 0.43, 0.46], dtype=np.float32)
+    zenith = np.array([1.2, 1.6, 4.2], dtype=np.float32)
+    horizon = np.array([2.4, 2.9, 4.0], dtype=np.float32)
+    ground = np.array([0.95, 1.0, 1.2], dtype=np.float32)
     faces = np.empty((6, face_size, face_size, 3), dtype=np.float32)
     for face in range(6):
         ys, xs = np.mgrid[0:face_size, 0:face_size]
@@ -78,10 +79,12 @@ def _array_to_cubemap_mipped(levels: list[np.ndarray]) -> Texture:
 
     rlLoadTextureCubemap expects the byte stream as: for each mip level
     (base first), the six square faces (+X,-X,+Y,-Y,+Z,-Z) as contiguous
-    s_k x s_k RGBA8 blocks; the level sizes halve per mip. Going through the
-    image path instead cannot inject custom per-level content (LoadCubemap
+    s_k x s_k RGBA16F blocks; the level sizes halve per mip. Going through
+    the image path instead cannot inject custom per-level content (LoadCubemap
     only converts the base level and re-derives the rest), so the raw data
-    pointer path is used here.
+    pointer path is used here. Storage is half-float because the sky is
+    linear radiance well above 1.0 — RGBA8 quantization would clip the whole
+    dome to flat white and gray out the background.
     """
 
     mip_count = len(levels)
@@ -91,19 +94,20 @@ def _array_to_cubemap_mipped(levels: list[np.ndarray]) -> Texture:
     for faces in levels:
         level_size = faces.shape[1]
         for face in range(6):
-            atlas = (np.clip(faces[face], 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
-            rgba = np.concatenate([atlas, np.full((level_size, level_size, 1), 255, dtype=np.uint8)], axis=2)
+            rgba = np.empty((level_size, level_size, 4), dtype=np.float16)
+            rgba[..., :3] = np.clip(faces[face], 0.0, 65504.0)
+            rgba[..., 3] = np.float16(1.0)
             chunks.append(np.ascontiguousarray(rgba).tobytes())
     data = b"".join(chunks)
 
-    texture_id = rlLoadTextureCubemap(data, size, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, mip_count)
+    texture_id = rlLoadTextureCubemap(data, size, PIXELFORMAT_UNCOMPRESSED_R16G16B16A16, mip_count)
     assert texture_id != 0, "rlLoadTextureCubemap failed for the prefilter chain"
     texture = Texture()
     texture.id = texture_id
     texture.width = size
     texture.height = size
     texture.mipmaps = mip_count
-    texture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8
+    texture.format = PIXELFORMAT_UNCOMPRESSED_R16G16B16A16
     return texture
 
 

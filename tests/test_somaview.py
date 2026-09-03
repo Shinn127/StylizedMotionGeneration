@@ -228,6 +228,9 @@ def test_ibl_chain_uses_convolution_and_importance_sampling():
     assert "def _convolve_irradiance" in source
     assert "def _prefilter_environment" in source
     assert "def _array_to_cubemap_mipped" in source
+    # Environment/irradiance/prefilter cubemaps store linear radiance above 1.0,
+    # so the upload must be half-float — RGBA8 would clip the dome to flat white.
+    assert "PIXELFORMAT_UNCOMPRESSED_R16G16B16A16, mip_count)" in source
     assert "1.0 - 2.0 * (indices + 0.5) / sample_count" in source  # full-sphere sampling
 
     sky = environment._procedural_sky_array(16)
