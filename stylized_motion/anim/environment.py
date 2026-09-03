@@ -47,13 +47,16 @@ def _procedural_sky_array(face_size: int = 32) -> np.ndarray:
     Values are linear radiance (not display sRGB), consumed as-is by the
     lighting pass — the background and the IBL terms must agree on that
     contract. Linear ~1.0 reads as a dull gray after the ACES toe, so the
-    palette lives around 1-3: bright blue zenith (~3 blue) into a near-white
-    warm horizon (~3) with a dimmer neutral ground bounce for layering.
+    palette lives around 0.3-4: a blue zenith into a paler blue horizon. The
+    below-horizon half keeps the same cool hue (slightly darker): the viewer's
+    finite floor plane means the visible background band samples dome
+    directions slightly BELOW the true horizon, so a neutral "ground bounce"
+    color there would paint the whole backdrop gray.
     """
 
-    zenith = np.array([1.2, 1.6, 4.2], dtype=np.float32)
-    horizon = np.array([2.4, 2.9, 4.0], dtype=np.float32)
-    ground = np.array([0.95, 1.0, 1.2], dtype=np.float32)
+    zenith = np.array([0.3, 0.9, 4.0], dtype=np.float32)
+    horizon = np.array([0.55, 1.6, 3.6], dtype=np.float32)
+    ground = np.array([0.5, 1.4, 3.2], dtype=np.float32)
     faces = np.empty((6, face_size, face_size, 3), dtype=np.float32)
     for face in range(6):
         ys, xs = np.mgrid[0:face_size, 0:face_size]
