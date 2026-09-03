@@ -42,16 +42,17 @@ _FACE_AXES = (
 
 
 def _procedural_sky_array(face_size: int = 32) -> np.ndarray:
-    """Source environment for the IBL chain: a smooth sky-gradient dome.
+    """Source environment for the IBL chain: a linear-radiance sky dome.
 
-    Bright blue zenith into a pale warm-lit horizon, with a darker warm-gray
-    ground bounce. The strong vertical luminance gradient and the cool-vs-warm
-    split give diffuse IBL the temperature contrast the direct sun sets up.
+    Values are linear radiance (not display sRGB), consumed as-is by the
+    lighting pass — the background and the IBL terms must agree on that
+    contract. Bright blue zenith (~HDR, B>1) into a pale warm horizon with a
+    darker neutral ground bounce.
     """
 
-    zenith = np.array([0.52, 0.68, 0.95], dtype=np.float32)
-    horizon = np.array([0.86, 0.89, 0.94], dtype=np.float32)
-    ground = np.array([0.42, 0.43, 0.45], dtype=np.float32)
+    zenith = np.array([0.58, 0.74, 1.32], dtype=np.float32)
+    horizon = np.array([0.92, 0.96, 1.06], dtype=np.float32)
+    ground = np.array([0.42, 0.43, 0.46], dtype=np.float32)
     faces = np.empty((6, face_size, face_size, 3), dtype=np.float32)
     for face in range(6):
         ys, xs = np.mgrid[0:face_size, 0:face_size]

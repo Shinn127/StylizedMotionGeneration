@@ -690,7 +690,7 @@ class GenoView:
         roughness: float = 0.58,
         exposure: float = 0.9,
         ssao_intensity: float = 0.15,
-        ibl_strength: float = 0.35,
+        ibl_strength: float = 0.22,
         ibl_enabled: bool = True,
         shadow_resolution: int = 2048,
         output_video: Path | None = None,
@@ -842,6 +842,9 @@ class GenoView:
         self.database_name_to_index = {str(name): idx for idx, name in enumerate(self.names.tolist())}
         self.full_name_to_index = None
         self.use_pruned_reconstruction = False
+        # One-entry FK cache: paused/scrubbed playback re-requests the same
+        # frame many times per second (event poll + skeleton overlay).
+        self._globals_cache = {}
         self.shader_locs = {}
         self.ground_position = Vector3(0.0, -0.01, 0.0)
 
@@ -1267,7 +1270,17 @@ class GenoView:
         return self._current_globals_for(self.positions, self.rotations, self.parents, self.frame_index)
 
     def _update_model_pose_for(self, model, bind_pos, bind_rot, positions, rotations, parents, frame_index):
-        global_rot, global_pos = self._current_globals_for(positions, rotations, parents, frame_index)
+        # FK results are pure functions of (positions, rotations, parents,
+        # frame_index); scrubbing and paused playback re-request the same frame
+        # every event poll, so cache the globals per source database and skip
+        # both the FK and the bone-matrix rewrite on hits.
+        cache_key = (id(positions), frame_index)
+        cache_hit = self._globals_cache.get("key") == cache_key
+        if cache_hit:
+            global_rot, global_pos = self._globals_cache["rot"], self._globals_cache["pos"]
+        else:
+            global_rot, global_pos = self._current_globals_for(positions, rotations, parents, frame_index)
+            self._globals_cache = {"key": cache_key, "rot": global_rot, "pos": global_pos}
         update_model_pose_from_numpy_arrays(model, bind_pos, bind_rot, global_pos[0, 1:], global_rot[0, 1:])
         return global_rot[0], global_pos[0]
 
@@ -1307,9 +1320,12 @@ class GenoView:
         recording_cwd = Path.cwd()
         if frame_dir is not None:
             os.chdir(frame_dir)
+        # VSYNC alone caps the loop at the display refresh (120fps on the
+        # target panels). SetTargetFPS would stack a second, usually lower,
+        # cap derived from the BVH's frame time — playback speed is dt-driven,
+        # so the render loop should not be throttled by it.
         SetConfigFlags(FLAG_VSYNC_HINT | (FLAG_WINDOW_HIDDEN if frame_dir is not None else 0))
         InitWindow(screen_width, screen_height, self.rig.window_title)
-        SetTargetFPS(self.fps)
         rlSetClipPlanes(0.01, 50.0)
         self.screen_width = screen_width
         self.screen_height = screen_height
@@ -1419,7 +1435,7 @@ class GenoViewCompare(GenoView):
         roughness: float = 0.58,
         exposure: float = 0.9,
         ssao_intensity: float = 0.15,
-        ibl_strength: float = 0.35,
+        ibl_strength: float = 0.22,
         ibl_enabled: bool = True,
         shadow_resolution: int = 2048,
         output_video: Path | None = None,
@@ -1488,7 +1504,7 @@ def main():
     parser.add_argument("--scene", choices=SCENE_MODES, default="character", help="character: motion viewer scene; grid: 5x5 metallic/roughness material test grid.")
     parser.add_argument("--sun-strength", type=float, default=None, help="Direct light intensity. Defaults to the per-shading light rig value (PBR: 0.55, legacy: 0.25).")
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
-    parser.add_argument("--ibl-strength", type=float, default=0.35)
+    parser.add_argument("--ibl-strength", type=float, default=0.22)
     parser.add_argument("--disable-ibl", action="store_true")
     parser.add_argument("--shadow-resolution", type=int, default=2048)
     parser.add_argument("--output-video", type=Path, default=None, help="Render the full clip to an MP4 at this path.")

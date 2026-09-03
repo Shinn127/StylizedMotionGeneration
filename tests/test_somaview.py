@@ -51,7 +51,9 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         # 3x3 PCF shadow sampling and the procedural sky background
         assert "uniform vec2 shadowTexelSize" in pbr_lighting
         assert "shadow / 9.0" in pbr_lighting
-        assert "texture(environmentMap, viewDir)" in pbr_lighting
+        # Sky background samples linear-radiance environment data directly.
+        assert "textureLod(environmentMap, viewDir, 0.0)" in pbr_lighting
+        assert "SRGBToLinear(textureLod(prefilterMap" not in pbr_lighting
         assert "finalColor = vec4(direct + ambient, 1.0)" in pbr_lighting
         assert "uniform float ssaoIntensity" in ssao
         assert "shadowMap" not in ssao

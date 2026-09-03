@@ -104,13 +104,14 @@ void main()
     float depth = texture(gbufferDepth, fragTexCoord).r;
     if (depth >= 0.99999) {
         // Procedural sky background: reconstruct the view ray through the far
-        // plane and sample the environment cubemap; the fallback path keeps a
-        // flat skyColor-tinted dome so --disable-ibl stays coherent.
+        // plane and sample the environment cubemap (linear radiance data —
+        // no sRGB decode); the fallback keeps a skyColor-tinted flat dome so
+        // --disable-ibl stays coherent.
         vec2 ndc = fragTexCoord * 2.0 - 1.0;
         vec4 farPointHomo = camInvViewProj * vec4(ndc, 1.0, 1.0);
         vec3 viewDir = normalize(farPointHomo.xyz / farPointHomo.w - camPos);
         vec3 sky = useIBL == 1
-            ? SRGBToLinear(texture(environmentMap, viewDir).rgb)
+            ? textureLod(environmentMap, viewDir, 0.0).rgb
             : SRGBToLinear(skyColor) * 2.0;
         finalColor = vec4(sky, 1.0);
         gl_FragDepth = 1.0;
@@ -161,8 +162,8 @@ void main()
     vec3 ambient = fallbackAmbient;
     if (useIBL == 1) {
         vec3 reflection = reflect(-view, normal);
-        vec3 irradiance = SRGBToLinear(texture(irradianceMap, normal).rgb);
-        vec3 prefiltered = SRGBToLinear(textureLod(prefilterMap, reflection, roughness * prefilterMaxLod).rgb);
+        vec3 irradiance = texture(irradianceMap, normal).rgb;
+        vec3 prefiltered = textureLod(prefilterMap, reflection, roughness * prefilterMaxLod).rgb;
         vec2 brdf = texture(brdfLut, vec2(nDotV, roughness)).rg;
         vec3 iblFresnel = FresnelSchlick(nDotV, f0);
         vec3 diffuseIBL = (1.0 - metallic) * albedo * irradiance;

@@ -164,7 +164,7 @@ def main():
     parser.add_argument("--exposure", type=float, default=0.9)
     parser.add_argument("--sun-strength", type=float, default=None)
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
-    parser.add_argument("--ibl-strength", type=float, default=0.35)
+    parser.add_argument("--ibl-strength", type=float, default=0.22)
     parser.add_argument("--tone-curve", choices=TONE_CURVES, default="aces")
     parser.add_argument("--scene", choices=SCENE_MODES, default="character")
     parser.add_argument("--normal-map", type=Path, default=None)
