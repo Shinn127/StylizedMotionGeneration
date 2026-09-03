@@ -16,6 +16,7 @@ from pathlib import Path
 
 from stylized_motion.anim.genoview import (
     DEBUG_MODES,
+    TONE_CURVES,
     RigSpec,
     GenoView,
     build_database_from_bvh,
@@ -61,6 +62,7 @@ def main():
     parser.add_argument("--metallic", type=float, default=0.0)
     parser.add_argument("--roughness", type=float, default=0.58)
     parser.add_argument("--exposure", type=float, default=0.9)
+    parser.add_argument("--tone-curve", choices=TONE_CURVES, default="aces", help="Tone mapping curve for the PBR path (aces | reinhard | agx).")
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
     parser.add_argument("--ibl-strength", type=float, default=0.35)
     parser.add_argument("--disable-ibl", action="store_true")
@@ -115,6 +117,7 @@ def main():
         normal_map=args.normal_map,
         metallic_roughness_map=args.metallic_roughness_map,
         sun_strength=args.sun_strength,
+        tone_curve=args.tone_curve,
     )
     viewer.run()
 

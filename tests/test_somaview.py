@@ -48,6 +48,10 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         assert "texture(materialAO, fragTexCoord).r" in pbr_lighting
         assert "uniform float prefilterMaxLod" in pbr_lighting
         assert "textureLod(prefilterMap" in pbr_lighting
+        # 3x3 PCF shadow sampling and the procedural sky background
+        assert "uniform vec2 shadowTexelSize" in pbr_lighting
+        assert "shadow / 9.0" in pbr_lighting
+        assert "texture(environmentMap, viewDir)" in pbr_lighting
         assert "finalColor = vec4(direct + ambient, 1.0)" in pbr_lighting
         assert "uniform float ssaoIntensity" in ssao
         assert "shadowMap" not in ssao
@@ -120,6 +124,30 @@ def test_pbr_light_rig_is_retuned_while_legacy_stays_frozen():
     # Warm sun against a cool sky carries the temperature contrast.
     assert PBR_LIGHT_RIG["sun_color"][2] < PBR_LIGHT_RIG["sun_color"][0]
     assert PBR_LIGHT_RIG["sky_color"][2] > PBR_LIGHT_RIG["sky_color"][0]
+
+
+def test_tone_curve_selection_is_shared_between_viewers():
+    from stylized_motion.anim.genoview import TONE_CURVES
+
+    assert TONE_CURVES[0] == "aces"
+    assert TONE_CURVES == ("aces", "reinhard", "agx")
+    for resource_dir in (RESOURCE_DIR, SOMA_RESOURCE_DIR):
+        tonemap = (resource_dir / "tonemap.fs").read_text(encoding="utf-8")
+        assert "uniform int toneCurve" in tonemap
+        assert "ACESApprox" in tonemap
+        assert "Reinhard" in tonemap
+        assert "AgXInverse(AgX(" in tonemap
+        # The default branch must stay the historical ACES fit.
+        assert "return ACESApprox(color);" in tonemap
+
+    import stylized_motion.anim.genoview as genoview_module
+
+    try:
+        genoview_module.GenoView(database=None, trajectory_path=None, resources_root=Path("."), tone_curve="bogus")
+    except ValueError as e:
+        assert "tone curve" in str(e)
+    else:
+        raise AssertionError("expected ValueError for bogus tone curve")
 
 
 def test_material_scene_and_texture_contract():

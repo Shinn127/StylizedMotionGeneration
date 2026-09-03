@@ -30,6 +30,7 @@ uniform float lightClipFar;
 uniform float iblStrength;
 uniform float prefilterMaxLod;
 uniform int useIBL;
+uniform vec2 shadowTexelSize;
 // 0 final image, 1 shadow, 2 direct diffuse, 3 direct specular, 4 indirect light
 uniform int debugMode;
 
@@ -86,14 +87,35 @@ float ShadowFactor(vec3 position, vec3 normal)
         lightPosition.z > 0.0 && lightPosition.z < 1.0;
     if (!inside) { return 1.0; }
     float receiverDepth = LinearDepth(lightPosition.z, lightClipNear, lightClipFar);
-    float blockerDepth = texture(shadowMap, lightPosition.xy).r;
-    return 1.0 - float(receiverDepth - 0.000005 > blockerDepth);
+    // 3x3 percentage-closer filtering over the shadow map; the constant depth
+    // bias stays per-sample and shadow never routes through the SSAO blur.
+    float shadow = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            float blockerDepth = texture(shadowMap, lightPosition.xy + vec2(x, y) * shadowTexelSize).r;
+            shadow += 1.0 - float(receiverDepth - 0.000005 > blockerDepth);
+        }
+    }
+    return shadow / 9.0;
 }
 
 void main()
 {
     float depth = texture(gbufferDepth, fragTexCoord).r;
-    if (depth >= 0.99999) { discard; }
+    if (depth >= 0.99999) {
+        // Procedural sky background: reconstruct the view ray through the far
+        // plane and sample the environment cubemap; the fallback path keeps a
+        // flat skyColor-tinted dome so --disable-ibl stays coherent.
+        vec2 ndc = fragTexCoord * 2.0 - 1.0;
+        vec4 farPointHomo = camInvViewProj * vec4(ndc, 1.0, 1.0);
+        vec3 viewDir = normalize(farPointHomo.xyz / farPointHomo.w - camPos);
+        vec3 sky = useIBL == 1
+            ? SRGBToLinear(texture(environmentMap, viewDir).rgb)
+            : SRGBToLinear(skyColor) * 2.0;
+        finalColor = vec4(sky, 1.0);
+        gl_FragDepth = 1.0;
+        return;
+    }
 
     vec3 positionClip = vec3(fragTexCoord, NonlinearDepth(depth, camClipNear, camClipFar)) * 2.0 - 1.0;
     vec4 positionHomo = camInvViewProj * vec4(positionClip, 1.0);
@@ -140,7 +162,6 @@ void main()
     if (useIBL == 1) {
         vec3 reflection = reflect(-view, normal);
         vec3 irradiance = SRGBToLinear(texture(irradianceMap, normal).rgb);
-        vec3 environment = SRGBToLinear(texture(environmentMap, reflection).rgb);
         vec3 prefiltered = SRGBToLinear(textureLod(prefilterMap, reflection, roughness * prefilterMaxLod).rgb);
         vec2 brdf = texture(brdfLut, vec2(nDotV, roughness)).rg;
         vec3 iblFresnel = FresnelSchlick(nDotV, f0);

@@ -16,6 +16,10 @@
 
 实施更新（2026-09-03，Phase 4 前半）：normal mapping 与材质 AO 已落地。顶点切线管线（含蒙皮切线变换）此前已就绪；`pbr.fs` 现构建 TBN 并采样 `normalMap.rg`（z 分量由 xy 重建，兼容标准 RGB 法线贴图），退化切线回退几何法线。GBuffer 新增第三个 R8 attachment（`gbufferMaterialAO`），材质 ao（uniform 或 `metallicRoughnessMap.B`）经此进入 lighting，与 SSAO 相乘后仅作用于间接光。viewer CLI 新增 `--normal-map` 与 `--metallic-roughness-map`，应用到角色默认材质。材质测试场景（material grid）仍属 Phase 4 未完成项。
 
+实施更新（2026-09-03，阶段 B 视觉升级）：Shadow 升级为 3×3 PCF（`shadowTexelSize` uniform，spec 8.2 关闭）；Lighting Pass 背景从 RAYWHITE 清屏色改为程序化天空（沿视线采样 environment cubemap，`--disable-ibl` 时回退 skyColor 平色；调试视图背景仍由 debug.fs 按 GBuffer 深度判定为黑）；`tonemap.fs` 支持 `--tone-curve aces|reinhard|agx`（默认 aces 保持历史公式不变）；顺带移除 IBL 分支中未使用的 `environment` 采样死代码（environmentMap 现由天空背景真正消费）。
+
+实施更新（2026-09-03，阶段 A 基线工具）：新增 `stylized_motion.anim.render_stills`（离屏渲染单帧到 PNG，直读 render-target 纹理，绕开 macOS 隐藏窗口 `take_screenshot` 抓黑帧问题；final 视图为 FXAA 前显示目标，其余与交互路径一致）与 `stylized_motion.anim.compare_stills`（阈值化像素对比，超差退出码 1）。`docs/assets/pbr_baseline/` 提交了 14 张基线图（12 个调试视图 + legacy + SomaView final）与再生成/回归说明；Phase 0 的基线截图交付项关闭。
+
 ## 1. 目标
 
 本轮修订完成后，GenoView/SomaView 应具备一个结构清晰、可验证、可扩展的 Minimal Deferred PBR 管线：
@@ -99,7 +103,7 @@ Screen
 | GBuffer | geometry、Material | albedo/metallic、normal/roughness、depth | direct/indirect lighting |
 | SSAO | GBuffer、camera | AO texture | Shadow Map 采样、颜色合成 |
 | SSAO Blur | AO、GBuffer depth/normal | filtered AO | Shadow filtering |
-| PBR Lighting | GBuffer、AO、Shadow、lights、environment | linear HDR | sRGB 输出、tone mapping |
+| PBR Lighting | GBuffer、AO、Shadow、lights、environment | linear HDR；背景像素输出程序化天空（沿视线采样 environment cubemap，`--disable-ibl` 时回退 skyColor 平色） | sRGB 输出、tone mapping |
 | Tone Mapping | HDR texture、exposure | display-linear/sRGB output | BRDF、shadow、FXAA |
 | FXAA | tone-mapped output | final screen image | HDR 运算 |
 
@@ -264,15 +268,15 @@ indirectDiffuse = irradiance * baseColor / PI * kD * ao
 - Shadow factor 在 Lighting Pass 中计算；
 - 默认先使用单次比较采样，保证职责拆分后结果稳定。
 
-### 8.2 第二阶段 PCF
+### 8.2 第二阶段 PCF（已落地 2026-09-03）
 
-在单次采样稳定后增加 3×3 PCF：
+`pbrLighting.fs` 的 `ShadowFactor` 使用 3×3 PCF：
 
-- 使用 shadow map texel size；
-- bias 分为 constant bias 和 normal bias；
+- 使用 `shadowTexelSize` uniform（1/shadowResolution，viewer 初始化后缓存）；
+- bias 保持 normal offset（世界空间 `0.01 * normal`）+ 逐样本常数 bias（5e-5 线性深度）；
 - shadow sampling 不经过 SSAO blur；
 - 超出 shadow projection 范围时返回 `shadow = 1.0`；
-`ssao.fs` 不再计算或输出 shadow。现有 `ssao.g` 语义不得继续作为正式接口。
+- `ssao.fs` 不计算或输出 shadow。
 
 ## 9. SSAO 规范
 
@@ -355,7 +359,7 @@ hdr
 
 第一阶段使用当前 ACES fitted curve 作为兼容实现，并在代码中命名为 `ACESApprox`，避免误称为完整 ACES 色彩管理。Tone Mapping 必须与 PBR Lighting 分离，以便后续替换 Reinhard、ACES 或 AgX。
 
-FXAA 必须放在 Tone Mapping 之后，因为 FXAA 依赖最终显示空间的边缘亮度。
+Tone curve 已可选化（2026-09-03）：`tonemap.fs` 的 `toneCurve` uniform 支持 `aces`（默认，保持历史拟合公式逐位不变）/ `reinhard` / `agx`（MinifiedAgX 拟合），viewer CLI 通过 `--tone-curve` 选择。FXAA 必须放在 Tone Mapping 之后，因为 FXAA 依赖最终显示空间的边缘亮度。
 
 ## 13. Python 渲染层
 
@@ -442,7 +446,7 @@ columns = roughness: 0.0, 0.25, 0.5, 0.75, 1.0
 
 ### Phase 0：基线与诊断
 
-> 2026-09-03 进度：metallic/roughness/shadow 等 debug view 已交付；基线截图仍需用 `--debug-view` + `--output-video` 逐模式生成。
+> 2026-09-03 进度：已完成关闭。debug view 全套 + 基线截图（`docs/assets/pbr_baseline/`，14 张，由 `render_stills` 生成、`compare_stills` 可回归对比）均已交付。
 
 - 固定当前 PBR 输出截图/参数作为 baseline；
 - 增加 metallic、roughness、shadow debug；

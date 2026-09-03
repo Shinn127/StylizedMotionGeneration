@@ -60,6 +60,10 @@ LIGHTING_DEBUG_MODES = {
     "hdr": 0,
 }
 
+# Tone mapping curves selectable through --tone-curve; indices are consumed by
+# tonemap.fs's toneCurve uniform. ACES stays the default for visual continuity.
+TONE_CURVES = ("aces", "reinhard", "agx")
+
 
 # Lighting rig inherited from GenoViewPython, frozen so `--shading legacy`
 # keeps rendering exactly the way it always has.
@@ -690,10 +694,13 @@ class GenoView:
         normal_map: Path | None = None,
         metallic_roughness_map: Path | None = None,
         sun_strength: float | None = None,
+        tone_curve: str = "aces",
         rig: RigSpec = GENO_RIG,
     ):
         if debug_view not in DEBUG_MODES:
             raise ValueError(f"Unknown debug view {debug_view!r}; expected one of {DEBUG_MODES}")
+        if tone_curve not in TONE_CURVES:
+            raise ValueError(f"Unknown tone curve {tone_curve!r}; expected one of {TONE_CURVES}")
         self.rig = rig
         self.skeleton_enabled = bool(draw_skeleton)
         self.skeleton_color = GRAY
@@ -708,6 +715,7 @@ class GenoView:
         self.ibl_strength = float(ibl_strength)
         self.ibl_enabled = bool(ibl_enabled)
         self.shadow_resolution = int(shadow_resolution)
+        self.tone_curve = tone_curve
         self.output_video = Path(output_video).resolve() if output_video is not None else None
         self.database = database
         self.positions = self.database["positions"].astype(np.float32)
@@ -850,6 +858,7 @@ class GenoView:
         self.prefilter_texture_slot_ptr = ffi.new("int*")
         self.brdf_lut_texture_slot_ptr = ffi.new("int*")
         self.prefilter_max_lod_ptr = ffi.new("float*")
+        self.tone_curve_ptr = ffi.new("int*")
         self.material_base_color_ptr = ffi.new("float[4]")
         self.ground_pattern_ptr = ffi.new("int*")
         self.use_base_color_map_ptr = ffi.new("int*")
@@ -900,6 +909,7 @@ class GenoView:
         self.blur_direction = Vector2(0.0, 0.0)
         self.blur_inv_texture_resolution = Vector2(0.0, 0.0)
         self.fxaa_inv_texture_resolution = Vector2(0.0, 0.0)
+        self.shadow_texel_size = Vector2(0.0, 0.0)
 
     def _res(self, name: str) -> bytes:
         return str((self.resources_root / name).resolve()).encode()
@@ -999,10 +1009,13 @@ class GenoView:
             self.shader_locs["lighting_ibl_strength"] = GetShaderLocation(self.shaders["lighting"], b"iblStrength")
             self.shader_locs["lighting_use_ibl"] = GetShaderLocation(self.shaders["lighting"], b"useIBL")
             self.shader_locs["lighting_debug_mode"] = GetShaderLocation(self.shaders["lighting"], b"debugMode")
+            self.shader_locs["lighting_shadow_texel_size"] = GetShaderLocation(self.shaders["lighting"], b"shadowTexelSize")
 
         if self.shading == "pbr":
             self.shader_locs["tonemap_input_texture"] = GetShaderLocation(self.shaders["tonemap"], b"inputTexture")
             self.shader_locs["tonemap_exposure"] = GetShaderLocation(self.shaders["tonemap"], b"exposure")
+            self.shader_locs["tonemap_tone_curve"] = GetShaderLocation(self.shaders["tonemap"], b"toneCurve")
+            self.tone_curve_ptr[0] = TONE_CURVES.index(self.tone_curve)
             self.shader_locs["debug_gbuffer_color"] = GetShaderLocation(self.shaders["debug"], b"texGbufferColor")
             self.shader_locs["debug_gbuffer_normal"] = GetShaderLocation(self.shaders["debug"], b"texGbufferNormal")
             self.shader_locs["debug_gbuffer_depth"] = GetShaderLocation(self.shaders["debug"], b"texGbufferDepth")
@@ -1338,6 +1351,7 @@ class GenoViewCompare(GenoView):
         normal_map: Path | None = None,
         metallic_roughness_map: Path | None = None,
         sun_strength: float | None = None,
+        tone_curve: str = "aces",
         rig: RigSpec = GENO_RIG,
     ):
         super().__init__(
@@ -1364,6 +1378,7 @@ class GenoViewCompare(GenoView):
             normal_map=normal_map,
             metallic_roughness_map=metallic_roughness_map,
             sun_strength=sun_strength,
+            tone_curve=tone_curve,
         )
 
 
@@ -1390,6 +1405,7 @@ def main():
     parser.add_argument("--metallic", type=float, default=0.0)
     parser.add_argument("--roughness", type=float, default=0.58)
     parser.add_argument("--exposure", type=float, default=0.9)
+    parser.add_argument("--tone-curve", choices=TONE_CURVES, default="aces", help="Tone mapping curve for the PBR path (aces | reinhard | agx).")
     parser.add_argument("--sun-strength", type=float, default=None, help="Direct light intensity. Defaults to the per-shading light rig value (PBR: 0.55, legacy: 0.25).")
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
     parser.add_argument("--ibl-strength", type=float, default=0.35)
@@ -1443,6 +1459,7 @@ def main():
         normal_map=args.normal_map,
         metallic_roughness_map=args.metallic_roughness_map,
         sun_strength=args.sun_strength,
+        tone_curve=args.tone_curve,
     )
     viewer.run()
 

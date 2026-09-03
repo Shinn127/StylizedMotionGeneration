@@ -196,6 +196,9 @@ class Renderer:
             SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_use_ibl"], view.use_ibl_ptr, SHADER_UNIFORM_INT)
             view.debug_mode_ptr[0] = LIGHTING_DEBUG_MODES[view.debug_view]
             SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_debug_mode"], view.debug_mode_ptr, SHADER_UNIFORM_INT)
+            view.shadow_texel_size.x = 1.0 / float(view.shadow_map.depth.width)
+            view.shadow_texel_size.y = 1.0 / float(view.shadow_map.depth.height)
+            SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_shadow_texel_size"], ffi.addressof(view.shadow_texel_size), SHADER_UNIFORM_VEC2)
         ClearBackground(RAYWHITE)
         DrawTextureRec(view.gbuffer.color, Rectangle(0, 0, view.gbuffer.color.width, -view.gbuffer.color.height), Vector2(0, 0), WHITE)
         EndShaderMode()
@@ -213,6 +216,7 @@ class Renderer:
         view.exposure_ptr[0] = view.exposure
         SetShaderValueTexture(view.shaders["tonemap"], view.shader_locs["tonemap_input_texture"], view.lighted.texture)
         SetShaderValue(view.shaders["tonemap"], view.shader_locs["tonemap_exposure"], view.exposure_ptr, SHADER_UNIFORM_FLOAT)
+        SetShaderValue(view.shaders["tonemap"], view.shader_locs["tonemap_tone_curve"], view.tone_curve_ptr, SHADER_UNIFORM_INT)
         ClearBackground(BLACK)
         DrawTextureRec(view.lighted.texture, Rectangle(0, 0, view.lighted.texture.width, -view.lighted.texture.height), Vector2(0, 0), WHITE)
         EndShaderMode()
