@@ -30,6 +30,7 @@ uniform float lightClipFar;
 uniform float iblStrength;
 uniform float prefilterMaxLod;
 uniform int useIBL;
+uniform int whiteBackground;
 uniform vec2 shadowTexelSize;
 // 0 final image, 1 shadow, 2 direct diffuse, 3 direct specular, 4 indirect light
 uniform int debugMode;
@@ -37,6 +38,10 @@ uniform int debugMode;
 out vec4 finalColor;
 
 #define PI 3.14159265358979323846264338327950288
+// Background marker written by the sky branch under --white-background. Must
+// stay representable in RGBA16F storage (half-float max 65504) and far above
+// any physical radiance the scene can produce (sun strength <= ~1).
+#define BACKGROUND_SENTINEL 6.0e4
 
 float NonlinearDepth(float depth, float near, float far)
 {
@@ -103,10 +108,14 @@ void main()
 {
     float depth = texture(gbufferDepth, fragTexCoord).r;
     if (depth >= 0.99999) {
-        // Procedural sky background: reconstruct the view ray through the far
-        // plane and sample the environment cubemap (linear radiance data —
-        // no sRGB decode); the fallback keeps a skyColor-tinted flat dome so
-        // --disable-ibl stays coherent.
+        // Procedural sky background: normally reconstruct the view ray through
+        // the far plane and sample the environment cubemap (linear radiance
+        // data — no sRGB decode); the fallback keeps a skyColor-tinted flat
+        // dome so --disable-ibl stays coherent. The FSQ runs blended
+        // (SRC_ALPHA, ONE_MINUS_SRC_ALPHA) — rlDisableColorBlend does not stick
+        // through the batch flush — and RGBA16F attachments clamp negatives on
+        // this GL backend, so the background marker is an unreachable large
+        // radiance: real scene radiance stays far below BACKGROUND_SENTINEL.
         vec2 ndc = fragTexCoord * 2.0 - 1.0;
         vec4 farPointHomo = camInvViewProj * vec4(ndc, 1.0, 1.0);
         vec3 viewDir = normalize(farPointHomo.xyz / farPointHomo.w - camPos);
@@ -114,6 +123,7 @@ void main()
             ? textureLod(environmentMap, viewDir, 0.0).rgb
             : SRGBToLinear(skyColor) * 2.0;
         finalColor = vec4(sky, 1.0);
+        if (whiteBackground == 1) { finalColor = vec4(vec3(BACKGROUND_SENTINEL), 1.0); }
         gl_FragDepth = 1.0;
         return;
     }

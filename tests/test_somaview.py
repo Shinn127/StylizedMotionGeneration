@@ -128,6 +128,31 @@ def test_pbr_light_rig_is_retuned_while_legacy_stays_frozen():
     assert PBR_LIGHT_RIG["sky_color"][2] > PBR_LIGHT_RIG["sky_color"][0]
 
 
+def test_white_background_sentinel_contract_is_shared_between_viewers():
+    # --white-background marks sky pixels with an unreachable radiance sentinel
+    # that tonemap.fs swaps for exact display white (paper figure mode). The
+    # sentinel must survive RGBA16F storage (half max 65504) and stay far above
+    # scene radiance, so both shaders must agree on the same constant.
+    for resource_dir in (RESOURCE_DIR, SOMA_RESOURCE_DIR):
+        lighting = (resource_dir / "pbrLighting.fs").read_text(encoding="utf-8")
+        tonemap = (resource_dir / "tonemap.fs").read_text(encoding="utf-8")
+        assert "uniform int whiteBackground" in lighting
+        assert "uniform int whiteBackground" in tonemap
+        assert "#define BACKGROUND_SENTINEL 6.0e4" in lighting
+        assert "BACKGROUND_SENTINEL_MIN 3.0e4" in tonemap
+        assert "if (whiteBackground == 1) { finalColor = vec4(vec3(BACKGROUND_SENTINEL), 1.0); }" in lighting
+        assert "hdr.r > BACKGROUND_SENTINEL_MIN" in tonemap
+    # Debug views share the flat white background for paper figures.
+    for resource_dir in (RESOURCE_DIR, SOMA_RESOURCE_DIR):
+        debug_fs = (resource_dir / "debug.fs").read_text(encoding="utf-8")
+        assert "Flat white background" in debug_fs
+    import stylized_motion.anim.genoview as genoview_module
+
+    source = Path(genoview_module.__file__).read_text(encoding="utf-8")
+    assert "white_background: bool = False" in source
+    assert '--white-background' in source
+
+
 def test_tone_curve_selection_is_shared_between_viewers():
     from stylized_motion.anim.genoview import TONE_CURVES
 

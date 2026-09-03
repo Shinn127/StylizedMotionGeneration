@@ -31,7 +31,9 @@ vec3 DisplayHDR(vec3 color)
 void main()
 {
     if (texture(texGbufferDepth, fragTexCoord).r >= 0.99999) {
-        finalColor = vec4(0.0, 0.0, 0.0, 1.0);
+        // Flat white background so debug views drop into paper figures the
+        // same way the final view does.
+        finalColor = vec4(1.0, 1.0, 1.0, 1.0);
         return;
     }
 

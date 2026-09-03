@@ -6,6 +6,12 @@ uniform sampler2D inputTexture;
 uniform float exposure;
 // 0 ACES (default), 1 Reinhard, 2 AgX (minified fit)
 uniform int toneCurve;
+// 1 = flat white background for paper figures (pbrLighting.fs marks background
+// pixels with an unreachable huge radiance sentinel)
+uniform int whiteBackground;
+
+#define BACKGROUND_SENTINEL 6.0e4
+#define BACKGROUND_SENTINEL_MIN 3.0e4
 
 out vec4 finalColor;
 
@@ -75,5 +81,12 @@ vec3 ToneMap(vec3 color)
 void main()
 {
     vec3 hdr = texture(inputTexture, fragTexCoord).rgb;
+    // Background pixels carry the sentinel radiance from pbrLighting.fs:
+    // bypass exposure and the tone curve entirely so the flat white background
+    // is exactly 255 for paper figures regardless of the active tone curve.
+    if (whiteBackground == 1 && hdr.r > BACKGROUND_SENTINEL_MIN) {
+        finalColor = vec4(1.0, 1.0, 1.0, 1.0);
+        return;
+    }
     finalColor = vec4(LinearToSRGB(ToneMap(exposure * hdr)), 1.0);
 }

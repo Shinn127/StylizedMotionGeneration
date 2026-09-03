@@ -716,6 +716,7 @@ class GenoView:
         sun_strength: float | None = None,
         tone_curve: str = "aces",
         scene_mode: str = "character",
+        white_background: bool = False,
         rig: RigSpec = GENO_RIG,
     ):
         if debug_view not in DEBUG_MODES:
@@ -740,6 +741,7 @@ class GenoView:
         self.ibl_enabled = bool(ibl_enabled)
         self.shadow_resolution = int(shadow_resolution)
         self.tone_curve = tone_curve
+        self.white_background = bool(white_background)
         self.output_video = Path(output_video).resolve() if output_video is not None else None
         self.database = database
         self.positions = self.database["positions"].astype(np.float32)
@@ -893,6 +895,7 @@ class GenoView:
         self.use_metallic_roughness_map_ptr = ffi.new("int*")
         self.use_normal_map_ptr = ffi.new("int*")
         self.debug_mode_ptr = ffi.new("int*")
+        self.white_background_ptr = ffi.new("int*")
         self.shadow_texture_slot_ptr[0] = 10
         self.environment_texture_slot_ptr[0] = 11
         self.irradiance_texture_slot_ptr[0] = 12
@@ -1036,6 +1039,7 @@ class GenoView:
             self.shader_locs["lighting_prefilter_max_lod"] = GetShaderLocation(self.shaders["lighting"], b"prefilterMaxLod")
             self.shader_locs["lighting_ibl_strength"] = GetShaderLocation(self.shaders["lighting"], b"iblStrength")
             self.shader_locs["lighting_use_ibl"] = GetShaderLocation(self.shaders["lighting"], b"useIBL")
+            self.shader_locs["lighting_white_background"] = GetShaderLocation(self.shaders["lighting"], b"whiteBackground")
             self.shader_locs["lighting_debug_mode"] = GetShaderLocation(self.shaders["lighting"], b"debugMode")
             self.shader_locs["lighting_shadow_texel_size"] = GetShaderLocation(self.shaders["lighting"], b"shadowTexelSize")
 
@@ -1043,7 +1047,9 @@ class GenoView:
             self.shader_locs["tonemap_input_texture"] = GetShaderLocation(self.shaders["tonemap"], b"inputTexture")
             self.shader_locs["tonemap_exposure"] = GetShaderLocation(self.shaders["tonemap"], b"exposure")
             self.shader_locs["tonemap_tone_curve"] = GetShaderLocation(self.shaders["tonemap"], b"toneCurve")
+            self.shader_locs["tonemap_white_background"] = GetShaderLocation(self.shaders["tonemap"], b"whiteBackground")
             self.tone_curve_ptr[0] = TONE_CURVES.index(self.tone_curve)
+            self.white_background_ptr[0] = int(self.white_background)
             self.shader_locs["debug_gbuffer_color"] = GetShaderLocation(self.shaders["debug"], b"texGbufferColor")
             self.shader_locs["debug_gbuffer_normal"] = GetShaderLocation(self.shaders["debug"], b"texGbufferNormal")
             self.shader_locs["debug_gbuffer_depth"] = GetShaderLocation(self.shaders["debug"], b"texGbufferDepth")
@@ -1474,6 +1480,7 @@ class GenoViewCompare(GenoView):
         sun_strength: float | None = None,
         tone_curve: str = "aces",
         scene_mode: str = "character",
+        white_background: bool = False,
         rig: RigSpec = GENO_RIG,
     ):
         super().__init__(
@@ -1502,6 +1509,7 @@ class GenoViewCompare(GenoView):
             sun_strength=sun_strength,
             tone_curve=tone_curve,
             scene_mode=scene_mode,
+            white_background=white_background,
         )
 
 
@@ -1529,6 +1537,7 @@ def main():
     parser.add_argument("--roughness", type=float, default=0.58)
     parser.add_argument("--exposure", type=float, default=0.9)
     parser.add_argument("--tone-curve", choices=TONE_CURVES, default="aces", help="Tone mapping curve for the PBR path (aces | reinhard | agx).")
+    parser.add_argument("--white-background", action="store_true", help="Flat pure-white background (paper figure mode); bypasses sky and tone curve on background pixels.")
     parser.add_argument("--scene", choices=SCENE_MODES, default="character", help="character: motion viewer scene; grid: 5x5 metallic/roughness material test grid.")
     parser.add_argument("--sun-strength", type=float, default=None, help="Direct light intensity. Defaults to the per-shading light rig value (PBR: 0.55, legacy: 0.25).")
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
@@ -1585,6 +1594,7 @@ def main():
         sun_strength=args.sun_strength,
         tone_curve=args.tone_curve,
         scene_mode=args.scene,
+        white_background=args.white_background,
     )
     viewer.run()
 

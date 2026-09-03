@@ -584,6 +584,10 @@ raylib 的 `SetShaderValueTexture` 以 `texture.id` 作为采样器 unit 键值�
 
 从 legacy 迁移时沿用的灯光参数（sunStrength=0.25、ambientStrength=1.0、灰白 sun/sky 等）在 Cook-Torrance + IBL 路径下形成环境光主导的平淡画面：角色背光/受光线性比 ≈0.43，远高于真实室外晴天（约 0.15-0.25），且缺少暖阳光/冷天光的色温对比。处理：viewer 按 shading 模式选择灯光 rig（`LEGACY_LIGHT_RIG` 完整冻结 GenoViewPython 数值；`PBR_LIGHT_RIG` 重调）：sun 0.55、暖阳光 `(255,240,214)`、光向 `(0.45,-0.8,-0.35)`（仰角约 55°，拉长投影）、sky fallback `(150,180,220)`、fallback 权重 ambient/sky/ground = 0.15/0.35/0.25、地面反照率 `(215,215,215)`（浅灰白整体色调，同日微调；渲染后约 0.72 显示亮度，低于背景 0.89 保持层次）；IBL environment/irradiance/prefilter 色盘重调为"冷天顶、暗地面"结构。`--sun-strength` 作为直接光强的 CLI 覆盖（缺省取当前模式的 rig 值）。设计落点：白反照率上直接:间接 ≈3.5:1，角色背光/受光线性比 ≈0.2，曝光 0.9 下受光白不削波（ACES 后 ≈0.81 sRGB）。
 
+### 20.8 白背景哨兵（2026-09-03）
+
+论文图像可视化需要天空背景为精确纯白（255,255,255），且不能影响角色 PBR 光照（往环境贴图塞白天气会污染 IBL）。方案：`--white-background`（或 `white_background=True`）下，pbrLighting.fs 的背景分支输出哨兵辐射度 `BACKGROUND_SENTINEL=6e4`，tonemap.fs 检测 `hdr.r > 3e4` 时绕过 exposure 与 tone curve 直接输出显示白，因此任意 tone curve（aces/reinhard/agx）下背景都是精确 255；debug 显示 pass 的背景分支同步改为白底。两个实现约束记录在案：(1) lighting 全屏 quad 实际运行在 `(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)` 混合下——`rlDisableColorBlend` 在 raylib 5.5 的批次刷新时不生效——因此背景标记必须带 alpha=1 完整替换 clear 色，不能依赖 alpha 通道语义；(2) RGBA16F 存储为半精度（上限 65504），哨兵不能超出该范围，6e4 与场景辐射度（≤ ~1.3）相距四个数量级，误检风险可忽略。关闭该开关时逐像素与原输出一致（已验证）。
+
 ## 20. 完成定义
 
 当 Phase 1 完成并满足以下条件时，称为“PBR 管线结构修订完成”：

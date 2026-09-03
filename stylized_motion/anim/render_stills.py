@@ -76,6 +76,7 @@ def render_still(args: argparse.Namespace) -> Path:
         sun_strength=args.sun_strength,
         tone_curve=args.tone_curve,
         scene_mode=args.scene,
+        white_background=args.white_background,
         rig=rig,
     )
 
@@ -166,6 +167,7 @@ def main():
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
     parser.add_argument("--ibl-strength", type=float, default=0.22)
     parser.add_argument("--tone-curve", choices=TONE_CURVES, default="aces")
+    parser.add_argument("--white-background", action="store_true", help="Flat pure-white background (paper figure mode).")
     parser.add_argument("--scene", choices=SCENE_MODES, default="character")
     parser.add_argument("--normal-map", type=Path, default=None)
     parser.add_argument("--metallic-roughness-map", type=Path, default=None)
