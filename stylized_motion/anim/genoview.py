@@ -88,11 +88,7 @@ PBR_LIGHT_RIG = {
     "light_dir": (0.45, -0.8, -0.35),
     "sun_color": (1.0, 240.0 / 255.0, 214.0 / 255.0),
     "sky_color": (170.0 / 255.0, 195.0 / 255.0, 228.0 / 255.0),
-    # Sun scaled for the unclamped sky: the RGBA16F dome now delivers ~4.0
-    # linear blue at the horizon (was clipped to 1.0), so 0.55 left the floor
-    # dominated by blue skylight. 1.3 restores a warm-dominant ground without
-    # clipping the character (lit side lands ~235 sRGB).
-    "sun_strength": 1.3,
+    "sun_strength": 0.55,
     "sky_strength": 0.35,
     "ground_strength": 0.25,
     "ambient_strength": 0.15,

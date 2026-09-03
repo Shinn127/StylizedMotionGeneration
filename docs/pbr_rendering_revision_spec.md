@@ -588,14 +588,6 @@ raylib 的 `SetShaderValueTexture` 以 `texture.id` 作为采样器 unit 键值�
 
 论文图像可视化需要天空背景为精确纯白（255,255,255），且不能影响角色 PBR 光照（往环境贴图塞白天气会污染 IBL）。方案：`--white-background`（或 `white_background=True`）下，pbrLighting.fs 的背景分支输出哨兵辐射度 `BACKGROUND_SENTINEL=6e4`，tonemap.fs 检测 `hdr.r > 3e4` 时绕过 exposure 与 tone curve 直接输出显示白，因此任意 tone curve（aces/reinhard/agx）下背景都是精确 255；debug 显示 pass 的背景分支同步改为白底。两个实现约束记录在案：(1) lighting 全屏 quad 实际运行在 `(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)` 混合下——`rlDisableColorBlend` 在 raylib 5.5 的批次刷新时不生效——因此背景标记必须带 alpha=1 完整替换 clear 色，不能依赖 alpha 通道语义；(2) RGBA16F 存储为半精度（上限 65504），哨兵不能超出该范围，6e4 与场景辐射度（≤ ~1.3）相距四个数量级，误检风险可忽略。关闭该开关时逐像素与原输出一致（已验证）。
 
-### 20.9 天空辐射度色盘与 cubemap 存储（2026-09-03）
-
-默认天空"发灰"有两层根因。第一层是存储：environment/irradiance/prefilter 三张 cubemap 经 `_array_to_cubemap_mipped` 上传时按 RGBA8 量化且 clip 到 0-1，所有 linear >1 的天空辐射度被拍平成 1.0——背景与 IBL 实际看到的不是设计的天穹，而是一张被削平的中性白 dome。修复：上传格式改为 `PIXELFORMAT_UNCOMPRESSED_R16G16B16A16`（半精度浮点，raw-data 指针路径按 face-major 连续写入，正确处理 8 字节/像素；经显式槽绑定探针验证 0.3/0.9/4.0 原样采样），线性辐射度原样入纹理。
-
-第二层是几何：viewer 的地板是 20×20 有限平面，相机高 0.75 时地板远缘的俯角约 4.3°，因此画面里所有"天空"背景像素的 viewDir 实际朝下 0..-4.3°，采样到穹顶的地面半区——地面半区若是中性"地面反弹色"，整个背景就呈灰色。修复：穹顶地面半区同样使用冷蓝色调 `(0.5,1.4,3.2)`（略暗于地平线），物理上对应远处地平线雾霭。
-
-色盘最终落点（保证 ACES toe 之后仍明亮且蓝）：天顶 `(0.3,0.9,4.0)`、地平线 `(0.55,1.6,3.6)`、地面半区 `(0.5,1.4,3.2)`。蓝天辐照增强后太阳相对变弱（地板一度被天光染蓝 B-R +31），`PBR_LIGHT_RIG.sun_strength` 从 0.55 上调至 1.3 恢复暖阳主导。渲染落点：天空显示 ~(200,237,249)、B-R +49，地板中性 (216,218,229) B-R +12，角色受光面饱和橙（更贴近材质本色）、阴影带冷调，高光无削波；`--white-background` 不受影响。IBL 磁盘缓存按天空内容 hash 键控，色盘变更自动失效重建。
-
 ## 20. 完成定义
 
 当 Phase 1 完成并满足以下条件时，称为“PBR 管线结构修订完成”：
