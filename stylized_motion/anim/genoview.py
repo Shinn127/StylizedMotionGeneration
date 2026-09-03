@@ -96,6 +96,26 @@ PBR_LIGHT_RIG = {
 }
 
 
+def kelvin_to_rgb(kelvin: float) -> tuple[float, float, float]:
+    """Blackbody color temperature (1000K-40000K) -> linear-ish RGB 0-1.
+
+    Tanner Helland's approximation, normalized so the maximum channel is 1.0.
+    Returns sRGB-space components; callers feed them through the same
+    SRGBToLinear path as the rig colors.
+    """
+    k = float(np.clip(kelvin, 1000.0, 40000.0)) / 100.0
+    if k <= 66.0:
+        red = 255.0
+        green = 99.4708025861 * np.log(k) - 161.1195681661
+        blue = 0.0 if k <= 19.0 else 138.5177312231 * np.log(k - 10.0) - 305.0447927307
+    else:
+        red = 329.698727446 * ((k - 60.0) ** -0.1332047592)
+        green = 288.1221695283 * ((k - 60.0) ** -0.0755148492)
+        blue = 255.0
+    rgb = np.clip((red, green, blue), 0.0, 255.0) / 255.0
+    return tuple(rgb / rgb.max())
+
+
 @dataclass(frozen=True)
 class RigSpec:
     """Character assets and skeleton conventions used by the viewer.
@@ -714,6 +734,8 @@ class GenoView:
         normal_map: Path | None = None,
         metallic_roughness_map: Path | None = None,
         sun_strength: float | None = None,
+        sun_temperature: float | None = None,
+        sky_temperature: float | None = None,
         tone_curve: str = "aces",
         scene_mode: str = "character",
         white_background: bool = False,
@@ -814,8 +836,18 @@ class GenoView:
         # Legacy keeps its frozen GenoViewPython rig; PBR uses the retuned one.
         self.light_rig = PBR_LIGHT_RIG if shading == "pbr" else LEGACY_LIGHT_RIG
         self.light_dir = Vector3Normalize(Vector3(*self.light_rig["light_dir"]))
-        self.sun_color = Vector3(*self.light_rig["sun_color"])
-        self.sky_color = Vector3(*self.light_rig["sky_color"])
+        # Explicit Kelvin temperatures override the rig's baked-in colors so
+        # the warm/cool balance is tunable without touching the rig dicts.
+        self.sun_color = (
+            Vector3(*kelvin_to_rgb(sun_temperature))
+            if sun_temperature is not None
+            else Vector3(*self.light_rig["sun_color"])
+        )
+        self.sky_color = (
+            Vector3(*kelvin_to_rgb(sky_temperature))
+            if sky_temperature is not None
+            else Vector3(*self.light_rig["sky_color"])
+        )
         self.sun_strength = float(sun_strength) if sun_strength is not None else float(self.light_rig["sun_strength"])
         self.default_material = Material(metallic=self.metallic, roughness=self.roughness)
         self.scene = Scene(
@@ -1478,6 +1510,8 @@ class GenoViewCompare(GenoView):
         normal_map: Path | None = None,
         metallic_roughness_map: Path | None = None,
         sun_strength: float | None = None,
+        sun_temperature: float | None = None,
+        sky_temperature: float | None = None,
         tone_curve: str = "aces",
         scene_mode: str = "character",
         white_background: bool = False,
@@ -1507,6 +1541,8 @@ class GenoViewCompare(GenoView):
             normal_map=normal_map,
             metallic_roughness_map=metallic_roughness_map,
             sun_strength=sun_strength,
+            sun_temperature=sun_temperature,
+            sky_temperature=sky_temperature,
             tone_curve=tone_curve,
             scene_mode=scene_mode,
             white_background=white_background,
@@ -1540,6 +1576,8 @@ def main():
     parser.add_argument("--white-background", action="store_true", help="Flat pure-white background (paper figure mode); bypasses sky and tone curve on background pixels.")
     parser.add_argument("--scene", choices=SCENE_MODES, default="character", help="character: motion viewer scene; grid: 5x5 metallic/roughness material test grid.")
     parser.add_argument("--sun-strength", type=float, default=None, help="Direct light intensity. Defaults to the per-shading light rig value (PBR: 0.55, legacy: 0.25).")
+    parser.add_argument("--sun-temperature", type=float, default=None, metavar="K", help="Direct light color temperature in Kelvin (1500-20000). Overrides the rig's baked-in sun color.")
+    parser.add_argument("--sky-temperature", type=float, default=None, metavar="K", help="Ambient/sky color temperature in Kelvin (1500-20000). Overrides the rig's baked-in sky color.")
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
     parser.add_argument("--ibl-strength", type=float, default=0.22)
     parser.add_argument("--disable-ibl", action="store_true")
@@ -1592,6 +1630,8 @@ def main():
         normal_map=args.normal_map,
         metallic_roughness_map=args.metallic_roughness_map,
         sun_strength=args.sun_strength,
+        sun_temperature=args.sun_temperature,
+        sky_temperature=args.sky_temperature,
         tone_curve=args.tone_curve,
         scene_mode=args.scene,
         white_background=args.white_background,

@@ -76,6 +76,8 @@ def main():
     parser.add_argument("--normal-map", type=Path, default=None, help="Optional tangent-space normal map applied to the character's default material.")
     parser.add_argument("--metallic-roughness-map", type=Path, default=None, help="Optional linear map (R=metallic, G=roughness, B=AO) applied to the character's default material.")
     parser.add_argument("--sun-strength", type=float, default=None, help="Direct light intensity. Defaults to the per-shading light rig value (PBR: 0.55, legacy: 0.25).")
+    parser.add_argument("--sun-temperature", type=float, default=None, metavar="K", help="Direct light color temperature in Kelvin (1500-20000).")
+    parser.add_argument("--sky-temperature", type=float, default=None, metavar="K", help="Ambient/sky color temperature in Kelvin (1500-20000).")
     args = parser.parse_args()
 
     selected_inputs = [args.database is not None, args.bvh is not None, args.features is not None]
@@ -120,6 +122,8 @@ def main():
         normal_map=args.normal_map,
         metallic_roughness_map=args.metallic_roughness_map,
         sun_strength=args.sun_strength,
+        sun_temperature=args.sun_temperature,
+        sky_temperature=args.sky_temperature,
         tone_curve=args.tone_curve,
         scene_mode=args.scene,
         white_background=args.white_background,

@@ -74,6 +74,8 @@ def render_still(args: argparse.Namespace) -> Path:
         normal_map=args.normal_map,
         metallic_roughness_map=args.metallic_roughness_map,
         sun_strength=args.sun_strength,
+        sun_temperature=args.sun_temperature,
+        sky_temperature=args.sky_temperature,
         tone_curve=args.tone_curve,
         scene_mode=args.scene,
         white_background=args.white_background,
@@ -164,6 +166,8 @@ def main():
     parser.add_argument("--roughness", type=float, default=0.58)
     parser.add_argument("--exposure", type=float, default=0.9)
     parser.add_argument("--sun-strength", type=float, default=None)
+    parser.add_argument("--sun-temperature", type=float, default=None, metavar="K")
+    parser.add_argument("--sky-temperature", type=float, default=None, metavar="K")
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
     parser.add_argument("--ibl-strength", type=float, default=0.22)
     parser.add_argument("--tone-curve", choices=TONE_CURVES, default="aces")
