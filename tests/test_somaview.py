@@ -48,11 +48,9 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         assert "texture(materialAO, fragTexCoord).r" in pbr_lighting
         assert "uniform float prefilterMaxLod" in pbr_lighting
         assert "textureLod(prefilterMap" in pbr_lighting
-        # PCSS-lite shadows (3x3 core + standoff-widened ring) and the sky
-        # background
+        # 3x3 PCF shadow sampling and the procedural sky background
         assert "uniform vec2 shadowTexelSize" in pbr_lighting
-        assert "blockerCount" in pbr_lighting
-        assert "standoff" in pbr_lighting
+        assert "shadow / 9.0" in pbr_lighting
         # Sky background samples linear-radiance environment data directly.
         assert "textureLod(environmentMap, viewDir, 0.0)" in pbr_lighting
         assert "SRGBToLinear(textureLod(prefilterMap" not in pbr_lighting

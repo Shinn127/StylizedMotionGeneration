@@ -92,41 +92,16 @@ float ShadowFactor(vec3 position, vec3 normal)
         lightPosition.z > 0.0 && lightPosition.z < 1.0;
     if (!inside) { return 1.0; }
     float receiverDepth = LinearDepth(lightPosition.z, lightClipNear, lightClipFar);
-    // PCSS-lite: average blocker depth over the 3x3 taps; when a blocker
-    // stands off the receiver, add a wider ring so the penumbra widens with
-    // distance. Near the contact the 3x3 core keeps the edge hard; the depth
+    // 3x3 percentage-closer filtering over the shadow map; the constant depth
     // bias stays per-sample and shadow never routes through the SSAO blur.
-    float blockerSum = 0.0;
-    float blockerCount = 0.0;
     float shadow = 0.0;
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
             float blockerDepth = texture(shadowMap, lightPosition.xy + vec2(x, y) * shadowTexelSize).r;
-            float occluded = float(receiverDepth - 0.000005 > blockerDepth);
-            shadow += 1.0 - occluded;
-            blockerSum += blockerDepth * occluded;
-            blockerCount += occluded;
+            shadow += 1.0 - float(receiverDepth - 0.000005 > blockerDepth);
         }
     }
-    if (blockerCount > 0.0) {
-        float standoff = receiverDepth - blockerSum / blockerCount;
-        // Wider taps use a bias proportional to their spacing (integer grid,
-        // depth slope makes far texels differ more than the center tap).
-        float wideBias = 0.000005 + standoff * 0.02;
-        float wide = 0.0;
-        for (int y = -2; y <= 2; ++y) {
-            for (int x = -2; x <= 2; ++x) {
-                if (x == 0 && y == 0) { continue; }
-                float blockerDepth = texture(shadowMap, lightPosition.xy + vec2(x, y) * 2.0 * shadowTexelSize).r;
-                wide += 1.0 - float(receiverDepth - wideBias > blockerDepth);
-            }
-        }
-        // Blend: near the contact the 3x3 core dominates; further away the
-        // wide ring takes over.
-        float wideWeight = clamp(standoff * 40.0, 0.0, 1.0);
-        shadow = mix(shadow / 9.0, wide / 24.0, wideWeight);
-    }
-    return shadow;
+    return shadow / 9.0;
 }
 
 void main()
@@ -182,22 +157,11 @@ void main()
     float geometry = GeometrySmith(nDotV, nDotL, roughness);
     vec3 fresnel = FresnelSchlick(vDotH, f0);
     vec3 specular = distribution * geometry * fresnel / max(4.0 * nDotV * nDotL, 1e-4);
-    // Grazing guard: at nDotV -> 0 the GGX + Fresnel-1 combination blows past
-    // the display range (screen-space white sheen band). Physically real, but
-    // on an sRGB monitor it reads as clipping; damp only the extreme band.
-    specular *= smoothstep(0.04, 0.18, nDotV);
     vec3 diffuse = (1.0 - fresnel) * (1.0 - metallic) * albedo / PI;
 
     vec3 sunRadiance = SRGBToLinear(sunColor) * (sunStrength * PI);
     float shadow = ShadowFactor(position, normal);
     vec3 direct = (diffuse + specular) * sunRadiance * nDotL * shadow;
-    // Display clamp: the sun-behind-camera mirror band drives the ground's
-    // GGX+Fresnel past the sRGB range into a flat clipped sheet. The ground
-    // runs roughness >= 0.85 (pbr.fs adds 0.27 for pattern cells); cap its
-    // direct radiance so the band reads as sheen. Rougher surfaces clamp
-    // tighter; the character keeps its full dynamic range.
-    float clampLevel = mix(1.55, 0.50, smoothstep(0.58, 0.85, roughness));
-    direct = min(direct, vec3(clampLevel));
 
     vec3 skyRadiance = SRGBToLinear(skyColor);
     float skyFactor = max(normal.y, 0.0);

@@ -201,7 +201,6 @@ class Renderer:
             view.shadow_texel_size.x = 1.0 / float(view.shadow_map.depth.width)
             view.shadow_texel_size.y = 1.0 / float(view.shadow_map.depth.height)
             SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_shadow_texel_size"], ffi.addressof(view.shadow_texel_size), SHADER_UNIFORM_VEC2)
-            SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_light_size"], view.light_size_ptr, SHADER_UNIFORM_FLOAT)
         ClearBackground(RAYWHITE)
         DrawTextureRec(view.gbuffer.color, Rectangle(0, 0, view.gbuffer.color.width, -view.gbuffer.color.height), Vector2(0, 0), WHITE)
         EndShaderMode()

@@ -46,19 +46,13 @@ def _procedural_sky_array(face_size: int = 32) -> np.ndarray:
 
     Values are linear radiance (not display sRGB), consumed as-is by the
     lighting pass — the background and the IBL terms must agree on that
-    contract. Calibrated by inverting the display chain (exposure 0.9 ->
-    ACES -> sRGB) on real-outdoor anchors (spec 20.10): a near-neutral
-    white-blue dome (zenith -> mid) keeps the cosine-weighted irradiance
-    only mildly cool, while a saturated blue ring rides the horizon — the
-    narrow band the camera actually sees (the finite floor plane means
-    background pixels look up to ~4.3 deg below true horizon, so the ring
-    also extends below it). Ground half is dim neutral.
+    contract. Bright blue zenith (~HDR, B>1) into a pale warm horizon with a
+    darker neutral ground bounce.
     """
 
-    zenith = np.array([0.40, 0.55, 0.72], dtype=np.float32)
-    mid = np.array([0.55, 0.66, 0.80], dtype=np.float32)
-    ring = np.array([0.50, 0.90, 1.60], dtype=np.float32)
-    ground = np.array([0.30, 0.34, 0.40], dtype=np.float32)
+    zenith = np.array([0.58, 0.74, 1.32], dtype=np.float32)
+    horizon = np.array([0.92, 0.96, 1.06], dtype=np.float32)
+    ground = np.array([0.42, 0.43, 0.46], dtype=np.float32)
     faces = np.empty((6, face_size, face_size, 3), dtype=np.float32)
     for face in range(6):
         ys, xs = np.mgrid[0:face_size, 0:face_size]
@@ -67,13 +61,10 @@ def _procedural_sky_array(face_size: int = 32) -> np.ndarray:
         right, up, forward = (np.asarray(axis, dtype=np.float32) for axis in _FACE_AXES[face])
         d = right[None, None] * u[..., None] + up[None, None] * v[..., None] + forward
         d = d / np.linalg.norm(d, axis=-1, keepdims=True)
-        height = d[..., 1][..., None]
-        height = np.clip(height, -1.0, 1.0)
-        ring_weight = np.exp(-(height / 0.12) ** 2)
-        base = mid + (zenith - mid) * np.clip(height, 0.0, 1.0)
-        col = base * (1.0 - ring_weight) + ring * ring_weight
-        below = ground * (1.0 - np.exp(-(-height / 0.10) ** 4)) + ring * np.exp(-(-height / 0.10) ** 2)
-        faces[face] = np.where(height < 0, below, col).astype(np.float32)
+        height = d[..., 1]
+        sky_mix = np.clip(height, 0.0, 1.0)[..., None]
+        ground_mix = np.clip(-height, 0.0, 1.0)[..., None]
+        faces[face] = horizon * (1.0 - sky_mix) * (1.0 - ground_mix) + zenith * sky_mix + ground * ground_mix
     return faces
 
 
