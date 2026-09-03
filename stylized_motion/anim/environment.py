@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import pi, sqrt
+from pathlib import Path
 
 import cffi
 import numpy as np
@@ -43,13 +44,14 @@ _FACE_AXES = (
 def _procedural_sky_array(face_size: int = 32) -> np.ndarray:
     """Source environment for the IBL chain: a smooth sky-gradient dome.
 
-    Cool blue zenith fading to a pale horizon and a darker neutral ground,
-    matching the retuned PBR light rig's temperature story.
+    Bright blue zenith into a pale warm-lit horizon, with a darker warm-gray
+    ground bounce. The strong vertical luminance gradient and the cool-vs-warm
+    split give diffuse IBL the temperature contrast the direct sun sets up.
     """
 
-    zenith = np.array([0.42, 0.55, 0.78], dtype=np.float32)
-    horizon = np.array([0.66, 0.72, 0.79], dtype=np.float32)
-    ground = np.array([0.36, 0.38, 0.40], dtype=np.float32)
+    zenith = np.array([0.52, 0.68, 0.95], dtype=np.float32)
+    horizon = np.array([0.86, 0.89, 0.94], dtype=np.float32)
+    ground = np.array([0.42, 0.43, 0.45], dtype=np.float32)
     faces = np.empty((6, face_size, face_size, 3), dtype=np.float32)
     for face in range(6):
         ys, xs = np.mgrid[0:face_size, 0:face_size]
@@ -323,6 +325,40 @@ def _integrate_brdf_lut(size: int = 128, samples: int = 128) -> Image:
     return image
 
 
+def _ibl_cache_path(sky: np.ndarray) -> Path:
+    """Cache file path keyed by the source sky content and generator version."""
+    import hashlib
+    import os
+
+    digest = hashlib.sha256(np.ascontiguousarray(sky).tobytes()).hexdigest()[:16]
+    base = os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")
+    cache_dir = Path(base) / "stylized_motion" / "ibl"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"procedural_sky_{digest}_v2.npz"
+
+
+def _load_or_build_ibl_arrays(sky: np.ndarray) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Disk cache around the irradiance + prefilter CPU integration."""
+    cache_path = _ibl_cache_path(sky)
+    if cache_path.exists():
+        try:
+            with np.load(cache_path) as data:
+                irradiance = data["irradiance"]
+                levels = [data[f"level_{i}"] for i in range(int(data["level_count"]))]
+            return irradiance, levels
+        except Exception:
+            pass  # Corrupt cache: rebuild below.
+    irradiance = _convolve_irradiance(sky, sky.shape[1], output_size=16)
+    levels = _prefilter_environment(sky, sky.shape[1], output_size=32, mips=6)
+    try:
+        payload = {"irradiance": irradiance, "level_count": len(levels)}
+        payload.update({f"level_{i}": level for i, level in enumerate(levels)})
+        np.savez(cache_path, **payload)
+    except Exception:
+        pass  # Cache write is best-effort; the textures are already built.
+    return irradiance, levels
+
+
 @dataclass
 class IBLResources:
     """One viewer's environment, irradiance, prefilter and BRDF resources."""
@@ -338,13 +374,13 @@ class IBLResources:
     def initialize(self) -> "IBLResources":
         # Full split-sum chain from one procedural sky: environment cubemap,
         # cosine-convolved irradiance, GGX importance-sampled prefilter mips,
-        # and the CPU-integrated BRDF LUT. All CPU work is one-off init cost.
+        # and the CPU-integrated BRDF LUT. The face arrays are cached on disk
+        # keyed by the source sky, so repeat startups skip the CPU integration.
         sky = _procedural_sky_array(32)
+        irradiance_faces, prefilter_faces = _load_or_build_ibl_arrays(sky)
         self.environment = _array_to_cubemap(sky)
         GenTextureMipmaps(ffi.addressof(self.environment))
-        irradiance_faces = _convolve_irradiance(sky, 32, output_size=16)
         self.irradiance = _array_to_cubemap(irradiance_faces)
-        prefilter_faces = _prefilter_environment(sky, 32, output_size=32, mips=6)
         # One cubemap whose mip chain *is* the roughness sequence, so the
         # shader's textureLod(prefilterMap, r, roughness * maxLod) samples
         # exact importance-sampled levels instead of box-filtered mips.

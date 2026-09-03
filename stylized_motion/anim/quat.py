@@ -1,5 +1,18 @@
 import numpy as np
-import torch
+
+# torch is only needed by the torch_* functions consumed by the training
+# losses. Importing it lazily keeps the viewer's startup (~0.4s of import
+# time) free of a dependency it never exercises.
+torch = None
+
+
+def _torch():
+    global torch
+    if torch is None:
+        import torch as _torch_module
+
+        torch = _torch_module
+    return torch
 
 
 def _fast_cross(a, b):
@@ -312,7 +325,7 @@ def nlerp_shortest(x, y, a):
 
 
 def torch_fast_cross(a, b):
-    return torch.cat(
+    return _torch().cat(
         [
             a[..., 1:2] * b[..., 2:3] - a[..., 2:3] * b[..., 1:2],
             a[..., 2:3] * b[..., 0:1] - a[..., 0:1] * b[..., 2:3],
@@ -323,7 +336,7 @@ def torch_fast_cross(a, b):
 
 
 def torch_length(x):
-    return torch.sqrt(torch.sum(x * x, dim=-1))
+    return _torch().sqrt(_torch().sum(x * x, dim=-1))
 
 
 def torch_normalize(x, eps=1e-8):
@@ -339,7 +352,7 @@ def torch_mul(x, y):
     x0, x1, x2, x3 = x[..., 0:1], x[..., 1:2], x[..., 2:3], x[..., 3:4]
     y0, y1, y2, y3 = y[..., 0:1], y[..., 1:2], y[..., 2:3], y[..., 3:4]
 
-    return torch.cat(
+    return _torch().cat(
         [
             y0 * x0 - y1 * x1 - y2 * x2 - y3 * x3,
             y0 * x1 + y1 * x0 - y2 * x3 + y3 * x2,
@@ -360,11 +373,11 @@ def torch_inv_mul_vec(q, x):
 
 
 def torch_exp(x, eps=1e-5):
-    halfangle = torch.sqrt(torch.sum(x * x, dim=-1, keepdim=True))
-    c = torch.where(halfangle < eps, torch.ones_like(halfangle), torch.cos(halfangle))
-    sinc = torch.sinc(halfangle / torch.pi)
-    s = torch.where(halfangle < eps, torch.ones_like(halfangle), sinc)
-    return torch.cat([c, s * x], dim=-1)
+    halfangle = _torch().sqrt(_torch().sum(x * x, dim=-1, keepdim=True))
+    c = _torch().where(halfangle < eps, _torch().ones_like(halfangle), _torch().cos(halfangle))
+    sinc = _torch().sinc(halfangle / _torch().pi)
+    s = _torch().where(halfangle < eps, _torch().ones_like(halfangle), sinc)
+    return _torch().cat([c, s * x], dim=-1)
 
 
 def torch_from_scaled_angle_axis(x, eps=1e-5):
@@ -374,6 +387,6 @@ def torch_from_scaled_angle_axis(x, eps=1e-5):
 def torch_quat_angle(x, y, eps=1e-8):
     q_err = torch_mul(x, torch_inv(y))
     q_err = torch_normalize(q_err, eps=eps)
-    xyz_norm = torch.linalg.vector_norm(q_err[..., 1:], dim=-1)
-    w_abs = torch.abs(q_err[..., 0])
-    return 2.0 * torch.atan2(xyz_norm, w_abs.clamp_min(eps))
+    xyz_norm = _torch().linalg.vector_norm(q_err[..., 1:], dim=-1)
+    w_abs = _torch().abs(q_err[..., 0])
+    return 2.0 * _torch().atan2(xyz_norm, w_abs.clamp_min(eps))

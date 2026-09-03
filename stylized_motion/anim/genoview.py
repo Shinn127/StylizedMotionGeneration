@@ -9,7 +9,6 @@ from pathlib import Path
 
 import cffi
 import numpy as np
-import torch
 from pyray import BoneInfo, Camera3D, Color, Matrix, Mesh, Model, Rectangle, Transform, Vector2, Vector3, Vector4, take_screenshot
 from raylib import *
 from raylib.defines import *
@@ -88,7 +87,7 @@ LEGACY_LIGHT_RIG = {
 PBR_LIGHT_RIG = {
     "light_dir": (0.45, -0.8, -0.35),
     "sun_color": (1.0, 240.0 / 255.0, 214.0 / 255.0),
-    "sky_color": (150.0 / 255.0, 180.0 / 255.0, 220.0 / 255.0),
+    "sky_color": (170.0 / 255.0, 195.0 / 255.0, 228.0 / 255.0),
     "sun_strength": 0.55,
     "sky_strength": 0.35,
     "ground_strength": 0.25,
@@ -500,6 +499,8 @@ def load_feature_stats(stats_source: Path):
             store.close()
     if stats_source.suffix != ".pt":
         raise ValueError("stats_source must be a schema-v3 feature database or checkpoint .pt")
+    import torch
+
     checkpoint = torch.load(stats_source, map_location="cpu", weights_only=False)
     if "feature_stats" not in checkpoint:
         raise KeyError(f"Checkpoint {stats_source} does not contain feature_stats")
