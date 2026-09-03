@@ -273,11 +273,20 @@ class PlaybackController:
 
         # Bottom control bar: readout above a padded timeline track.
         bar_top = int(rect.y) - 30
-        DrawRectangle(int(rect.x) - 8, bar_top, int(rect.width) + 16, int(rect.height) + 38, Color(24, 26, 30, 165))
-        DrawText(readout.encode(), int(rect.x), bar_top + 6, 16, Color(225, 229, 235, 255))
-        DrawRectangle(int(rect.x), int(rect.y), int(rect.width), int(rect.height), Color(52, 58, 66, 200))
-        DrawRectangle(int(rect.x), int(rect.y), fill_width, int(rect.height), Color(64, 140, 250, 235))
-        DrawCircle(knob_x, int(rect.y + rect.height * 0.5), 8.0, Color(235, 238, 242, 255))
+        DrawRectangleRounded(
+            Rectangle(int(rect.x) - 8, bar_top, int(rect.width) + 16, int(rect.height) + 40),
+            0.22, 8, Color(16, 19, 24, 195),
+        )
+        readout_color = Color(238, 241, 246, 255)
+        readout_shadow = Color(10, 12, 16, 190)
+        DrawText(readout.encode(), int(rect.x) + 1, bar_top + 8, 16, readout_shadow)
+        DrawText(readout.encode(), int(rect.x), bar_top + 7, 16, readout_color)
+        DrawRectangleRounded(rect, 0.5, 6, Color(58, 66, 76, 215))
+        DrawRectangleRounded(
+            Rectangle(int(rect.x), int(rect.y), fill_width, int(rect.height)),
+            0.5, 6, Color(74, 148, 255, 240),
+        )
+        DrawCircle(knob_x, int(rect.y + rect.height * 0.5), 8.0, Color(245, 247, 250, 255))
 
 
 def file_read(out, size, f):
@@ -1181,17 +1190,27 @@ class GenoView:
     def _draw_hud(self, screen_width: int, screen_height: int) -> None:
         """Grouped HUD: info panel top-left, camera hint bottom-right.
 
-        Drawn last (over the 3D output) with translucent panels so text stays
-        readable on the bright scene without blocking the view.
+        Drawn last (over the 3D output). Panels are a translucent deep slate
+        (not black), text carries a soft offset shadow so it stays readable
+        on both bright and dark scene regions.
         """
-        panel = Color(24, 26, 30, 150)
-        title_color = Color(140, 148, 158, 255)
-        value_color = Color(232, 235, 240, 255)
-        accent_color = Color(120, 180, 255, 255)
+        panel = Color(16, 19, 24, 195)
+        shadow_color = Color(10, 12, 16, 190)
+        muted_color = Color(222, 228, 236, 255)
+        value_color = Color(248, 250, 252, 255)
+        accent_color = Color(140, 200, 255, 255)
+        roundness = 0.28
+
+        def draw_text_shadow(text, x, y, size, color):
+            DrawText(text, x + 1, y + 1, size, shadow_color)
+            DrawText(text, x, y, size, color)
+
+        def draw_panel(x, y, w, h):
+            DrawRectangleRounded(Rectangle(x, y, w, h), roundness, 8, panel)
 
         margin = 16
-        line_height = 22
-        panel_width = 300
+        line_height = 24
+        panel_width = 310
 
         # --- Status panel (top-left): playback, then mode-specific rows. ---
         rows: list[tuple[bytes, Color]] = []
@@ -1206,36 +1225,37 @@ class GenoView:
             rig_mode = "pruned->full" if self.use_pruned_reconstruction else "full direct"
             rows.append((f"Pose: {rig_mode}".encode(), value_color))
             if self.compare_mode:
-                rows.append((f"L {self.left_label}  |  R {self.right_label}".encode(), Color(120, 160, 250, 255)))
+                rows.append((f"L {self.left_label}  |  R {self.right_label}".encode(), accent_color))
             if self.indices is not None:
                 mirror = "yes" if bool(self.sample_mirror[self.sample_index]) else "no"
                 rows.append((f"Sample {self.sample_index}  |  mirror {mirror}".encode(), value_color))
 
-        panel_height = 14 + len(rows) * line_height + 10
-        DrawRectangle(margin, margin, panel_width, panel_height, panel)
+        padding = 12
+        panel_height = padding * 2 + len(rows) * line_height
+        draw_panel(margin, margin, panel_width, panel_height)
         for index, (text, color) in enumerate(rows):
-            DrawText(text, margin + 12, margin + 12 + index * line_height, 17, color)
+            draw_text_shadow(text, margin + padding, margin + padding + index * line_height, 17, color)
 
-        # --- Render panel: debug view + fps (pbr only), below the status one.
+        # --- Render panel: debug view + fps + cycle hint (pbr only). ---
         if self.shading == "pbr":
-            render_rows = [
-                (f"Debug: {self.debug_view}".encode(), accent_color),
-                (f"{GetFPS()} fps".encode(), title_color),
-            ]
-            render_height = 14 + len(render_rows) * line_height + 10
-            render_top = margin + panel_height + 10
-            DrawRectangle(margin, render_top, panel_width, render_height, panel)
-            for index, (text, color) in enumerate(render_rows):
-                DrawText(text, margin + 12, render_top + 12 + index * line_height, 17, color)
             hint = b"V / Shift+V to cycle"
-            DrawText(hint, margin + 12, render_top + render_height - 4, 14, title_color)
+            render_rows = [
+                (f"Debug: {self.debug_view}".encode(), accent_color, 17, 0),
+                (f"{GetFPS()} fps".encode(), muted_color, 17, 1),
+                (hint, muted_color, 15, 1),
+            ]
+            render_height = padding * 2 + len(render_rows) * line_height
+            render_top = margin + panel_height + 8
+            draw_panel(margin, render_top, panel_width, render_height)
+            for index, (text, color, size, lift) in enumerate(render_rows):
+                draw_text_shadow(text, margin + padding, render_top + padding + index * line_height + lift, size, color)
 
         # --- Camera hint (bottom-right, above the timeline bar). ---
         camera_hint = b"Ctrl+LMB orbit | Ctrl+RMB pan | Wheel zoom"
         hint_width = MeasureText(camera_hint, 15) + 24
-        hint_y = screen_height - 100
-        DrawRectangle(screen_width - hint_width - margin, hint_y, hint_width, 26, panel)
-        DrawText(camera_hint, screen_width - hint_width - margin + 12, hint_y + 5, 15, value_color)
+        hint_y = screen_height - 104
+        draw_panel(screen_width - hint_width - margin, hint_y, hint_width, 30)
+        draw_text_shadow(camera_hint, screen_width - hint_width - margin + 12, hint_y + 6, 15, value_color)
 
     def _reconstruct_full_local_pose_for(self, positions, rotations, frame_index):
         full_positions = self.full_bind_local_positions.copy()
