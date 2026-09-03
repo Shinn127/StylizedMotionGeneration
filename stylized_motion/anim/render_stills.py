@@ -17,16 +17,24 @@ from pathlib import Path
 
 from pyray import Vector3
 from raylib import (
+    BeginTextureMode,
+    ClearBackground,
     CloseWindow,
+    DrawTexturePro,
+    EndTextureMode,
     ExportImage,
     FLAG_WINDOW_HIDDEN,
     InitWindow,
     LoadImageFromTexture,
+    LoadRenderTexture,
     SetConfigFlags,
+    UnloadRenderTexture,
     rlDisableColorBlend,
+    rlEnableColorBlend,
     Vector3Add,
     Vector3Scale,
 )
+from pyray import BLANK, WHITE, Rectangle, Vector2
 
 from stylized_motion.anim.genoview import (
     DEBUG_MODES,
@@ -101,6 +109,30 @@ def render_still(args: argparse.Namespace) -> Path:
 
         rlDisableColorBlend()
         viewer.renderer.render_frame(global_rot, global_pos, viewer.sample_index, None, None)
+        if args.hud:
+            # Bake the HUD into the tonemapped target before FXAA so stills
+            # document the UI layout. The HUD is drawn on its own LDR target
+            # (window orientation) and composited in with a flipped blit,
+            # because render targets are Y-inverted versus the window.
+            hud_target = LoadRenderTexture(args.width, args.height)
+            BeginTextureMode(hud_target)
+            ClearBackground(BLANK)
+            rlEnableColorBlend()
+            viewer._draw_hud(args.width, args.height)
+            viewer.playback.draw_ui(args.width, args.height, "Sample" if viewer.indices is not None else "Frame")
+            EndTextureMode()
+            BeginTextureMode(viewer.tonemapped)
+            rlEnableColorBlend()
+            DrawTexturePro(
+                hud_target.texture,
+                Rectangle(0, 0, args.width, args.height),
+                Rectangle(0, 0, float(args.width), float(args.height)),
+                Vector2(0.0, 0.0),
+                0.0,
+                WHITE,
+            )
+            EndTextureMode()
+            UnloadRenderTexture(hud_target)
         viewer.renderer.draw_output()
 
         target = viewer.tonemapped if viewer.shading == "pbr" else viewer.lighted
@@ -124,6 +156,7 @@ def main():
     parser.add_argument("--shading", choices=("legacy", "pbr"), default="pbr")
     parser.add_argument("--debug-view", choices=DEBUG_MODES, default="final")
     parser.add_argument("--frame", type=int, default=0, help="Playback frame index to render.")
+    parser.add_argument("--hud", action="store_true", help="Draw the interactive HUD panels into the still.")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--metallic", type=float, default=0.0)

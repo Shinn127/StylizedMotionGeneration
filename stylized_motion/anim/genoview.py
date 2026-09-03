@@ -241,7 +241,7 @@ class PlaybackController:
 
     def timeline_rect(self, screen_width, screen_height):
         margin = 24
-        return Rectangle(margin, screen_height - 34, screen_width - 2 * margin, 10)
+        return Rectangle(margin, screen_height - 52, screen_width - 2 * margin, 12)
 
     def _frame_from_mouse_x(self, rect, mouse_x):
         alpha = (float(mouse_x) - float(rect.x)) / max(float(rect.width), 1.0)
@@ -269,13 +269,15 @@ class PlaybackController:
         progress = self.current_frame / max(self.frame_count - 1, 1)
         fill_width = int(round(float(rect.width) * progress))
         knob_x = int(round(float(rect.x) + float(rect.width) * progress))
-        readout = f"{label} | {self.current_frame + 1}/{self.frame_count} | {self.current_speed:.2f}x"
+        readout = f"{label} {self.current_frame + 1}/{self.frame_count}   {self.current_speed:.2f}x"
 
-        DrawRectangle(int(rect.x), int(rect.y), int(rect.width), int(rect.height), Color(30, 30, 30, 95))
-        DrawRectangle(int(rect.x), int(rect.y), fill_width, int(rect.height), Color(45, 132, 255, 220))
-        DrawRectangleLines(int(rect.x), int(rect.y), int(rect.width), int(rect.height), Color(20, 20, 20, 180))
-        DrawCircle(knob_x, int(rect.y + rect.height * 0.5), 7.0, Color(20, 82, 180, 245))
-        DrawText(readout.encode(), int(rect.x), int(rect.y - 24), 18, BLACK)
+        # Bottom control bar: readout above a padded timeline track.
+        bar_top = int(rect.y) - 30
+        DrawRectangle(int(rect.x) - 8, bar_top, int(rect.width) + 16, int(rect.height) + 38, Color(24, 26, 30, 165))
+        DrawText(readout.encode(), int(rect.x), bar_top + 6, 16, Color(225, 229, 235, 255))
+        DrawRectangle(int(rect.x), int(rect.y), int(rect.width), int(rect.height), Color(52, 58, 66, 200))
+        DrawRectangle(int(rect.x), int(rect.y), fill_width, int(rect.height), Color(64, 140, 250, 235))
+        DrawCircle(knob_x, int(rect.y + rect.height * 0.5), 8.0, Color(235, 238, 242, 255))
 
 
 def file_read(out, size, f):
@@ -1171,7 +1173,66 @@ class GenoView:
         return "unknown"
 
     def _control_hint(self) -> bytes:
-        return b"Space: play/pause | Left/Right: step | Up/Down: speed | Home/End | Drag timeline | B: skeleton"
+        return b"Space play/pause | <-/-> step | Up/Down speed | Home/End | B skeleton | V debug view"
+
+    def _draw_hud(self, screen_width: int, screen_height: int) -> None:
+        """Grouped HUD: info panel top-left, camera hint bottom-right.
+
+        Drawn last (over the 3D output) with translucent panels so text stays
+        readable on the bright scene without blocking the view.
+        """
+        panel = Color(24, 26, 30, 150)
+        title_color = Color(140, 148, 158, 255)
+        value_color = Color(232, 235, 240, 255)
+        accent_color = Color(120, 180, 255, 255)
+
+        margin = 16
+        line_height = 22
+        panel_width = 300
+
+        # --- Status panel (top-left): playback, then mode-specific rows. ---
+        rows: list[tuple[bytes, Color]] = []
+        play_state = "Paused" if not self.playback.playing else f"Playing {self.playback.current_speed:.2f}x"
+        rows.append((play_state.encode(), accent_color))
+        rows.append((f"Frame {self.frame_index}  |  {self._frame_range_name()}".encode(), value_color))
+        if self.scene_mode == "grid":
+            rows.append((b"Scene: material grid", value_color))
+        else:
+            skeleton_state = "on" if self.skeleton_enabled else "off"
+            rows.append((f"Skeleton overlay: {skeleton_state}   (B)".encode(), value_color))
+            rig_mode = "pruned->full" if self.use_pruned_reconstruction else "full direct"
+            rows.append((f"Pose: {rig_mode}".encode(), value_color))
+            if self.compare_mode:
+                rows.append((f"L {self.left_label}  |  R {self.right_label}".encode(), Color(120, 160, 250, 255)))
+            if self.indices is not None:
+                mirror = "yes" if bool(self.sample_mirror[self.sample_index]) else "no"
+                rows.append((f"Sample {self.sample_index}  |  mirror {mirror}".encode(), value_color))
+
+        panel_height = 14 + len(rows) * line_height + 10
+        DrawRectangle(margin, margin, panel_width, panel_height, panel)
+        for index, (text, color) in enumerate(rows):
+            DrawText(text, margin + 12, margin + 12 + index * line_height, 17, color)
+
+        # --- Render panel: debug view + fps (pbr only), below the status one.
+        if self.shading == "pbr":
+            render_rows = [
+                (f"Debug: {self.debug_view}".encode(), accent_color),
+                (f"{GetFPS()} fps".encode(), title_color),
+            ]
+            render_height = 14 + len(render_rows) * line_height + 10
+            render_top = margin + panel_height + 10
+            DrawRectangle(margin, render_top, panel_width, render_height, panel)
+            for index, (text, color) in enumerate(render_rows):
+                DrawText(text, margin + 12, render_top + 12 + index * line_height, 17, color)
+            hint = b"V / Shift+V to cycle"
+            DrawText(hint, margin + 12, render_top + render_height - 4, 14, title_color)
+
+        # --- Camera hint (bottom-right, above the timeline bar). ---
+        camera_hint = b"Ctrl+LMB orbit | Ctrl+RMB pan | Wheel zoom"
+        hint_width = MeasureText(camera_hint, 15) + 24
+        hint_y = screen_height - 100
+        DrawRectangle(screen_width - hint_width - margin, hint_y, hint_width, 26, panel)
+        DrawText(camera_hint, screen_width - hint_width - margin + 12, hint_y + 5, 15, value_color)
 
     def _reconstruct_full_local_pose_for(self, positions, rotations, frame_index):
         full_positions = self.full_bind_local_positions.copy()
@@ -1315,24 +1376,7 @@ class GenoView:
 
                 if frame_dir is None:
                     rlEnableColorBlend()
-                    DrawFPS(10, 10)
-                    play_state = "Paused" if not self.playback.playing else f"Playing {self.playback.current_speed:.2f}x"
-                    status = f"{play_state} | Skeleton: {'on' if self.skeleton_enabled else 'off'}"
-                    DrawText(f"Frame: {self.frame_index}".encode(), 10, 34, 20, BLACK)
-                    DrawText(f"Range: {self._frame_range_name()}".encode(), 10, 58, 20, DARKGRAY)
-                    DrawText(status.encode(), 10, 82, 20, BLUE)
-                    mode_label = f"Skeleton: {'pruned->full reconstruction' if self.use_pruned_reconstruction else 'full direct'}"
-                    DrawText(mode_label.encode(), 10, 106, 20, DARKGRAY)
-                    if self.compare_mode:
-                        DrawText(f"Left: {self.left_label}".encode(), 10, 130, 20, Color(40, 90, 220, 255))
-                        DrawText(f"Right: {self.right_label}".encode(), 10, 154, 20, ORANGE)
-                    if self.indices is not None:
-                        DrawText(f"Sample: {self.sample_index}".encode(), 10, 130, 20, DARKGRAY)
-                        DrawText(f"Mirror: {bool(self.sample_mirror[self.sample_index])}".encode(), 10, 154, 20, DARKGRAY)
-                    DrawText(b"Ctrl+LMB/RMB+drag: camera | Wheel: zoom", 10, 184, 18, BLACK)
-                    DrawText(self._control_hint(), 10, 208, 18, BLACK)
-                    if self.shading == "pbr":
-                        DrawText(f"Debug: {self.debug_view} (V / Shift+V)".encode(), 10, 232, 18, DARKGRAY)
+                    self._draw_hud(screen_width, screen_height)
                     self.playback.draw_ui(screen_width, screen_height, "Sample" if self.indices is not None else "Frame")
                 EndDrawing()
                 if frame_dir is not None:
