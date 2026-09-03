@@ -73,29 +73,34 @@ def _array_to_cubemap(faces: np.ndarray) -> Texture:
 def _array_to_cubemap_mipped(levels: list[np.ndarray]) -> Texture:
     """Upload prefiltered roughness levels as one cubemap with a manual mip chain.
 
-    Builds the raylib-native mipped cubemap image layout: a (size, size*6)
-    RGBA8 column per mip level, six levels concatenated (mip0 first, each mip
-    holding faces +X,-X,+Y,-Y,+Z,-Z stacked vertically). LoadTextureCubemap
-    forwards this straight to rlLoadTextureCubemap, which reads exactly that
-    face-then-mip order, so no GL calls are needed.
+    rlLoadTextureCubemap expects the byte stream as: for each mip level
+    (base first), the six square faces (+X,-X,+Y,-Y,+Z,-Z) as contiguous
+    s_k x s_k RGBA8 blocks; the level sizes halve per mip. Going through the
+    image path instead cannot inject custom per-level content (LoadCubemap
+    only converts the base level and re-derives the rest), so the raw data
+    pointer path is used here.
     """
 
     mip_count = len(levels)
     assert mip_count >= 1
-    column = []
+    size = levels[0].shape[1]
+    chunks = []
     for faces in levels:
-        size = faces.shape[1]
-        atlas = np.concatenate([faces[face] for face in range(6)], axis=1)
-        atlas = (np.clip(atlas, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
-        column.append(np.concatenate([atlas, np.full((size, size * 6, 1), 255, dtype=np.uint8)], axis=2))
-    stacked = np.concatenate(column, axis=0)
-    height, width = stacked.shape[:2]
+        level_size = faces.shape[1]
+        for face in range(6):
+            atlas = (np.clip(faces[face], 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+            rgba = np.concatenate([atlas, np.full((level_size, level_size, 1), 255, dtype=np.uint8)], axis=2)
+            chunks.append(np.ascontiguousarray(rgba).tobytes())
+    data = b"".join(chunks)
 
-    image = GenImageColor(width, height, Color(0, 0, 0, 255))
-    ffi.memmove(image.data, np.ascontiguousarray(stacked).ravel().tobytes(), width * height * 4)
-    image.mipmaps = mip_count
-    texture = LoadTextureCubemap(image, CUBEMAP_LAYOUT_LINE_HORIZONTAL)
-    UnloadImage(image)
+    texture_id = rlLoadTextureCubemap(data, size, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, mip_count)
+    assert texture_id != 0, "rlLoadTextureCubemap failed for the prefilter chain"
+    texture = Texture()
+    texture.id = texture_id
+    texture.width = size
+    texture.height = size
+    texture.mipmaps = mip_count
+    texture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8
     return texture
 
 
