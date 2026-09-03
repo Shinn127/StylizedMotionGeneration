@@ -175,7 +175,10 @@ def test_material_grid_scene_contract():
     # in the lighting pass (verified visually), roughness honors the floor.
     assert cell.material.metallic == 0.0
     rough_cell = build_material_grid_object(None, *placements[4])
-    assert rough_cell.material.roughness == 0.25
+    assert rough_cell.material.roughness == 1.0
+    # The roughness floor keeps the zero-roughness column physically valid.
+    floor_cell = build_material_grid_object(None, 0.0, 0.0, 0.0, 0.0)
+    assert floor_cell.material.roughness == 0.04
 
     try:
         from stylized_motion.anim import genoview as genoview_module
