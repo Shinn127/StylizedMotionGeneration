@@ -64,6 +64,7 @@ def main():
     parser.add_argument("--roughness", type=float, default=0.58)
     parser.add_argument("--exposure", type=float, default=0.9)
     parser.add_argument("--tone-curve", choices=TONE_CURVES, default="aces", help="Tone mapping curve for the PBR path (aces | reinhard | agx).")
+    parser.add_argument("--white-background", action="store_true", help="Flat pure-white background (paper figure mode); bypasses sky and tone curve on background pixels.")
     parser.add_argument("--scene", choices=SCENE_MODES, default="character", help="character: motion viewer scene; grid: 5x5 metallic/roughness material test grid.")
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
     parser.add_argument("--ibl-strength", type=float, default=0.22)
@@ -121,6 +122,7 @@ def main():
         sun_strength=args.sun_strength,
         tone_curve=args.tone_curve,
         scene_mode=args.scene,
+        white_background=args.white_background,
     )
     viewer.run()
 
