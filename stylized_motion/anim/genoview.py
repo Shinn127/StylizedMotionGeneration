@@ -64,6 +64,8 @@ LIGHTING_DEBUG_MODES = {
 # tonemap.fs's toneCurve uniform. ACES stays the default for visual continuity.
 TONE_CURVES = ("aces", "reinhard", "agx")
 
+SCENE_MODES = ("character", "grid")
+
 
 # Lighting rig inherited from GenoViewPython, frozen so `--shading legacy`
 # keeps rendering exactly the way it always has.
@@ -695,12 +697,16 @@ class GenoView:
         metallic_roughness_map: Path | None = None,
         sun_strength: float | None = None,
         tone_curve: str = "aces",
+        scene_mode: str = "character",
         rig: RigSpec = GENO_RIG,
     ):
         if debug_view not in DEBUG_MODES:
             raise ValueError(f"Unknown debug view {debug_view!r}; expected one of {DEBUG_MODES}")
         if tone_curve not in TONE_CURVES:
             raise ValueError(f"Unknown tone curve {tone_curve!r}; expected one of {TONE_CURVES}")
+        if scene_mode not in SCENE_MODES:
+            raise ValueError(f"Unknown scene {scene_mode!r}; expected one of {SCENE_MODES}")
+        self.scene_mode = scene_mode
         self.rig = rig
         self.skeleton_enabled = bool(draw_skeleton)
         self.skeleton_color = GRAY
@@ -819,6 +825,7 @@ class GenoView:
         self.ground_model = None
         self.geno_model = None
         self.compare_model = None
+        self.grid_models = []
         self.bind_pos = None
         self.bind_rot = None
         self.compare_bind_pos = None
@@ -1070,25 +1077,40 @@ class GenoView:
                 skinned=False,
             )
         )
-        self.scene.add_object(
-            RenderObject(
-                model=self.geno_model,
-                material=self.default_material,
-                position=self.left_model_offset,
-                draw_color=Color(70, 125, 255, 255) if self.compare_mode else ORANGE,
-                skinned=True,
+        if self.scene_mode == "grid":
+            from stylized_motion.anim.scene import (
+                GRID_ROUGHNESS_STEPS,
+                build_material_grid_object,
+                material_grid_positions,
             )
-        )
-        if self.compare_mode:
+
+            # One shared UV sphere; per-cell materials carry the variation.
+            sphere_mesh = GenMeshSphere(0.4, 48, 32)
+            GenMeshTangents(ffi.addressof(sphere_mesh))
+            grid_model = LoadModelFromMesh(sphere_mesh)
+            self.grid_models.append(grid_model)
+            for x, z, metallic, roughness in material_grid_positions():
+                self.scene.add_object(build_material_grid_object(grid_model, x, z, metallic, roughness))
+        else:
             self.scene.add_object(
                 RenderObject(
-                    model=self.compare_model,
+                    model=self.geno_model,
                     material=self.default_material,
-                    position=self.right_model_offset,
-                    draw_color=ORANGE,
+                    position=self.left_model_offset,
+                    draw_color=Color(70, 125, 255, 255) if self.compare_mode else ORANGE,
                     skinned=True,
                 )
             )
+            if self.compare_mode:
+                self.scene.add_object(
+                    RenderObject(
+                        model=self.compare_model,
+                        material=self.default_material,
+                        position=self.right_model_offset,
+                        draw_color=ORANGE,
+                        skinned=True,
+                    )
+                )
         (
             self.full_names,
             self.full_parents,
@@ -1135,6 +1157,9 @@ class GenoView:
             UnloadModel(self.compare_model)
         if self.ground_model is not None:
             UnloadModel(self.ground_model)
+        for grid_model in self.grid_models:
+            UnloadModel(grid_model)
+        self.grid_models = []
         for shader in self.shaders.values():
             UnloadShader(shader)
 
@@ -1248,16 +1273,23 @@ class GenoView:
                 self._sync_playback_frame()
 
                 global_rot, global_pos = self._update_model_pose()
-                if self.compare_mode:
+                if self.compare_mode and self.scene_mode == "character":
                     compare_global_rot, compare_global_pos = self._update_compare_model_pose()
                 else:
                     compare_global_rot = None
                     compare_global_pos = None
 
                 root = global_pos[0]
-                target_x = root[0] + self.left_model_offset.x
-                target_z = root[2] + self.left_model_offset.z
-                if self.compare_mode:
+                if self.scene_mode == "grid":
+                    # Frame the material grid instead of following the (hidden)
+                    # character root; keep the light target on the grid too so
+                    # the shadows land on the spheres and ground.
+                    target_x = 0.0
+                    target_z = -2.0
+                else:
+                    target_x = root[0] + self.left_model_offset.x
+                    target_z = root[2] + self.left_model_offset.z
+                if self.compare_mode and self.scene_mode == "character":
                     compare_root = compare_global_pos[0]
                     target_x = 0.5 * (target_x + compare_root[0] + self.right_model_offset.x)
                     target_z = 0.5 * (target_z + compare_root[2] + self.right_model_offset.z)
@@ -1352,6 +1384,7 @@ class GenoViewCompare(GenoView):
         metallic_roughness_map: Path | None = None,
         sun_strength: float | None = None,
         tone_curve: str = "aces",
+        scene_mode: str = "character",
         rig: RigSpec = GENO_RIG,
     ):
         super().__init__(
@@ -1379,6 +1412,7 @@ class GenoViewCompare(GenoView):
             metallic_roughness_map=metallic_roughness_map,
             sun_strength=sun_strength,
             tone_curve=tone_curve,
+            scene_mode=scene_mode,
         )
 
 
@@ -1406,6 +1440,7 @@ def main():
     parser.add_argument("--roughness", type=float, default=0.58)
     parser.add_argument("--exposure", type=float, default=0.9)
     parser.add_argument("--tone-curve", choices=TONE_CURVES, default="aces", help="Tone mapping curve for the PBR path (aces | reinhard | agx).")
+    parser.add_argument("--scene", choices=SCENE_MODES, default="character", help="character: motion viewer scene; grid: 5x5 metallic/roughness material test grid.")
     parser.add_argument("--sun-strength", type=float, default=None, help="Direct light intensity. Defaults to the per-shading light rig value (PBR: 0.55, legacy: 0.25).")
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
     parser.add_argument("--ibl-strength", type=float, default=0.35)
@@ -1460,6 +1495,7 @@ def main():
         metallic_roughness_map=args.metallic_roughness_map,
         sun_strength=args.sun_strength,
         tone_curve=args.tone_curve,
+        scene_mode=args.scene,
     )
     viewer.run()
 

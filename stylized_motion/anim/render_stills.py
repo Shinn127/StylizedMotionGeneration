@@ -31,6 +31,7 @@ from raylib import (
 from stylized_motion.anim.genoview import (
     DEBUG_MODES,
     GENO_RIG,
+    SCENE_MODES,
     TONE_CURVES,
     GenoView,
     build_database_from_bvh,
@@ -66,6 +67,7 @@ def render_still(args: argparse.Namespace) -> Path:
         metallic_roughness_map=args.metallic_roughness_map,
         sun_strength=args.sun_strength,
         tone_curve=args.tone_curve,
+        scene_mode=args.scene,
         rig=rig,
     )
 
@@ -80,11 +82,21 @@ def render_still(args: argparse.Namespace) -> Path:
         viewer.playback.set_current_frame(args.frame)
         viewer._sync_playback_frame()
         global_rot, global_pos = viewer._update_model_pose()
-        # Mirror run()'s shadow-light follow so off-frame roots stay lit.
+        # Mirror run()'s follow logic: the character scene tracks the root,
+        # the material grid stays centered on the grid.
         root = global_pos[0]
-        viewer.shadow_light.target = Vector3(root[0], 0.0, root[2])
+        if viewer.scene_mode == "grid":
+            target_x, target_z = 0.0, -2.0
+        else:
+            target_x, target_z = root[0], root[2]
+        viewer.shadow_light.target = Vector3(target_x, 0.0, target_z)
         viewer.shadow_light.position = Vector3Add(
             viewer.shadow_light.target, Vector3Scale(viewer.light_dir, -5.0)
+        )
+        viewer.camera.distance = 8.5 if viewer.scene_mode == "grid" else 4.0
+        viewer.camera.update(
+            Vector3(target_x, 0.75 if viewer.scene_mode == "character" else 0.4, target_z),
+            0.0, 0.0, 0.0, 0.0, 0.0, 1.0 / 60.0,
         )
 
         rlDisableColorBlend()
@@ -121,6 +133,7 @@ def main():
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
     parser.add_argument("--ibl-strength", type=float, default=0.35)
     parser.add_argument("--tone-curve", choices=TONE_CURVES, default="aces")
+    parser.add_argument("--scene", choices=SCENE_MODES, default="character")
     parser.add_argument("--normal-map", type=Path, default=None)
     parser.add_argument("--metallic-roughness-map", type=Path, default=None)
     parser.add_argument("--disable-ibl", action="store_true")

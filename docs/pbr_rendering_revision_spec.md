@@ -425,6 +425,8 @@ Raylib/RLGL backend
 
 ## 14. Material Test Scene
 
+> 2026-09-03 已落地：`--scene grid`（GenoView/SomaView/render_stills 均支持）。5×5 球体网格，行=metallic {0,.25,.5,.75,1}（向 -Z），列=roughness {0,.25,.5,.75,1}（向 +X），共享 UV 球 mesh、每格独立 Material（中性 albedo、微弱金属梯度着色以便辨认）。grid 模式下角色隐藏、相机与 shadow 光目标固定于网格中心。验收（离屏渲染 + 调试视图）：metallic=1 行 diffuse 调试视图为黑（金属无漫反射）；非金属行 diffuse 随 roughness 单调；直接光高光随 roughness 增大变宽变弱；投影正确落在球与地面。五种标准 probe 材质定义见 `scene.MATERIAL_GRID_PROBES`（供后续 per-object 材质实验引用）。
+
 增加开发专用测试场景，至少包含 5×5 material grid：
 
 ```text
@@ -485,7 +487,7 @@ columns = roughness: 0.0, 0.25, 0.5, 0.75, 1.0
 
 ### Phase 4：Normal Mapping 与测试场景
 
-> 2026-09-03 进度：tangent 数据管线、TBN/normal map 采样、材质 AO 的间接光接入已完成；material grid 与系统性纹理验证（颜色空间、mipmap）仍未完成，`--normal-map` / `--metallic-roughness-map` 提供手动验证入口。
+> 2026-09-03 进度：已全部完成关闭。tangent 管线、TBN/normal map 采样、材质 AO 间接光接入、`--scene grid` 材质测试场景（5×5 grid + 验收）均已交付；`--normal-map` / `--metallic-roughness-map` 提供纹理验证入口。
 
 - 扩展模型/mesh 数据以提供可靠 tangent；
 - 在 GBuffer 中构造 TBN 并采样 normal map；

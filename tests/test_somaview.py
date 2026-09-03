@@ -150,6 +150,43 @@ def test_tone_curve_selection_is_shared_between_viewers():
         raise AssertionError("expected ValueError for bogus tone curve")
 
 
+def test_material_grid_scene_contract():
+    from stylized_motion.anim.genoview import SCENE_MODES
+    from stylized_motion.anim.scene import (
+        GRID_METALLIC_STEPS,
+        GRID_ROUGHNESS_STEPS,
+        build_material_grid_object,
+        material_grid_positions,
+    )
+
+    assert SCENE_MODES == ("character", "grid")
+    assert GRID_METALLIC_STEPS == (0.0, 0.25, 0.5, 0.75, 1.0)
+    assert GRID_ROUGHNESS_STEPS == (0.0, 0.25, 0.5, 0.75, 1.0)
+
+    placements = material_grid_positions()
+    assert len(placements) == 25
+    metals = sorted({p[2] for p in placements})
+    roughs = sorted({p[3] for p in placements})
+    assert metals == list(GRID_METALLIC_STEPS)
+    assert roughs == list(GRID_ROUGHNESS_STEPS)
+
+    cell = build_material_grid_object(None, *placements[0])
+    # Pure metal cell: metallic clamps through Material, diffuse must vanish
+    # in the lighting pass (verified visually), roughness honors the floor.
+    assert cell.material.metallic == 0.0
+    rough_cell = build_material_grid_object(None, *placements[4])
+    assert rough_cell.material.roughness == 0.25
+
+    try:
+        from stylized_motion.anim import genoview as genoview_module
+
+        genoview_module.GenoView(database=None, trajectory_path=None, resources_root=Path("."), scene_mode="bogus")
+    except ValueError as e:
+        assert "scene" in str(e)
+    else:
+        raise AssertionError("expected ValueError for bogus scene mode")
+
+
 def test_material_scene_and_texture_contract():
     from stylized_motion.anim.materials import Material, TEXTURE_CONTRACT
     from stylized_motion.anim.scene import DirectionalLight, RenderObject, Scene
