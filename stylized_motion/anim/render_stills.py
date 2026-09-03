@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from pyray import Vector3
+from pyray import Vector3, ffi
 from raylib import (
     BeginTextureMode,
     ClearBackground,
@@ -48,6 +48,27 @@ from stylized_motion.anim.genoview import (
 from stylized_motion.anim.renderer import Renderer
 from stylized_motion.anim.somaview import SOMA_RIG
 from stylized_motion.util.paths import RESOURCE_DIR, SOMA_RESOURCE_DIR
+
+
+def flip_image_vertically(image):
+    """Return a copy of the image with rows reversed (window orientation).
+
+    The flipped copy must own its memory: pointing the Image at a temporary
+    numpy buffer that dies (or gets GC-pinned oddly) showed up as a black
+    wedge from the bottom-left corner.
+    """
+    import numpy as np
+
+    bytes_per_pixel = 4
+    row_bytes = image.width * bytes_per_pixel
+    pixels = np.frombuffer(ffi.buffer(image.data, image.width * image.height * bytes_per_pixel), dtype=np.uint8)
+    flipped = np.ascontiguousarray(pixels.reshape(image.height, row_bytes)[::-1])
+    image.data = ffi.from_buffer("unsigned char[]", flipped)
+    _flip_keepalive.append(flipped)
+    return image.data
+
+
+_flip_keepalive: list = []
 
 
 def render_still(args: argparse.Namespace) -> Path:
@@ -138,8 +159,12 @@ def render_still(args: argparse.Namespace) -> Path:
 
         target = viewer.tonemapped if viewer.shading == "pbr" else viewer.lighted
         image = LoadImageFromTexture(target.texture)
+        # Render targets are Y-inverted versus the window; flip so the PNG
+        # matches what the interactive viewer shows (sky on top).
+        image.data = flip_image_vertically(image)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         ExportImage(image, str(args.output).encode("utf-8"))
+        _flip_keepalive.clear()
     finally:
         viewer._cleanup()
         CloseWindow()
@@ -165,7 +190,7 @@ def main():
     parser.add_argument("--exposure", type=float, default=0.9)
     parser.add_argument("--sun-strength", type=float, default=None)
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
-    parser.add_argument("--ibl-strength", type=float, default=0.22)
+    parser.add_argument("--ibl-strength", type=float, default=0.45)
     parser.add_argument("--tone-curve", choices=TONE_CURVES, default="aces")
     parser.add_argument("--white-background", action="store_true", help="Flat pure-white background (paper figure mode).")
     parser.add_argument("--scene", choices=SCENE_MODES, default="character")

@@ -79,16 +79,16 @@ LEGACY_LIGHT_RIG = {
     "ground_albedo": (190, 190, 190),
 }
 
-# PBR rig, retuned for the physically-based path. Targets: direct:ambient
-# roughly 3.5:1 on white albedo (sun-dominant, outdoor), a shadow side around
-# a fifth of the lit side in linear terms so form stays readable, a warm sun
-# against a cool sky for temperature contrast, and a light gray-white ground
-# tone that keeps the scene airy without outshining the sky background.
+# PBR rig, solved from display anchors by inverting exposure -> ACES -> sRGB
+# (spec 20.10): the floor lit/shadow anchors pin the direct:indirect ratio at
+# ~5:1 (sun-dominant outdoor, shadows read as form), the sun strength follows
+# from the unclamped blue ring's irradiance, and ibl-strength pairs with the
+# dome's near-neutral irradiance so floor shadow lands at (170,173,181).
 PBR_LIGHT_RIG = {
     "light_dir": (0.45, -0.8, -0.35),
     "sun_color": (1.0, 240.0 / 255.0, 214.0 / 255.0),
     "sky_color": (170.0 / 255.0, 195.0 / 255.0, 228.0 / 255.0),
-    "sun_strength": 0.55,
+    "sun_strength": 1.88,
     "sky_strength": 0.35,
     "ground_strength": 0.25,
     "ambient_strength": 0.15,
@@ -705,7 +705,7 @@ class GenoView:
         roughness: float = 0.58,
         exposure: float = 0.9,
         ssao_intensity: float = 0.15,
-        ibl_strength: float = 0.22,
+        ibl_strength: float = 0.45,
         ibl_enabled: bool = True,
         shadow_resolution: int = 2048,
         output_video: Path | None = None,
@@ -1469,7 +1469,7 @@ class GenoViewCompare(GenoView):
         roughness: float = 0.58,
         exposure: float = 0.9,
         ssao_intensity: float = 0.15,
-        ibl_strength: float = 0.22,
+        ibl_strength: float = 0.45,
         ibl_enabled: bool = True,
         shadow_resolution: int = 2048,
         output_video: Path | None = None,
@@ -1541,7 +1541,7 @@ def main():
     parser.add_argument("--scene", choices=SCENE_MODES, default="character", help="character: motion viewer scene; grid: 5x5 metallic/roughness material test grid.")
     parser.add_argument("--sun-strength", type=float, default=None, help="Direct light intensity. Defaults to the per-shading light rig value (PBR: 0.55, legacy: 0.25).")
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
-    parser.add_argument("--ibl-strength", type=float, default=0.22)
+    parser.add_argument("--ibl-strength", type=float, default=0.45)
     parser.add_argument("--disable-ibl", action="store_true")
     parser.add_argument("--shadow-resolution", type=int, default=2048)
     parser.add_argument("--output-video", type=Path, default=None, help="Render the full clip to an MP4 at this path.")

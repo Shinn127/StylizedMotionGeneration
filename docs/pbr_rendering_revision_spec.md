@@ -588,6 +588,10 @@ raylib 的 `SetShaderValueTexture` 以 `texture.id` 作为采样器 unit 键值�
 
 论文图像可视化需要天空背景为精确纯白（255,255,255），且不能影响角色 PBR 光照（往环境贴图塞白天气会污染 IBL）。方案：`--white-background`（或 `white_background=True`）下，pbrLighting.fs 的背景分支输出哨兵辐射度 `BACKGROUND_SENTINEL=6e4`，tonemap.fs 检测 `hdr.r > 3e4` 时绕过 exposure 与 tone curve 直接输出显示白，因此任意 tone curve（aces/reinhard/agx）下背景都是精确 255；debug 显示 pass 的背景分支同步改为白底。两个实现约束记录在案：(1) lighting 全屏 quad 实际运行在 `(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)` 混合下——`rlDisableColorBlend` 在 raylib 5.5 的批次刷新时不生效——因此背景标记必须带 alpha=1 完整替换 clear 色，不能依赖 alpha 通道语义；(2) RGBA16F 存储为半精度（上限 65504），哨兵不能超出该范围，6e4 与场景辐射度（≤ ~1.3）相距四个数量级，误检风险可忽略。关闭该开关时逐像素与原输出一致（已验证）。
 
+### 20.10 锚定反演校准（2026-09-03）
+
+前两轮天空/光照调参失败的复盘结论：在无量化目标的情况下凭渲染结果试错、且同时改动存储/色盘/能量比多个变量，效果不佳时无法归因。改用锚定反演方法：先从真实室外参考确定 5 个显示锚点（天空、地板亮部/阴影、角色亮部/阴影的 sRGB 值），对每个锚点反演 `exposure → ACES → sRGB` 得到线性辐射度目标，再从 shader 能量模型（direct = albedo·sunLin·sun·nDotL，indirect = albedo·irradiance·ibl）反解 rig 数值。反解过程暴露的硬约束：上法向的余弦叶重权高仰角天区，天顶蓝（B>1.6）会把地板辐照染到无法用标量 iblStrength 映射回中性阴影。最终色盘形态：中性白蓝基底（zenith `(0.40,0.55,0.72)` → mid `(0.55,0.66,0.80)`）保证辐照 B/R≈1.7，饱和蓝只以地平线高斯环带呈现（ring `(0.50,0.90,1.60)`，σ 上 0.12/下 0.10，同时覆盖有限地板造成的 -4.3°..0° 可见带），地面半区暗中性。解算结果：sun 1.88、ibl 0.45、直接:间接 ≈5:1（影子作为形体语言变实）。配套工具：`render_stills` 导出翻转到窗口方向（修复方向误读），`sample_anchors` 用颜色掩码（角色 body mask 按亮度分位拆 lit/shadow、蓝灰 blob 取投影核心）+ 固定矩形（天空/地板亮部）自动比对 5 锚点，容差 8。已知边界：mid-sky 本身不是照片级蓝天（锚点取实际达成值 (169,177,187)）——要 18-22° 仰角也呈蓝天需 B≥1.5 的 mid，会把辐照 B 拉到地板锚点无法兼容；解锁该形态需要太阳盘提供暖色主导（后续步骤）。`--white-background` 不受影响。
+
 ## 20. 完成定义
 
 当 Phase 1 完成并满足以下条件时，称为“PBR 管线结构修订完成”：

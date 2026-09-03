@@ -67,7 +67,7 @@ def main():
     parser.add_argument("--white-background", action="store_true", help="Flat pure-white background (paper figure mode); bypasses sky and tone curve on background pixels.")
     parser.add_argument("--scene", choices=SCENE_MODES, default="character", help="character: motion viewer scene; grid: 5x5 metallic/roughness material test grid.")
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
-    parser.add_argument("--ibl-strength", type=float, default=0.22)
+    parser.add_argument("--ibl-strength", type=float, default=0.45)
     parser.add_argument("--disable-ibl", action="store_true")
     parser.add_argument("--shadow-resolution", type=int, default=2048)
     parser.add_argument("--output-video", type=Path, default=None, help="Render the full clip to an MP4 at this path.")
