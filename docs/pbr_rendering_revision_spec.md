@@ -18,6 +18,8 @@
 
 实施更新（2026-09-03，阶段 B 视觉升级）：Shadow 升级为 3×3 PCF（`shadowTexelSize` uniform，spec 8.2 关闭）；Lighting Pass 背景从 RAYWHITE 清屏色改为程序化天空（沿视线采样 environment cubemap，`--disable-ibl` 时回退 skyColor 平色；调试视图背景仍由 debug.fs 按 GBuffer 深度判定为黑）；`tonemap.fs` 支持 `--tone-curve aces|reinhard|agx`（默认 aces 保持历史公式不变）；顺带移除 IBL 分支中未使用的 `environment` 采样死代码（environmentMap 现由天空背景真正消费）。
 
+实施更新（2026-09-03，阶段 C2 IBL 资源真实化）：IBL 链从手工单色 cubemap 升级为从程序化天空梯度（冷天顶/亮地平线/暗地面）出发的完整 split-sum 资源管线：irradiance 由 Fibonacci 球余弦卷积生成（全求积覆盖、对称性 0.0）；prefilter 六级由 GGX importance sampling 生成并按 GL mip 链规范（逐级减半）打包为一张 cubemap，shader 的 `textureLod(prefilterMap, r, roughness*maxLod)` 现在采样的是精确 IS 级别而非 box-filter 近似。修掉两个 CPU 数学 bug（Hammersley 双重反转使 xi≈0、Fibonacci 采样缺 2x 拉伸只覆盖上半球）。prefilter 查表走 8² 代理 cubemap，初始化 CPU 成本从 514s 降到 ~6s。
+
 实施更新（2026-09-03，阶段 A 基线工具）：新增 `stylized_motion.anim.render_stills`（离屏渲染单帧到 PNG，直读 render-target 纹理，绕开 macOS 隐藏窗口 `take_screenshot` 抓黑帧问题；final 视图为 FXAA 前显示目标，其余与交互路径一致）与 `stylized_motion.anim.compare_stills`（阈值化像素对比，超差退出码 1）。`docs/assets/pbr_baseline/` 提交了 14 张基线图（12 个调试视图 + legacy + SomaView final）与再生成/回归说明；Phase 0 的基线截图交付项关闭。
 
 ## 1. 目标

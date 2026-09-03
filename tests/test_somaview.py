@@ -190,6 +190,37 @@ def test_material_grid_scene_contract():
         raise AssertionError("expected ValueError for bogus scene mode")
 
 
+def test_ibl_chain_uses_convolution_and_importance_sampling():
+    import numpy as np
+
+    import stylized_motion.anim.environment as environment
+
+    source = Path(environment.__file__).read_text(encoding="utf-8")
+    # The irradiance map is convolved, not hand-painted; the prefilter mips
+    # come from GGX importance sampling with a real mip chain.
+    assert "def _convolve_irradiance" in source
+    assert "def _prefilter_environment" in source
+    assert "def _array_to_cubemap_mipped" in source
+    assert "1.0 - 2.0 * (indices + 0.5) / sample_count" in source  # full-sphere sampling
+
+    sky = environment._procedural_sky_array(16)
+    irradiance = environment._convolve_irradiance(sky, 16, output_size=8)
+    up = irradiance[2][4, 4]
+    down = irradiance[3][4, 4]
+    # The sky dome is brighter and bluer above the horizon.
+    assert up.sum() > down.sum()
+    assert up[2] > up[0]
+    # +-X face centers sample symmetric environment regions.
+    assert float(np.abs(irradiance[0][4, 4] - irradiance[1][4, 4]).max()) < 0.01
+
+    levels = environment._prefilter_environment(sky, 16, output_size=16, mips=3)
+    assert len(levels) == 3
+    assert levels[0].shape[1] == 16 and levels[1].shape[1] == 8 and levels[2].shape[1] == 4
+    # Rougher levels integrate a wider lobe: variance must drop.
+    variances = [float(level[2].var()) for level in levels]
+    assert variances[0] > variances[-1]
+
+
 def test_material_scene_and_texture_contract():
     from stylized_motion.anim.materials import Material, TEXTURE_CONTRACT
     from stylized_motion.anim.scene import DirectionalLight, RenderObject, Scene
