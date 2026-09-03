@@ -243,6 +243,15 @@ class PlaybackController:
         margin = 24
         return Rectangle(margin, screen_height - 52, screen_width - 2 * margin, 12)
 
+    def control_bar_rect(self, screen_width, screen_height):
+        """Background panel behind the readout + timeline track.
+
+        Shared by draw_ui and the HUD so overlays can stack against it
+        without hardcoding its geometry twice.
+        """
+        rect = self.timeline_rect(screen_width, screen_height)
+        return Rectangle(int(rect.x) - 8, int(rect.y) - 30, int(rect.width) + 16, int(rect.height) + 40)
+
     def _frame_from_mouse_x(self, rect, mouse_x):
         alpha = (float(mouse_x) - float(rect.x)) / max(float(rect.width), 1.0)
         alpha = float(np.clip(alpha, 0.0, 1.0))
@@ -272,15 +281,12 @@ class PlaybackController:
         readout = f"{label} {self.current_frame + 1}/{self.frame_count}   {self.current_speed:.2f}x"
 
         # Bottom control bar: readout above a padded timeline track.
-        bar_top = int(rect.y) - 30
-        DrawRectangleRounded(
-            Rectangle(int(rect.x) - 8, bar_top, int(rect.width) + 16, int(rect.height) + 40),
-            0.22, 8, Color(16, 19, 24, 195),
-        )
+        bar = self.control_bar_rect(screen_width, screen_height)
+        DrawRectangleRounded(bar, 0.22, 8, Color(16, 19, 24, 70))
         readout_color = Color(238, 241, 246, 255)
         readout_shadow = Color(10, 12, 16, 190)
-        DrawText(readout.encode(), int(rect.x) + 1, bar_top + 8, 16, readout_shadow)
-        DrawText(readout.encode(), int(rect.x), bar_top + 7, 16, readout_color)
+        DrawText(readout.encode(), int(bar.x) + 9, int(bar.y) + 8, 16, readout_shadow)
+        DrawText(readout.encode(), int(bar.x) + 8, int(bar.y) + 7, 16, readout_color)
         DrawRectangleRounded(rect, 0.5, 6, Color(58, 66, 76, 215))
         DrawRectangleRounded(
             Rectangle(int(rect.x), int(rect.y), fill_width, int(rect.height)),
@@ -1194,7 +1200,7 @@ class GenoView:
         (not black), text carries a soft offset shadow so it stays readable
         on both bright and dark scene regions.
         """
-        panel = Color(16, 19, 24, 195)
+        panel = Color(16, 19, 24, 70)
         shadow_color = Color(10, 12, 16, 190)
         muted_color = Color(222, 228, 236, 255)
         value_color = Color(248, 250, 252, 255)
@@ -1250,11 +1256,13 @@ class GenoView:
             for index, (text, color, size, lift) in enumerate(render_rows):
                 draw_text_shadow(text, margin + padding, render_top + padding + index * line_height + lift, size, color)
 
-        # --- Camera hint (bottom-right, above the timeline bar). ---
+        # --- Camera hint (bottom-right, stacked above the timeline bar). ---
         camera_hint = b"Ctrl+LMB orbit | Ctrl+RMB pan | Wheel zoom"
         hint_width = MeasureText(camera_hint, 15) + 24
-        hint_y = screen_height - 104
-        draw_panel(screen_width - hint_width - margin, hint_y, hint_width, 30)
+        hint_height = 30
+        bar = self.playback.control_bar_rect(screen_width, screen_height)
+        hint_y = int(bar.y) - hint_height - 8
+        draw_panel(screen_width - hint_width - margin, hint_y, hint_width, hint_height)
         draw_text_shadow(camera_hint, screen_width - hint_width - margin + 12, hint_y + 6, 15, value_color)
 
     def _reconstruct_full_local_pose_for(self, positions, rotations, frame_index):
