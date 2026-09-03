@@ -40,10 +40,10 @@ ANCHOR_TARGETS = {
     # achieved value is anchored rather than an unreachable photo reference;
     # making mid-sky itself that blue would push floor irradiance blue again.
     "sky": (169, 177, 187),
-    "floor_lit": (230, 228, 223),
-    "floor_shadow": (109, 128, 146),
-    "character_lit": (236, 196, 39),
-    "character_shadow": (205, 146, 21),
+    "floor_lit": (207, 209, 211),
+    "floor_shadow": (81, 97, 114),
+    "character_lit": (240, 222, 30),
+    "character_shadow": (223, 175, 19),
 }
 
 DEFAULT_TOLERANCE = 8.0

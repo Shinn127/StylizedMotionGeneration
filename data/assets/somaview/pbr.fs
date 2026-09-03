@@ -93,6 +93,12 @@ void main()
     vec3 normal = useNormalMap != 0 ? ResolveNormal(fragNormal, fragTexCoord) : normalize(fragNormal);
     float metallic = clamp(pbrMetallic, 0.0, 1.0);
     float roughness = clamp(pbrRoughness, 0.04, 1.0);
+    // The matte ground reflects the sun-behind-camera mirror band diffusely:
+    // raising its roughness spreads the specular lobe so the band reads as
+    // sheen instead of a clipped white sheet.
+    if (pbrGroundPattern != 0) {
+        roughness = clamp(roughness + 0.27, 0.04, 1.0);
+    }
     float ao = clamp(pbrAo, 0.0, 1.0);
     if (useMetallicRoughnessMap != 0) {
         vec3 packedMaterial = texture(metallicRoughnessMap, fragTexCoord).rgb;

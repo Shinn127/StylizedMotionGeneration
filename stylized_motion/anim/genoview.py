@@ -79,16 +79,15 @@ LEGACY_LIGHT_RIG = {
     "ground_albedo": (190, 190, 190),
 }
 
-# PBR rig, solved from display anchors by inverting exposure -> ACES -> sRGB
-# (spec 20.10): the floor lit/shadow anchors pin the direct:indirect ratio at
-# ~5:1 (sun-dominant outdoor, shadows read as form), the sun strength follows
-# from the unclamped blue ring's irradiance, and ibl-strength pairs with the
-# dome's near-neutral irradiance so floor shadow lands at (170,173,181).
+# PBR rig, display-first calibration (spec 20.10): anchors chosen for how the
+# sRGB monitor reads, not raw physics — a 4.3:1 direct:indirect ratio keeps
+# shadows as form while floor lit side sits ~207 sRGB (not washed out), and
+# the sky band stays soft gray-blue.
 PBR_LIGHT_RIG = {
     "light_dir": (0.45, -0.8, -0.35),
     "sun_color": (1.0, 240.0 / 255.0, 214.0 / 255.0),
     "sky_color": (170.0 / 255.0, 195.0 / 255.0, 228.0 / 255.0),
-    "sun_strength": 1.88,
+    "sun_strength": 0.717,
     "sky_strength": 0.35,
     "ground_strength": 0.25,
     "ambient_strength": 0.15,
@@ -705,7 +704,7 @@ class GenoView:
         roughness: float = 0.58,
         exposure: float = 0.9,
         ssao_intensity: float = 0.15,
-        ibl_strength: float = 0.45,
+        ibl_strength: float = 0.291,
         ibl_enabled: bool = True,
         shadow_resolution: int = 2048,
         output_video: Path | None = None,
@@ -896,6 +895,7 @@ class GenoView:
         self.use_normal_map_ptr = ffi.new("int*")
         self.debug_mode_ptr = ffi.new("int*")
         self.white_background_ptr = ffi.new("int*")
+        self.light_size_ptr = ffi.new("float*")
         self.shadow_texture_slot_ptr[0] = 10
         self.environment_texture_slot_ptr[0] = 11
         self.irradiance_texture_slot_ptr[0] = 12
@@ -1042,6 +1042,7 @@ class GenoView:
             self.shader_locs["lighting_white_background"] = GetShaderLocation(self.shaders["lighting"], b"whiteBackground")
             self.shader_locs["lighting_debug_mode"] = GetShaderLocation(self.shaders["lighting"], b"debugMode")
             self.shader_locs["lighting_shadow_texel_size"] = GetShaderLocation(self.shaders["lighting"], b"shadowTexelSize")
+            self.shader_locs["lighting_light_size"] = GetShaderLocation(self.shaders["lighting"], b"lightSize")
 
         if self.shading == "pbr":
             self.shader_locs["tonemap_input_texture"] = GetShaderLocation(self.shaders["tonemap"], b"inputTexture")
@@ -1050,6 +1051,8 @@ class GenoView:
             self.shader_locs["tonemap_white_background"] = GetShaderLocation(self.shaders["tonemap"], b"whiteBackground")
             self.tone_curve_ptr[0] = TONE_CURVES.index(self.tone_curve)
             self.white_background_ptr[0] = int(self.white_background)
+            # Sun disc diameter in world units: drives the PCSS penumbra width.
+            self.light_size_ptr[0] = 0.35
             self.shader_locs["debug_gbuffer_color"] = GetShaderLocation(self.shaders["debug"], b"texGbufferColor")
             self.shader_locs["debug_gbuffer_normal"] = GetShaderLocation(self.shaders["debug"], b"texGbufferNormal")
             self.shader_locs["debug_gbuffer_depth"] = GetShaderLocation(self.shaders["debug"], b"texGbufferDepth")
@@ -1469,7 +1472,7 @@ class GenoViewCompare(GenoView):
         roughness: float = 0.58,
         exposure: float = 0.9,
         ssao_intensity: float = 0.15,
-        ibl_strength: float = 0.45,
+        ibl_strength: float = 0.291,
         ibl_enabled: bool = True,
         shadow_resolution: int = 2048,
         output_video: Path | None = None,
@@ -1541,7 +1544,7 @@ def main():
     parser.add_argument("--scene", choices=SCENE_MODES, default="character", help="character: motion viewer scene; grid: 5x5 metallic/roughness material test grid.")
     parser.add_argument("--sun-strength", type=float, default=None, help="Direct light intensity. Defaults to the per-shading light rig value (PBR: 0.55, legacy: 0.25).")
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
-    parser.add_argument("--ibl-strength", type=float, default=0.45)
+    parser.add_argument("--ibl-strength", type=float, default=0.291)
     parser.add_argument("--disable-ibl", action="store_true")
     parser.add_argument("--shadow-resolution", type=int, default=2048)
     parser.add_argument("--output-video", type=Path, default=None, help="Render the full clip to an MP4 at this path.")

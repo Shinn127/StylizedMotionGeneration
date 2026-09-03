@@ -190,7 +190,7 @@ def main():
     parser.add_argument("--exposure", type=float, default=0.9)
     parser.add_argument("--sun-strength", type=float, default=None)
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
-    parser.add_argument("--ibl-strength", type=float, default=0.45)
+    parser.add_argument("--ibl-strength", type=float, default=0.291)
     parser.add_argument("--tone-curve", choices=TONE_CURVES, default="aces")
     parser.add_argument("--white-background", action="store_true", help="Flat pure-white background (paper figure mode).")
     parser.add_argument("--scene", choices=SCENE_MODES, default="character")
