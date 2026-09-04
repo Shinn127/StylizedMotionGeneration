@@ -73,6 +73,7 @@ def main():
     parser.add_argument("--output-video", type=Path, default=None, help="Render the full clip to an MP4 at this path.")
     parser.add_argument("--skeleton", action="store_true", help="Draw the character skeleton overlay (joints, bone links, per-joint XYZ frames). Toggle at runtime with B.")
     parser.add_argument("--debug-view", choices=DEBUG_MODES, default="final", help="Initial PBR debug view. Cycle at runtime with V (Shift+V to go back).")
+    parser.add_argument("--base-color-map", type=Path, default=None, help="Optional sRGB base-color map applied to the character's default material.")
     parser.add_argument("--normal-map", type=Path, default=None, help="Optional tangent-space normal map applied to the character's default material.")
     parser.add_argument("--metallic-roughness-map", type=Path, default=None, help="Optional linear map (R=metallic, G=roughness, B=AO) applied to the character's default material.")
     parser.add_argument("--sun-strength", type=float, default=None, help="Direct light intensity. Defaults to the per-shading light rig value (PBR: 0.55, legacy: 0.25).")
@@ -119,6 +120,7 @@ def main():
         output_video=args.output_video,
         draw_skeleton=args.skeleton,
         debug_view=args.debug_view,
+        base_color_map=args.base_color_map,
         normal_map=args.normal_map,
         metallic_roughness_map=args.metallic_roughness_map,
         sun_strength=args.sun_strength,

@@ -42,7 +42,7 @@ out vec4 finalColor;
 void main()
 {
     float depth = texture(gbufferDepth, fragTexCoord).r;
-    if (depth == 1.0f) { discard; }
+    if (depth >= 0.99999) { discard; }
 
     vec3 fragNormal = texture(gbufferNormal, fragTexCoord).xyz * 2.0 - 1.0;
     
@@ -60,6 +60,8 @@ void main()
         vec3 next = base + radius * vec3(Spiral(i, turns, seed.x), 0.0);
         vec4 ntex = camProj * vec4(next, 1);
         vec2 sampleTexCoord = (ntex.xy / ntex.w) * 0.5f + 0.5f;
+        if (sampleTexCoord.x <= 0.0 || sampleTexCoord.x >= 1.0 ||
+            sampleTexCoord.y <= 0.0 || sampleTexCoord.y >= 1.0) { continue; }
         vec3 actu = CameraSpace(sampleTexCoord, texture(gbufferDepth, sampleTexCoord).r);
         vec3 diff = actu - base;
         float vv = dot(diff, diff);

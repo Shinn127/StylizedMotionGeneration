@@ -64,6 +64,7 @@ def render_still(args: argparse.Namespace) -> Path:
         resources_root=resources_root,
         shading=args.shading,
         debug_view=args.debug_view,
+        base_color_map=args.base_color_map,
         metallic=args.metallic,
         roughness=args.roughness,
         exposure=args.exposure,
@@ -142,6 +143,8 @@ def render_still(args: argparse.Namespace) -> Path:
         image = LoadImageFromTexture(target.texture)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         ExportImage(image, str(args.output).encode("utf-8"))
+        from raylib import UnloadImage
+        UnloadImage(image)
     finally:
         viewer._cleanup()
         CloseWindow()
@@ -158,6 +161,7 @@ def main():
     parser.add_argument("--resources-root", type=Path, default=None)
     parser.add_argument("--shading", choices=("legacy", "pbr"), default="pbr")
     parser.add_argument("--debug-view", choices=DEBUG_MODES, default="final")
+    parser.add_argument("--base-color-map", type=Path, default=None)
     parser.add_argument("--frame", type=int, default=0, help="Playback frame index to render.")
     parser.add_argument("--hud", action="store_true", help="Draw the interactive HUD panels into the still.")
     parser.add_argument("--width", type=int, default=1280)

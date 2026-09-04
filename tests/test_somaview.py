@@ -57,6 +57,7 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         assert "finalColor = vec4(direct + ambient, 1.0)" in pbr_lighting
         assert "uniform float ssaoIntensity" in ssao
         assert "shadowMap" not in ssao
+        assert "sampleTexCoord.x <= 0.0" in ssao
     for shader in ("pbr.fs", "lighting.fs", "pbrLighting.fs", "ssao.fs", "tonemap.fs", "debug.fs"):
         assert (RESOURCE_DIR / shader).read_bytes() == (SOMA_RESOURCE_DIR / shader).read_bytes()
 
@@ -246,6 +247,28 @@ def test_ibl_chain_uses_convolution_and_importance_sampling():
     # Rougher levels integrate a wider lobe: variance must drop.
     variances = [float(level[2].var()) for level in levels]
     assert variances[0] > variances[-1]
+
+
+def test_ibl_upload_preserves_hdr_precision():
+    import stylized_motion.anim.environment as environment
+
+    source = Path(environment.__file__).read_text(encoding="utf-8")
+    assert "np.float16" in source
+    assert "PIXELFORMAT_UNCOMPRESSED_R16G16B16A16" in source
+    assert "np.clip(faces[face], 0.0, 65504.0)" in source
+
+
+def test_base_color_map_is_exposed_across_viewer_entrypoints():
+    geno_source = Path(__file__).resolve().parents[1] / "stylized_motion" / "anim" / "genoview.py"
+    source = geno_source.read_text(encoding="utf-8")
+    assert "base_color_map: Path | None = None" in source
+    assert "--base-color-map" in source
+    assert "base_color_map=base_color_map" in source
+
+    soma_source = (Path(__file__).resolve().parents[1] / "stylized_motion" / "anim" / "somaview.py").read_text(encoding="utf-8")
+    still_source = (Path(__file__).resolve().parents[1] / "stylized_motion" / "anim" / "render_stills.py").read_text(encoding="utf-8")
+    assert "--base-color-map" in soma_source
+    assert "--base-color-map" in still_source
 
 
 def test_material_scene_and_texture_contract():

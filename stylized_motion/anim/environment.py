@@ -69,7 +69,7 @@ def _procedural_sky_array(face_size: int = 32) -> np.ndarray:
 
 
 def _array_to_cubemap(faces: np.ndarray) -> Texture:
-    """Upload a (6, size, size, 3) float array (0-1) as a single-mip cubemap."""
+    """Upload a (6, size, size, 3) linear-radiance array as a cubemap."""
     return _array_to_cubemap_mipped([faces])
 
 
@@ -78,7 +78,7 @@ def _array_to_cubemap_mipped(levels: list[np.ndarray]) -> Texture:
 
     rlLoadTextureCubemap expects the byte stream as: for each mip level
     (base first), the six square faces (+X,-X,+Y,-Y,+Z,-Z) as contiguous
-    s_k x s_k RGBA8 blocks; the level sizes halve per mip. Going through the
+    s_k x s_k RGBA16F blocks; the level sizes halve per mip. Going through the
     image path instead cannot inject custom per-level content (LoadCubemap
     only converts the base level and re-derives the rest), so the raw data
     pointer path is used here.
@@ -91,19 +91,20 @@ def _array_to_cubemap_mipped(levels: list[np.ndarray]) -> Texture:
     for faces in levels:
         level_size = faces.shape[1]
         for face in range(6):
-            atlas = (np.clip(faces[face], 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
-            rgba = np.concatenate([atlas, np.full((level_size, level_size, 1), 255, dtype=np.uint8)], axis=2)
+            rgba = np.empty((level_size, level_size, 4), dtype=np.float16)
+            rgba[..., :3] = np.clip(faces[face], 0.0, 65504.0)
+            rgba[..., 3] = np.float16(1.0)
             chunks.append(np.ascontiguousarray(rgba).tobytes())
     data = b"".join(chunks)
 
-    texture_id = rlLoadTextureCubemap(data, size, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, mip_count)
+    texture_id = rlLoadTextureCubemap(data, size, PIXELFORMAT_UNCOMPRESSED_R16G16B16A16, mip_count)
     assert texture_id != 0, "rlLoadTextureCubemap failed for the prefilter chain"
     texture = Texture()
     texture.id = texture_id
     texture.width = size
     texture.height = size
     texture.mipmaps = mip_count
-    texture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8
+    texture.format = PIXELFORMAT_UNCOMPRESSED_R16G16B16A16
     return texture
 
 

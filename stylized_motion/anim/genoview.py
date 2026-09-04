@@ -731,6 +731,7 @@ class GenoView:
         output_video: Path | None = None,
         draw_skeleton: bool = False,
         debug_view: str = "final",
+        base_color_map: Path | None = None,
         normal_map: Path | None = None,
         metallic_roughness_map: Path | None = None,
         sun_strength: float | None = None,
@@ -752,6 +753,7 @@ class GenoView:
         self.skeleton_enabled = bool(draw_skeleton)
         self.skeleton_color = GRAY
         self.debug_view = debug_view
+        self.base_color_map_path = base_color_map
         self.normal_map_path = normal_map
         self.metallic_roughness_map_path = metallic_roughness_map
         self.shading = shading
@@ -1097,6 +1099,8 @@ class GenoView:
         # Material maps need the GL context, so they are loaded here instead of
         # __init__; they ride on the default material of the skinned character.
         if self.shading == "pbr":
+            if self.base_color_map_path is not None:
+                self.default_material.base_color_map = load_material_texture(self.base_color_map_path, "base_color_map")
             if self.normal_map_path is not None:
                 self.default_material.normal_map = load_material_texture(self.normal_map_path, "normal_map")
             if self.metallic_roughness_map_path is not None:
@@ -1507,6 +1511,7 @@ class GenoViewCompare(GenoView):
         output_video: Path | None = None,
         draw_skeleton: bool = False,
         debug_view: str = "final",
+        base_color_map: Path | None = None,
         normal_map: Path | None = None,
         metallic_roughness_map: Path | None = None,
         sun_strength: float | None = None,
@@ -1538,6 +1543,7 @@ class GenoViewCompare(GenoView):
             output_video=output_video,
             draw_skeleton=draw_skeleton,
             debug_view=debug_view,
+            base_color_map=base_color_map,
             normal_map=normal_map,
             metallic_roughness_map=metallic_roughness_map,
             sun_strength=sun_strength,
@@ -1585,6 +1591,7 @@ def main():
     parser.add_argument("--output-video", type=Path, default=None, help="Render the full clip to an MP4 at this path.")
     parser.add_argument("--skeleton", action="store_true", help="Draw the character skeleton overlay (joints, bone links, per-joint XYZ frames). Toggle at runtime with B.")
     parser.add_argument("--debug-view", choices=DEBUG_MODES, default="final", help="Initial PBR debug view. Cycle at runtime with V (Shift+V to go back).")
+    parser.add_argument("--base-color-map", type=Path, default=None, help="Optional sRGB base-color map applied to the character's default material.")
     parser.add_argument("--normal-map", type=Path, default=None, help="Optional tangent-space normal map applied to the character's default material.")
     parser.add_argument("--metallic-roughness-map", type=Path, default=None, help="Optional linear map (R=metallic, G=roughness, B=AO) applied to the character's default material.")
     args = parser.parse_args()
@@ -1627,6 +1634,7 @@ def main():
         output_video=args.output_video,
         draw_skeleton=args.skeleton,
         debug_view=args.debug_view,
+        base_color_map=args.base_color_map,
         normal_map=args.normal_map,
         metallic_roughness_map=args.metallic_roughness_map,
         sun_strength=args.sun_strength,

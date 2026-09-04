@@ -32,6 +32,7 @@ def test_render_stills_supports_viewer_and_debug_options():
         "--tone-curve",
         "--normal-map",
         "--metallic-roughness-map",
+        "--base-color-map",
         "--disable-ibl",
         "--sun-strength",
     ):

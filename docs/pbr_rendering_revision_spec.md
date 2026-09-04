@@ -10,11 +10,11 @@
 
 执行口径：本 spec 以当前项目已有的 Deferred Renderer 为基础，保留动画、Skinning、相机、资源格式和 viewer 入口。修订分阶段完成；第一阶段只修复职责边界和颜色管线，不一次性实现全部 IBL 或现代实时渲染技术。
 
-当前实施记录（2026-08-31）：Phase 1、Phase 2 已完成，Phase 3 已落地程序化 environment/irradiance 资源、environment/prefilter mip 链、GGX split-sum BRDF LUT 以及独立 IBL 采样路径。Phase 4 仍负责 normal map 的 TBN 应用、AO map 的材质级间接光接入和材质测试场景；legacy 地面网格调制保留在 PBR GBuffer 中作为视觉兼容项。
+当前实施记录（2026-09-04）：Phase 1～4 的功能项已落地；当前修订集中在 IBL HDR 精度、纹理入口、SSAO 边界和运行时验证。legacy 地面网格调制保留在 PBR GBuffer 中作为视觉兼容项。
 
 实施更新（2026-09-03）：Debug View 已落地，Phase 0 的 debug 参数交付项关闭。模式为 final/base_color/metallic/roughness/normal/depth/ao/shadow/diffuse/specular/ibl/hdr；运行时 `V`（`Shift+V` 反向）循环，`--debug-view` 指定初始模式。shadow/diffuse/specular/ibl 由 `pbrLighting.fs` 的 `debugMode` 输出到 HDR target，其余模式由新增 `debug.fs` 显示 pass 直接读取 GBuffer/SSAO/HDR 纹理；调试显示只做 exposure + linear→sRGB，不经过 ACES，且跳过 FXAA。
 
-实施更新（2026-09-03，Phase 4 前半）：normal mapping 与材质 AO 已落地。顶点切线管线（含蒙皮切线变换）此前已就绪；`pbr.fs` 现构建 TBN 并采样 `normalMap.rg`（z 分量由 xy 重建，兼容标准 RGB 法线贴图），退化切线回退几何法线。GBuffer 新增第三个 R8 attachment（`gbufferMaterialAO`），材质 ao（uniform 或 `metallicRoughnessMap.B`）经此进入 lighting，与 SSAO 相乘后仅作用于间接光。viewer CLI 新增 `--normal-map` 与 `--metallic-roughness-map`，应用到角色默认材质。材质测试场景（material grid）仍属 Phase 4 未完成项。
+实施更新（2026-09-04）：normal mapping、材质 AO、材质网格和三类材质纹理入口均已落地。顶点切线管线（含蒙皮切线变换）构建 TBN 并采样 `normalMap.rg`（z 分量由 xy 重建，兼容标准 RGB 法线贴图），退化切线回退几何法线。GBuffer 新增第三个 R8 attachment（`gbufferMaterialAO`），材质 ao（uniform 或 `metallicRoughnessMap.B`）经此进入 lighting，与 SSAO 相乘后仅作用于间接光。viewer CLI 通过 `--base-color-map`、`--normal-map` 与 `--metallic-roughness-map` 应用到角色默认材质；`--scene grid` 提供材质测试场景。
 
 实施更新（2026-09-03，阶段 B 视觉升级）：Shadow 升级为 3×3 PCF（`shadowTexelSize` uniform，spec 8.2 关闭）；Lighting Pass 背景从 RAYWHITE 清屏色改为程序化天空（沿视线采样 environment cubemap，`--disable-ibl` 时回退 skyColor 平色；调试视图背景仍由 debug.fs 按 GBuffer 深度判定为黑）；`tonemap.fs` 支持 `--tone-curve aces|reinhard|agx`（默认 aces 保持历史公式不变）；顺带移除 IBL 分支中未使用的 `environment` 采样死代码（environmentMap 现由天空背景真正消费）。
 
@@ -558,7 +558,7 @@ python -m stylized_motion.run --mode visualize --pipeline somaview --bvh <small_
 
 ### 20.1 RGBA8 albedo 精度
 
-当前 GBuffer0 使用 RGBA8。第一阶段保持该格式以降低改动面；引入高对比度 HDR 材质或纹理后，应评估使用 sRGB attachment、RGB10A2 或更高精度 albedo target 的成本。
+当前 GBuffer0 使用 RGBA8。材质 albedo 仍受该 attachment 的 8-bit 精度限制；IBL environment/irradiance/prefilter 已使用 RGBA16F，避免程序化天空高光在上传阶段被截断。
 
 ### 20.2 Shadow 与 SSAO 资源尺寸
 
