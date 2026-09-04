@@ -563,7 +563,7 @@ python -m stylized_motion.run \
   --stats-source data/processed/100style_pruned_90/feature_database
 ```
 
-GenoView 支持播放、暂停、逐帧移动、速度调整、时间轴拖拽和相机交互。渲染默认使用 PBR；`--shading legacy` 可切换到 legacy 光照模型。PBR 使用 Cook-Torrance 光照、独立 HDR/Tone Mapping 和 ACES approximation。可用 `--ssao-intensity` 调整 AO 强度（默认 `0.15`）。PBR 灯光按 per-shading rig 取默认值（暖阳光 + 冷天光，直接光 0.55），可用 `--sun-strength` 覆盖直接光强；legacy 模式保持 GenoViewPython 原始数值。
+GenoView 支持播放、暂停、逐帧移动、速度调整、时间轴拖拽和相机交互。渲染默认使用 PBR；`--shading legacy` 可切换到 legacy 光照模型。PBR 使用 Cook-Torrance 光照、三级 CSM 阴影、horizon-based GTAO、独立 HDR/Tone Mapping 和 ACES approximation。可用 `--ssao-intensity` 调整 AO 强度（默认 `0.15`）。PBR 灯光按 per-shading rig 取默认值（暖阳光 + 冷天光，直接光 0.55），可用 `--sun-strength` 覆盖直接光强；legacy 模式保持 GenoViewPython 原始数值。
 
 PBR Geometry Pass 的默认材质由 `Material` 描述，`Scene` 管理 `RenderObject` 和 `DirectionalLight`，`RenderTargets` 管理 GBuffer、HDR、Shadow 和 AO 资源。材质纹理约定为：`base_color_map` 使用 sRGB（CLI：`--base-color-map`），`metallic_roughness_map` 的 RGB 分别为 Metallic/Roughness/AO，`normal_map` 使用线性 tangent-space 数据；加载材质纹理时会生成 mipmap。IBL environment/irradiance/prefilter 使用 RGBA16F 上传以保留线性 HDR 辐射度。
 

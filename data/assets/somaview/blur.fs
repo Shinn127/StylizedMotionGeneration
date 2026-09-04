@@ -32,9 +32,12 @@ out vec4 finalColor;
 void main()
 {
     float depth = texture(gbufferDepth, fragTexCoord).r;
-    if (depth == 1.0f) { discard; }
+    if (depth >= 0.99999) {
+        finalColor = vec4(1.0, 1.0, 1.0, 1.0);
+        return;
+    }
 
-    vec3 baseNormal = texture(gbufferNormal, fragTexCoord).rgb * 2.0f - 1.0f;
+    vec3 baseNormal = normalize(texture(gbufferNormal, fragTexCoord).rgb * 2.0f - 1.0f);
     vec3 basePosition = CameraSpace(fragTexCoord, depth);
     
     vec4 totalColor = vec4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -43,10 +46,14 @@ void main()
     
     for (int x = -3; x <= 3; x++)
     {
-        vec2 sampleTexcoord = fragTexCoord + float(x) * stride * blurDirection * invTextureResolution;
+        vec2 sampleTexcoord = clamp(
+            fragTexCoord + float(x) * stride * blurDirection * invTextureResolution,
+            vec2(0.0), vec2(1.0));
+        float sampleDepth = texture(gbufferDepth, sampleTexcoord).r;
+        if (sampleDepth >= 0.99999) { continue; }
         vec4 sampleColour = texture(inputTexture, sampleTexcoord);
-        vec3 sampleNormal = texture(gbufferNormal, sampleTexcoord).rgb * 2.0f - 1.0f;
-        vec3 samplePosition = CameraSpace(sampleTexcoord, texture(gbufferDepth, sampleTexcoord).r);
+        vec3 sampleNormal = normalize(texture(gbufferNormal, sampleTexcoord).rgb * 2.0f - 1.0f);
+        vec3 samplePosition = CameraSpace(sampleTexcoord, sampleDepth);
         
         vec3 diffPosition = (samplePosition - basePosition) / 0.05f;
 
@@ -59,7 +66,5 @@ void main()
         totalWeight += weight;
     }
     
-    finalColor = totalColor / totalWeight;    
-    
-    //finalColor = texture(inputTexture, fragTexCoord);
+    finalColor = totalWeight > 0.0f ? totalColor / totalWeight : texture(inputTexture, fragTexCoord);
 }

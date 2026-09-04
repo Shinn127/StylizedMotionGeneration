@@ -14,6 +14,8 @@
 
 实施更新（2026-09-04，CSM）：PBR Shadow Pass 已升级为 3 级 cascaded shadow maps。viewer 每帧按相机深度生成 logarithmic/uniform 混合 split（lambda=0.75），对每级 light frustum 做 texel snapping 和独立 near/far fitting；lighting shader 按 camera depth 选择对应 shadow map，并继续使用 3×3 PCF。legacy 路径保留单张 shadow map。
 
+实施更新（2026-09-04，GTAO）：SSAO Pass 已升级为轻量 horizon-based GTAO 近似。每个像素沿 8 条屏幕空间方向进行 4 步深度重建，按每条射线的最高 horizon 贡献计算接触遮蔽，再通过现有 bilateral blur 保留几何边界；天空采样、屏幕边缘和零权重邻域均显式处理，AO 仍只作用于间接光。
+
 实施更新（2026-09-03）：Debug View 已落地，Phase 0 的 debug 参数交付项关闭。模式为 final/base_color/metallic/roughness/normal/depth/ao/shadow/diffuse/specular/ibl/hdr；运行时 `V`（`Shift+V` 反向）循环，`--debug-view` 指定初始模式。shadow/diffuse/specular/ibl 由 `pbrLighting.fs` 的 `debugMode` 输出到 HDR target，其余模式由新增 `debug.fs` 显示 pass 直接读取 GBuffer/SSAO/HDR 纹理；调试显示只做 exposure + linear→sRGB，不经过 ACES，且跳过 FXAA。
 
 实施更新（2026-09-04）：normal mapping、材质 AO、材质网格和三类材质纹理入口均已落地。顶点切线管线（含蒙皮切线变换）构建 TBN 并采样 `normalMap.rg`（z 分量由 xy 重建，兼容标准 RGB 法线贴图），退化切线回退几何法线。GBuffer 新增第三个 R8 attachment（`gbufferMaterialAO`），材质 ao（uniform 或 `metallicRoughnessMap.B`）经此进入 lighting，与 SSAO 相乘后仅作用于间接光。viewer CLI 通过 `--base-color-map`、`--normal-map` 与 `--metallic-roughness-map` 应用到角色默认材质；`--scene grid` 提供材质测试场景。
@@ -287,12 +289,12 @@ PBR 在此基础上使用 3 级 CSM：近裁剪面到远裁剪面的 split 采�
 ## 9. SSAO 规范
 
 - SSAO 只输出 AO，推荐单通道 R8 或现有 RGBA target 的 `.r` 通道；
-- AO 范围、bias、sample count 先保持当前视觉基线；
+- 当前实现使用 4 个方向、双侧 4 步 horizon search；半径保持 0.5 世界单位，`ssaoIntensity` 继续作为唯一强度入口；
 - AO bilateral blur 只读取 GBuffer normal/depth 和 AO 输入；
 - Lighting 中使用 `indirect *= ao`；
 - 不对 direct light 乘 AO；
 - 不把 sky/ground/IBL 分量拆成不同的 AO 语义；
-- 增加 AO 强度 uniform，默认值保持当前效果附近。
+- 屏幕边缘采样坐标 clamp 到有效范围，天空邻居不参与 blur，邻域无有效权重时保留中心 AO。
 
 ## 10. PBR Lighting 规范
 

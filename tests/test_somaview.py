@@ -66,8 +66,18 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         assert "finalColor = vec4(direct + ambient, 1.0)" in pbr_lighting
         assert "uniform float ssaoIntensity" in ssao
         assert "shadowMap" not in ssao
+        assert "#define GTAO_DIRECTION_COUNT 4" in ssao
+        assert "#define GTAO_STEP_COUNT 4" in ssao
+        assert "float horizonCosine" in ssao
+        assert "horizon = max(horizon, horizonCosine * falloff * normalWeight);" in ssao
+        assert "vec2 radiusUV = ProjectedRadius(basePosition.z, radius);" in ssao
+        assert "finalColor = vec4(1.0, 1.0, 1.0, 1.0);" in ssao
         assert "sampleTexCoord.x <= 0.0" in ssao
-    for shader in ("pbr.fs", "lighting.fs", "pbrLighting.fs", "pbrShadow.fs", "shadow.fs", "ssao.fs", "tonemap.fs", "debug.fs"):
+        blur = (resource_dir / "blur.fs").read_text(encoding="utf-8")
+        assert "sampleTexcoord = clamp" in blur
+        assert "sampleDepth >= 0.99999" in blur
+        assert "totalWeight > 0.0f" in blur
+    for shader in ("pbr.fs", "lighting.fs", "pbrLighting.fs", "pbrShadow.fs", "shadow.fs", "ssao.fs", "blur.fs", "tonemap.fs", "debug.fs"):
         assert (RESOURCE_DIR / shader).read_bytes() == (SOMA_RESOURCE_DIR / shader).read_bytes()
 
     pbr_shadow = (RESOURCE_DIR / "pbrShadow.fs").read_text(encoding="utf-8")
