@@ -53,11 +53,6 @@ float NonlinearDepth(float depth, float near, float far)
     return (((2.0 * near) / depth) - far - near) / (near - far);
 }
 
-float LinearDepth(float depth, float near, float far)
-{
-    return (2.0 * near) / (far + near - depth * (far - near));
-}
-
 vec3 SRGBToLinear(vec3 color)
 {
     return pow(max(color, vec3(0.0)), vec3(2.2));

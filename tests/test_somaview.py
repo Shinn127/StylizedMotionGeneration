@@ -56,6 +56,7 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         assert "uniform vec3 cascadeSplits" in pbr_lighting
         assert "float cameraDepth = -(camView * vec4(position, 1.0)).z;" in pbr_lighting
         assert "float receiverDepth = lightPosition.z;" in pbr_lighting
+        assert "float LinearDepth" not in pbr_lighting
         assert "float depthSlope = max(abs(dFdx(receiverDepth)), abs(dFdy(receiverDepth)));" in pbr_lighting
         assert "float depthBias = baseBias + 1.5 * depthSlope;" in pbr_lighting
         assert "vec2 sampleCoord = clamp" in pbr_lighting
