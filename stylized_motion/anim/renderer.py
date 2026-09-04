@@ -46,7 +46,7 @@ class Renderer:
     def render_shadow(self):
         view = self.view
         if view.shading == "pbr":
-            splits, shadow_lights = _update_cascade_shadow_lights(view)
+            splits, shadow_lights, shadow_biases = _update_cascade_shadow_lights(view)
             light_view_projs = []
             for index, (shadow_light, _, _) in enumerate(shadow_lights):
                 begin_shadow_map(view.shadow_maps[index], shadow_light)
@@ -56,7 +56,7 @@ class Renderer:
                     render_object.model.materials[0].shader = view.shaders[shader_key]
                     DrawModel(render_object.model, render_object.position, render_object.scale, WHITE)
                 end_shadow_map()
-            return light_view_projs, splits
+            return light_view_projs, splits, shadow_biases
 
         begin_shadow_map(view.shadow_maps[0], view.shadow_light)
         light_view_proj = MatrixMultiply(rlGetMatrixModelview(), rlGetMatrixProjection())
@@ -171,7 +171,7 @@ class Renderer:
             view.ssao_front.texture, view.ssao_texture_slot_ptr,
         )
         if view.shading == "pbr":
-            light_view_projs, cascade_splits = shadow_data
+            light_view_projs, cascade_splits, shadow_biases = shadow_data
             for index in range(CSM_CASCADE_COUNT):
                 set_shader_value_shadow_map(
                     view.shaders["lighting"], view.shader_locs[f"lighting_shadow_map_{index}"],
@@ -185,6 +185,12 @@ class Renderer:
             SetShaderValue(
                 view.shaders["lighting"], view.shader_locs["lighting_cascade_splits"],
                 view.shadow_cascade_splits_ptr, SHADER_UNIFORM_VEC3,
+            )
+            for index in range(CSM_CASCADE_COUNT):
+                view.shadow_bias_ptr[index] = shadow_biases[index]
+            SetShaderValue(
+                view.shaders["lighting"], view.shader_locs["lighting_shadow_bias"],
+                view.shadow_bias_ptr, SHADER_UNIFORM_VEC3,
             )
             set_shader_value_texture_slot(
                 view.shaders["lighting"], view.shader_locs["lighting_material_ao"],
@@ -417,6 +423,7 @@ def _update_cascade_shadow_lights(view):
     light_up /= np.linalg.norm(light_up)
 
     shadow_lights = []
+    shadow_biases = []
     previous_split = camera_near
     for index, split in enumerate(splits):
         corners = _frustum_corners(camera, previous_split, split, aspect)
@@ -442,6 +449,8 @@ def _update_cascade_shadow_lights(view):
         )
         light_near = max(0.01, float(-light_space[:, 2].max()) - CSM_Z_PADDING)
         light_far = float(-light_space[:, 2].min()) + CSM_Z_PADDING
+        depth_range = light_far - light_near
+        shadow_biases.append(max(2.0 / 65535.0, 0.25 * texel_size / depth_range))
         shadow_light = view.shadow_lights[index]
         shadow_light.target = Vector3(*center)
         shadow_light.position = Vector3(*position)
@@ -452,4 +461,4 @@ def _update_cascade_shadow_lights(view):
         shadow_light.far = light_far
         shadow_lights.append((shadow_light, light_near, light_far))
         previous_split = split
-    return splits, shadow_lights
+    return splits, shadow_lights, shadow_biases

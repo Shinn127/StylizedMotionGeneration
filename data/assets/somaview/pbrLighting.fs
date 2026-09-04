@@ -35,6 +35,7 @@ uniform float prefilterMaxLod;
 uniform int useIBL;
 uniform int whiteBackground;
 uniform vec2 shadowTexelSize;
+uniform vec3 shadowBias;
 uniform vec3 cascadeSplits;
 // 0 final image, 1 shadow, 2 direct diffuse, 3 direct specular, 4 indirect light
 uniform int debugMode;
@@ -87,7 +88,7 @@ vec3 FresnelSchlick(float vDotH, vec3 f0)
     return f0 + (1.0 - f0) * pow(1.0 - vDotH, 5.0);
 }
 
-float ShadowFactorFor(vec3 position, vec3 normal, mat4 lightViewProj, sampler2D shadowMap)
+float ShadowFactorFor(vec3 position, vec3 normal, mat4 lightViewProj, sampler2D shadowMap, float baseBias)
 {
     vec4 lightPosition = lightViewProj * vec4(position + 0.01 * normal, 1.0);
     lightPosition.xyz = (lightPosition.xyz / lightPosition.w + 1.0) * 0.5;
@@ -96,7 +97,8 @@ float ShadowFactorFor(vec3 position, vec3 normal, mat4 lightViewProj, sampler2D 
         lightPosition.z > 0.0 && lightPosition.z < 1.0;
     if (!inside) { return 1.0; }
     float receiverDepth = lightPosition.z;
-    float depthBias = max(0.00005, shadowTexelSize.x);
+    float depthSlope = max(abs(dFdx(receiverDepth)), abs(dFdy(receiverDepth)));
+    float depthBias = baseBias + 1.5 * depthSlope;
     // 3x3 percentage-closer filtering over the shadow map; the constant depth
     // bias stays per-sample and shadow never routes through the SSAO blur.
     float shadow = 0.0;
@@ -115,12 +117,12 @@ float ShadowFactorFor(vec3 position, vec3 normal, mat4 lightViewProj, sampler2D 
 float ShadowFactor(vec3 position, vec3 normal, float cameraDepth)
 {
     if (cameraDepth <= cascadeSplits.x) {
-        return ShadowFactorFor(position, normal, lightViewProj0, shadowMap0);
+        return ShadowFactorFor(position, normal, lightViewProj0, shadowMap0, shadowBias.x);
     }
     if (cameraDepth <= cascadeSplits.y) {
-        return ShadowFactorFor(position, normal, lightViewProj1, shadowMap1);
+        return ShadowFactorFor(position, normal, lightViewProj1, shadowMap1, shadowBias.y);
     }
-    return ShadowFactorFor(position, normal, lightViewProj2, shadowMap2);
+    return ShadowFactorFor(position, normal, lightViewProj2, shadowMap2, shadowBias.z);
 }
 
 void main()

@@ -52,10 +52,12 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         assert "textureLod(prefilterMap" in pbr_lighting
         # Three-cascade CSM with 3x3 PCF and the procedural sky background
         assert "uniform vec2 shadowTexelSize" in pbr_lighting
+        assert "uniform vec3 shadowBias" in pbr_lighting
         assert "uniform vec3 cascadeSplits" in pbr_lighting
         assert "float cameraDepth = -(camView * vec4(position, 1.0)).z;" in pbr_lighting
         assert "float receiverDepth = lightPosition.z;" in pbr_lighting
-        assert "float depthBias = max(0.00005, shadowTexelSize.x);" in pbr_lighting
+        assert "float depthSlope = max(abs(dFdx(receiverDepth)), abs(dFdy(receiverDepth)));" in pbr_lighting
+        assert "float depthBias = baseBias + 1.5 * depthSlope;" in pbr_lighting
         assert "vec2 sampleCoord = clamp" in pbr_lighting
         assert "shadow / 9.0" in pbr_lighting
         # Sky background samples linear-radiance environment data directly.

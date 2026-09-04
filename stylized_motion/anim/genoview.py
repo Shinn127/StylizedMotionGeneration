@@ -920,6 +920,7 @@ class GenoView:
         self.shadow_texture_slot_ptr = ffi.new("int*")
         self.shadow_texture_slot_ptrs = [ffi.new("int*") for _ in range(3)]
         self.shadow_cascade_splits_ptr = ffi.new("float[3]")
+        self.shadow_bias_ptr = ffi.new("float[3]")
         self.environment_texture_slot_ptr = ffi.new("int*")
         self.irradiance_texture_slot_ptr = ffi.new("int*")
         self.prefilter_texture_slot_ptr = ffi.new("int*")
@@ -1091,6 +1092,7 @@ class GenoView:
             self.shader_locs["lighting_white_background"] = GetShaderLocation(self.shaders["lighting"], b"whiteBackground")
             self.shader_locs["lighting_debug_mode"] = GetShaderLocation(self.shaders["lighting"], b"debugMode")
             self.shader_locs["lighting_shadow_texel_size"] = GetShaderLocation(self.shaders["lighting"], b"shadowTexelSize")
+            self.shader_locs["lighting_shadow_bias"] = GetShaderLocation(self.shaders["lighting"], b"shadowBias")
             self.shader_locs["lighting_cascade_splits"] = GetShaderLocation(self.shaders["lighting"], b"cascadeSplits")
             self.shader_locs["lighting_cam_view"] = GetShaderLocation(self.shaders["lighting"], b"camView")
 
