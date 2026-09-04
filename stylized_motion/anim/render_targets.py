@@ -103,9 +103,10 @@ def set_shader_value_texture_slot(shader, loc_index, texture, slot_ptr):
     """Bind a 2D texture to an explicit texture slot.
 
     raylib's SetShaderValueTexture keys samplers off texture.id, which collides
-    with the manually managed slots (shadow map 10, environment 11-13, BRDF
-    LUT 14) whenever a render target's GL texture name lands on those numbers.
-    Multi-texture passes must bind their textures to dedicated slots instead.
+    with the manually managed slots (shadow maps 10-12, environment 13-15,
+    BRDF LUT 16) whenever a render target's GL texture name lands on those
+    numbers. Multi-texture passes must bind their textures to dedicated slots
+    instead.
     """
     if loc_index > -1:
         rlEnableShader(shader.id)
@@ -199,6 +200,7 @@ class RenderTargets:
         self.height = height
         self.shading = shading
         self.shadow_resolution = shadow_resolution
+        self.shadow_maps = []
         self.shadow_map = None
         self.gbuffer = None
         self.lighting = None
@@ -207,7 +209,12 @@ class RenderTargets:
         self.ssao_back = None
 
     def initialize(self) -> "RenderTargets":
-        self.shadow_map = load_shadow_map(self.shadow_resolution, self.shadow_resolution)
+        shadow_count = 3 if self.shading == "pbr" else 1
+        self.shadow_maps = [
+            load_shadow_map(self.shadow_resolution, self.shadow_resolution)
+            for _ in range(shadow_count)
+        ]
+        self.shadow_map = self.shadow_maps[0]
         self.gbuffer = load_gbuffer(self.width, self.height)
         self.lighting = (
             load_color_target(self.width, self.height, PIXELFORMAT_UNCOMPRESSED_R16G16B16A16)
@@ -234,5 +241,5 @@ class RenderTargets:
             UnloadRenderTexture(self.ssao_front)
         if self.gbuffer is not None:
             unload_gbuffer(self.gbuffer)
-        if self.shadow_map is not None:
-            unload_shadow_map(self.shadow_map)
+        for shadow_map in self.shadow_maps:
+            unload_shadow_map(shadow_map)

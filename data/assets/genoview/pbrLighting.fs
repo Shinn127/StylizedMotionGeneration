@@ -7,15 +7,20 @@ uniform sampler2D gbufferNormal;
 uniform sampler2D gbufferDepth;
 uniform sampler2D ssao;
 uniform sampler2D materialAO;
-uniform sampler2D shadowMap;
+uniform sampler2D shadowMap0;
+uniform sampler2D shadowMap1;
+uniform sampler2D shadowMap2;
 uniform samplerCube environmentMap;
 uniform samplerCube irradianceMap;
 uniform samplerCube prefilterMap;
 uniform sampler2D brdfLut;
 
 uniform vec3 camPos;
+uniform mat4 camView;
 uniform mat4 camInvViewProj;
-uniform mat4 lightViewProj;
+uniform mat4 lightViewProj0;
+uniform mat4 lightViewProj1;
+uniform mat4 lightViewProj2;
 uniform vec3 lightDir;
 uniform vec3 sunColor;
 uniform float sunStrength;
@@ -25,13 +30,12 @@ uniform float groundStrength;
 uniform float ambientStrength;
 uniform float camClipNear;
 uniform float camClipFar;
-uniform float lightClipNear;
-uniform float lightClipFar;
 uniform float iblStrength;
 uniform float prefilterMaxLod;
 uniform int useIBL;
 uniform int whiteBackground;
 uniform vec2 shadowTexelSize;
+uniform vec3 cascadeSplits;
 // 0 final image, 1 shadow, 2 direct diffuse, 3 direct specular, 4 indirect light
 uniform int debugMode;
 
@@ -83,7 +87,7 @@ vec3 FresnelSchlick(float vDotH, vec3 f0)
     return f0 + (1.0 - f0) * pow(1.0 - vDotH, 5.0);
 }
 
-float ShadowFactor(vec3 position, vec3 normal)
+float ShadowFactorFor(vec3 position, vec3 normal, mat4 lightViewProj, sampler2D shadowMap)
 {
     vec4 lightPosition = lightViewProj * vec4(position + 0.01 * normal, 1.0);
     lightPosition.xyz = (lightPosition.xyz / lightPosition.w + 1.0) * 0.5;
@@ -91,17 +95,32 @@ float ShadowFactor(vec3 position, vec3 normal)
         lightPosition.y > 0.0 && lightPosition.y < 1.0 &&
         lightPosition.z > 0.0 && lightPosition.z < 1.0;
     if (!inside) { return 1.0; }
-    float receiverDepth = LinearDepth(lightPosition.z, lightClipNear, lightClipFar);
+    float receiverDepth = lightPosition.z;
+    float depthBias = max(0.00005, shadowTexelSize.x);
     // 3x3 percentage-closer filtering over the shadow map; the constant depth
     // bias stays per-sample and shadow never routes through the SSAO blur.
     float shadow = 0.0;
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
-            float blockerDepth = texture(shadowMap, lightPosition.xy + vec2(x, y) * shadowTexelSize).r;
-            shadow += 1.0 - float(receiverDepth - 0.000005 > blockerDepth);
+            vec2 sampleCoord = clamp(
+                lightPosition.xy + vec2(x, y) * shadowTexelSize,
+                vec2(0.0), vec2(1.0));
+            float blockerDepth = texture(shadowMap, sampleCoord).r;
+            shadow += 1.0 - float(receiverDepth - depthBias > blockerDepth);
         }
     }
     return shadow / 9.0;
+}
+
+float ShadowFactor(vec3 position, vec3 normal, float cameraDepth)
+{
+    if (cameraDepth <= cascadeSplits.x) {
+        return ShadowFactorFor(position, normal, lightViewProj0, shadowMap0);
+    }
+    if (cameraDepth <= cascadeSplits.y) {
+        return ShadowFactorFor(position, normal, lightViewProj1, shadowMap1);
+    }
+    return ShadowFactorFor(position, normal, lightViewProj2, shadowMap2);
 }
 
 void main()
@@ -142,6 +161,7 @@ void main()
     vec3 normal = normalize(normalRoughness.rgb * 2.0 - 1.0);
     float roughness = clamp(normalRoughness.a, 0.04, 1.0);
     vec3 view = normalize(camPos - position);
+    float cameraDepth = -(camView * vec4(position, 1.0)).z;
     vec3 f0 = mix(vec3(0.04), albedo, metallic);
 
     vec3 sun = normalize(-lightDir);
@@ -160,7 +180,7 @@ void main()
     vec3 diffuse = (1.0 - fresnel) * (1.0 - metallic) * albedo / PI;
 
     vec3 sunRadiance = SRGBToLinear(sunColor) * (sunStrength * PI);
-    float shadow = ShadowFactor(position, normal);
+    float shadow = ShadowFactor(position, normal, cameraDepth);
     vec3 direct = (diffuse + specular) * sunRadiance * nDotL * shadow;
 
     vec3 skyRadiance = SRGBToLinear(skyColor);

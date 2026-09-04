@@ -12,6 +12,8 @@
 
 当前实施记录（2026-09-04）：Phase 1～4 的功能项已落地；当前修订集中在 IBL HDR 精度、纹理入口、SSAO 边界和运行时验证。legacy 地面网格调制保留在 PBR GBuffer 中作为视觉兼容项。
 
+实施更新（2026-09-04，CSM）：PBR Shadow Pass 已升级为 3 级 cascaded shadow maps。viewer 每帧按相机深度生成 logarithmic/uniform 混合 split（lambda=0.75），对每级 light frustum 做 texel snapping 和独立 near/far fitting；lighting shader 按 camera depth 选择对应 shadow map，并继续使用 3×3 PCF。legacy 路径保留单张 shadow map。
+
 实施更新（2026-09-03）：Debug View 已落地，Phase 0 的 debug 参数交付项关闭。模式为 final/base_color/metallic/roughness/normal/depth/ao/shadow/diffuse/specular/ibl/hdr；运行时 `V`（`Shift+V` 反向）循环，`--debug-view` 指定初始模式。shadow/diffuse/specular/ibl 由 `pbrLighting.fs` 的 `debugMode` 输出到 HDR target，其余模式由新增 `debug.fs` 显示 pass 直接读取 GBuffer/SSAO/HDR 纹理；调试显示只做 exposure + linear→sRGB，不经过 ACES，且跳过 FXAA。
 
 实施更新（2026-09-04）：normal mapping、材质 AO、材质网格和三类材质纹理入口均已落地。顶点切线管线（含蒙皮切线变换）构建 TBN 并采样 `normalMap.rg`（z 分量由 xy 重建，兼容标准 RGB 法线贴图），退化切线回退几何法线。GBuffer 新增第三个 R8 attachment（`gbufferMaterialAO`），材质 ao（uniform 或 `metallicRoughnessMap.B`）经此进入 lighting，与 SSAO 相乘后仅作用于间接光。viewer CLI 通过 `--base-color-map`、`--normal-map` 与 `--metallic-roughness-map` 应用到角色默认材质；`--scene grid` 提供材质测试场景。
@@ -224,8 +226,8 @@ pbr_gbuffer.fs
 shadow.vs / skinnedShadow.vs
   light-space transform、shadow skinning
 
-shadow.fs
-  depth-only output
+shadow.fs / pbrShadow.fs
+  legacy depth linearization / PBR orthographic depth-only output
 
 ssao.fs
   只计算 AO，输出单通道语义；不得读取 shadowMap
@@ -266,7 +268,7 @@ indirectDiffuse = irradiance * baseColor / PI * kD * ao
 
 - 保留单方向光和现有正交 light camera；
 - Shadow Pass 仍同时支持 ground、static model 和 skinned model；
-- PBR Lighting 新增 `shadowMap`、`lightViewProj`、shadow clip/bias uniform；
+- PBR Lighting 新增 `shadowMap`、`lightViewProj`、shadow bias 语义；
 - Shadow factor 在 Lighting Pass 中计算；
 - 默认先使用单次比较采样，保证职责拆分后结果稳定。
 
@@ -275,10 +277,12 @@ indirectDiffuse = irradiance * baseColor / PI * kD * ao
 `pbrLighting.fs` 的 `ShadowFactor` 使用 3×3 PCF：
 
 - 使用 `shadowTexelSize` uniform（1/shadowResolution，viewer 初始化后缓存）；
-- bias 保持 normal offset（世界空间 `0.01 * normal`）+ 逐样本常数 bias（5e-5 线性深度）；
+- PBR 使用 normal offset（世界空间 `0.01 * normal`）+ 至少一个 shadow texel 的归一化深度 bias；Legacy 保持原有 clip/bias 参数；
 - shadow sampling 不经过 SSAO blur；
 - 超出 shadow projection 范围时返回 `shadow = 1.0`；
 - `ssao.fs` 不计算或输出 shadow。
+
+PBR 在此基础上使用 3 级 CSM：近裁剪面到远裁剪面的 split 采用 logarithmic/uniform 混合，级联投影中心按 shadow texel 对齐，避免相机平移造成阴影抖动；每级独立绑定 shadow map 和 light matrix。PBR 的正交 Shadow Pass 直接使用归一化 light-space depth，Lighting 侧使用按 texel 尺寸下限约束的 bias；Legacy 保持单级 `shadow.fs` contract。
 
 ## 9. SSAO 规范
 

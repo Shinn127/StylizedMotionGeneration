@@ -43,13 +43,20 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         assert "in vec4 fragTangent" in pbr_gbuffer
         assert "layout (location = 2) out float gbufferMaterialAO" in pbr_gbuffer
         assert "gbufferMaterialAO = ao;" in pbr_gbuffer
-        assert "uniform sampler2D shadowMap" in pbr_lighting
+        assert "uniform sampler2D shadowMap0" in pbr_lighting
+        assert "uniform sampler2D shadowMap1" in pbr_lighting
+        assert "uniform sampler2D shadowMap2" in pbr_lighting
         assert "uniform sampler2D materialAO" in pbr_lighting
         assert "texture(materialAO, fragTexCoord).r" in pbr_lighting
         assert "uniform float prefilterMaxLod" in pbr_lighting
         assert "textureLod(prefilterMap" in pbr_lighting
-        # 3x3 PCF shadow sampling and the procedural sky background
+        # Three-cascade CSM with 3x3 PCF and the procedural sky background
         assert "uniform vec2 shadowTexelSize" in pbr_lighting
+        assert "uniform vec3 cascadeSplits" in pbr_lighting
+        assert "float cameraDepth = -(camView * vec4(position, 1.0)).z;" in pbr_lighting
+        assert "float receiverDepth = lightPosition.z;" in pbr_lighting
+        assert "float depthBias = max(0.00005, shadowTexelSize.x);" in pbr_lighting
+        assert "vec2 sampleCoord = clamp" in pbr_lighting
         assert "shadow / 9.0" in pbr_lighting
         # Sky background samples linear-radiance environment data directly.
         assert "textureLod(environmentMap, viewDir, 0.0)" in pbr_lighting
@@ -58,8 +65,11 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         assert "uniform float ssaoIntensity" in ssao
         assert "shadowMap" not in ssao
         assert "sampleTexCoord.x <= 0.0" in ssao
-    for shader in ("pbr.fs", "lighting.fs", "pbrLighting.fs", "ssao.fs", "tonemap.fs", "debug.fs"):
+    for shader in ("pbr.fs", "lighting.fs", "pbrLighting.fs", "pbrShadow.fs", "shadow.fs", "ssao.fs", "tonemap.fs", "debug.fs"):
         assert (RESOURCE_DIR / shader).read_bytes() == (SOMA_RESOURCE_DIR / shader).read_bytes()
+
+    pbr_shadow = (RESOURCE_DIR / "pbrShadow.fs").read_text(encoding="utf-8")
+    assert "gl_FragDepth = gl_FragCoord.z;" in pbr_shadow
 
 
 def test_debug_view_contract_is_shared_between_viewers():
@@ -100,7 +110,7 @@ def test_gbuffer_carries_material_ao_attachment():
 
 def test_multi_texture_passes_bind_explicit_slots():
     # raylib keys SetShaderValueTexture samplers off texture.id, which collides
-    # with the manually managed slots 10-14 whenever a render target's GL
+    # with the manually managed slots 10-22 whenever a render target's GL
     # texture name lands on those numbers (see spec 20.6).
     import stylized_motion.anim.render_targets as render_targets
 
@@ -109,8 +119,19 @@ def test_multi_texture_passes_bind_explicit_slots():
     import stylized_motion.anim.genoview as genoview_module
 
     genoview_source = Path(genoview_module.__file__).read_text(encoding="utf-8")
-    for slot_ptr in ("material_ao_texture_slot_ptr", "ssao_texture_slot_ptr", "debug_lighted_slot_ptr"):
+    for slot_ptr in ("material_ao_texture_slot_ptr", "ssao_texture_slot_ptr", "debug_lighted_slot_ptr", "shadow_texture_slot_ptrs"):
         assert slot_ptr in genoview_source
+
+
+def test_pbr_uses_three_cascaded_shadow_maps():
+    import stylized_motion.anim.render_targets as render_targets
+    import stylized_motion.anim.renderer as renderer
+
+    render_targets_source = Path(render_targets.__file__).read_text(encoding="utf-8")
+    renderer_source = Path(renderer.__file__).read_text(encoding="utf-8")
+    assert "shadow_count = 3 if self.shading == \"pbr\" else 1" in render_targets_source
+    assert "CSM_CASCADE_COUNT = 3" in renderer_source
+    assert "_update_cascade_shadow_lights(view)" in renderer_source
 
 
 def test_pbr_light_rig_is_retuned_while_legacy_stays_frozen():

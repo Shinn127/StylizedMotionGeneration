@@ -867,6 +867,7 @@ class GenoView:
         self.shadow_light.height = 5.0
         self.shadow_light.near = 0.01
         self.shadow_light.far = 10.0
+        self.shadow_lights = [ShadowLight() for _ in range(3)]
 
         self.shadow_map = None
         self.gbuffer = None
@@ -917,6 +918,8 @@ class GenoView:
         self.exposure_ptr = ffi.new("float*")
         self.ssao_intensity_ptr = ffi.new("float*")
         self.shadow_texture_slot_ptr = ffi.new("int*")
+        self.shadow_texture_slot_ptrs = [ffi.new("int*") for _ in range(3)]
+        self.shadow_cascade_splits_ptr = ffi.new("float[3]")
         self.environment_texture_slot_ptr = ffi.new("int*")
         self.irradiance_texture_slot_ptr = ffi.new("int*")
         self.prefilter_texture_slot_ptr = ffi.new("int*")
@@ -931,14 +934,16 @@ class GenoView:
         self.debug_mode_ptr = ffi.new("int*")
         self.white_background_ptr = ffi.new("int*")
         self.shadow_texture_slot_ptr[0] = 10
-        self.environment_texture_slot_ptr[0] = 11
-        self.irradiance_texture_slot_ptr[0] = 12
-        self.prefilter_texture_slot_ptr[0] = 13
-        self.brdf_lut_texture_slot_ptr[0] = 14
+        for index, slot in enumerate((10, 11, 12)):
+            self.shadow_texture_slot_ptrs[index][0] = slot
+        self.environment_texture_slot_ptr[0] = 13
+        self.irradiance_texture_slot_ptr[0] = 14
+        self.prefilter_texture_slot_ptr[0] = 15
+        self.brdf_lut_texture_slot_ptr[0] = 16
         # Dedicated slots beyond the lighting pass's 10-14: render-target GL
         # texture names collide with SetShaderValueTexture's id-keyed samplers.
         self.material_ao_texture_slot_ptr = ffi.new("int*")
-        self.material_ao_texture_slot_ptr[0] = 15
+        self.material_ao_texture_slot_ptr[0] = 17
         self.ssao_texture_slot_ptr = ffi.new("int*")
         self.ssao_texture_slot_ptr[0] = 21
         self.debug_gbuffer_color_slot_ptr = ffi.new("int*")
@@ -946,11 +951,11 @@ class GenoView:
         self.debug_gbuffer_depth_slot_ptr = ffi.new("int*")
         self.debug_ssao_slot_ptr = ffi.new("int*")
         self.debug_lighted_slot_ptr = ffi.new("int*")
-        self.debug_gbuffer_color_slot_ptr[0] = 16
-        self.debug_gbuffer_normal_slot_ptr[0] = 17
-        self.debug_gbuffer_depth_slot_ptr[0] = 18
-        self.debug_ssao_slot_ptr[0] = 19
-        self.debug_lighted_slot_ptr[0] = 20
+        self.debug_gbuffer_color_slot_ptr[0] = 18
+        self.debug_gbuffer_normal_slot_ptr[0] = 19
+        self.debug_gbuffer_depth_slot_ptr[0] = 20
+        self.debug_ssao_slot_ptr[0] = 21
+        self.debug_lighted_slot_ptr[0] = 22
         self.prefilter_max_lod_ptr[0] = 5.0
         self.ground_pattern_ptr[0] = 0
         self.specularity_ptr[0] = 0.5
@@ -984,8 +989,9 @@ class GenoView:
         lighting_fs = "pbrLighting.fs" if self.shading == "pbr" else "lighting.fs"
         self.shaders["basic"] = LoadShader(self._res("basic.vs"), self._res(gbuffer_fs))
         self.shaders["skinned_basic"] = LoadShader(self._res("skinnedBasic.vs"), self._res(gbuffer_fs))
-        self.shaders["shadow"] = LoadShader(self._res("shadow.vs"), self._res("shadow.fs"))
-        self.shaders["skinned_shadow"] = LoadShader(self._res("skinnedShadow.vs"), self._res("shadow.fs"))
+        shadow_fs = "pbrShadow.fs" if self.shading == "pbr" else "shadow.fs"
+        self.shaders["shadow"] = LoadShader(self._res("shadow.vs"), self._res(shadow_fs))
+        self.shaders["skinned_shadow"] = LoadShader(self._res("skinnedShadow.vs"), self._res(shadow_fs))
         self.shaders["ssao"] = LoadShader(self._res("post.vs"), self._res("ssao.fs"))
         self.shaders["blur"] = LoadShader(self._res("post.vs"), self._res("blur.fs"))
         self.shaders["lighting"] = LoadShader(self._res("post.vs"), self._res(lighting_fs))
@@ -1019,10 +1025,11 @@ class GenoView:
                 self.shader_locs[f"{prefix}_use_normal_map"] = GetShaderLocation(self.shaders[shader_key], b"useNormalMap")
                 self.shader_locs[f"{prefix}_ground_pattern"] = GetShaderLocation(self.shaders[shader_key], b"pbrGroundPattern")
 
-        self.shader_locs["shadow_light_clip_near"] = GetShaderLocation(self.shaders["shadow"], b"lightClipNear")
-        self.shader_locs["shadow_light_clip_far"] = GetShaderLocation(self.shaders["shadow"], b"lightClipFar")
-        self.shader_locs["skinned_shadow_light_clip_near"] = GetShaderLocation(self.shaders["skinned_shadow"], b"lightClipNear")
-        self.shader_locs["skinned_shadow_light_clip_far"] = GetShaderLocation(self.shaders["skinned_shadow"], b"lightClipFar")
+        if self.shading == "legacy":
+            self.shader_locs["shadow_light_clip_near"] = GetShaderLocation(self.shaders["shadow"], b"lightClipNear")
+            self.shader_locs["shadow_light_clip_far"] = GetShaderLocation(self.shaders["shadow"], b"lightClipFar")
+            self.shader_locs["skinned_shadow_light_clip_near"] = GetShaderLocation(self.shaders["skinned_shadow"], b"lightClipNear")
+            self.shader_locs["skinned_shadow_light_clip_far"] = GetShaderLocation(self.shaders["skinned_shadow"], b"lightClipFar")
 
         self.shader_locs["ssao_gbuffer_normal"] = GetShaderLocation(self.shaders["ssao"], b"gbufferNormal")
         self.shader_locs["ssao_gbuffer_depth"] = GetShaderLocation(self.shaders["ssao"], b"gbufferDepth")
@@ -1061,11 +1068,19 @@ class GenoView:
         self.shader_locs["lighting_cam_clip_near"] = GetShaderLocation(self.shaders["lighting"], b"camClipNear")
         self.shader_locs["lighting_cam_clip_far"] = GetShaderLocation(self.shaders["lighting"], b"camClipFar")
 
-        self.shader_locs["lighting_shadow_map"] = GetShaderLocation(self.shaders["lighting"], b"shadowMap")
-        self.shader_locs["lighting_light_view_proj"] = GetShaderLocation(self.shaders["lighting"], b"lightViewProj")
-        self.shader_locs["lighting_light_clip_near"] = GetShaderLocation(self.shaders["lighting"], b"lightClipNear")
-        self.shader_locs["lighting_light_clip_far"] = GetShaderLocation(self.shaders["lighting"], b"lightClipFar")
-        if self.shading == "pbr":
+        if self.shading == "legacy":
+            self.shader_locs["lighting_shadow_map"] = GetShaderLocation(self.shaders["lighting"], b"shadowMap")
+            self.shader_locs["lighting_light_view_proj"] = GetShaderLocation(self.shaders["lighting"], b"lightViewProj")
+            self.shader_locs["lighting_light_clip_near"] = GetShaderLocation(self.shaders["lighting"], b"lightClipNear")
+            self.shader_locs["lighting_light_clip_far"] = GetShaderLocation(self.shaders["lighting"], b"lightClipFar")
+        else:
+            for index in range(3):
+                self.shader_locs[f"lighting_shadow_map_{index}"] = GetShaderLocation(
+                    self.shaders["lighting"], f"shadowMap{index}".encode()
+                )
+                self.shader_locs[f"lighting_light_view_proj_{index}"] = GetShaderLocation(
+                    self.shaders["lighting"], f"lightViewProj{index}".encode()
+                )
             self.shader_locs["lighting_environment_map"] = GetShaderLocation(self.shaders["lighting"], b"environmentMap")
             self.shader_locs["lighting_irradiance_map"] = GetShaderLocation(self.shaders["lighting"], b"irradianceMap")
             self.shader_locs["lighting_prefilter_map"] = GetShaderLocation(self.shaders["lighting"], b"prefilterMap")
@@ -1076,6 +1091,8 @@ class GenoView:
             self.shader_locs["lighting_white_background"] = GetShaderLocation(self.shaders["lighting"], b"whiteBackground")
             self.shader_locs["lighting_debug_mode"] = GetShaderLocation(self.shaders["lighting"], b"debugMode")
             self.shader_locs["lighting_shadow_texel_size"] = GetShaderLocation(self.shaders["lighting"], b"shadowTexelSize")
+            self.shader_locs["lighting_cascade_splits"] = GetShaderLocation(self.shaders["lighting"], b"cascadeSplits")
+            self.shader_locs["lighting_cam_view"] = GetShaderLocation(self.shaders["lighting"], b"camView")
 
         if self.shading == "pbr":
             self.shader_locs["tonemap_input_texture"] = GetShaderLocation(self.shaders["tonemap"], b"inputTexture")
@@ -1114,7 +1131,8 @@ class GenoView:
         self.render_targets = RenderTargets(
             screen_width, screen_height, self.shading, shadow_resolution=self.shadow_resolution
         ).initialize()
-        self.shadow_map = self.render_targets.shadow_map
+        self.shadow_maps = self.render_targets.shadow_maps
+        self.shadow_map = self.shadow_maps[0]
         self.gbuffer = self.render_targets.gbuffer
         self.lighted = self.render_targets.lighting
         self.tonemapped = self.render_targets.tonemapped
