@@ -54,8 +54,49 @@ def load_shadow_map(width, height):
     return target
 
 
+def load_shadow_evsm_map(width, height):
+    """EVSM moment target: RGBA32F color attachment + depth attachment.
+
+    The four channels carry the warped-depth moments (exp(k(z-1)), its square,
+    exp(k(1-z)), its square). Float storage is the whole point — the moments of
+    steep depth spans live far outside [0,1] and 8-bit storage destroys them.
+    """
+    target = RenderTexture()
+    target.id = rlLoadFramebuffer()
+    target.texture.width = width
+    target.texture.height = height
+    assert target.id != 0
+    rlEnableFramebuffer(target.id)
+    target.texture.id = rlLoadTexture(ffi.NULL, width, height, PIXELFORMAT_UNCOMPRESSED_R32G32B32A32, 1)
+    target.texture.width = width
+    target.texture.height = height
+    target.texture.format = PIXELFORMAT_UNCOMPRESSED_R32G32B32A32
+    target.texture.mipmaps = 1
+    rlFramebufferAttach(target.id, target.texture.id, RL_ATTACHMENT_COLOR_CHANNEL0, RL_ATTACHMENT_TEXTURE2D, 0)
+    target.depth.id = rlLoadTextureDepth(width, height, False)
+    target.depth.width = width
+    target.depth.height = height
+    target.depth.format = 19
+    target.depth.mipmaps = 1
+    rlFramebufferAttach(target.id, target.depth.id, RL_ATTACHMENT_DEPTH, RL_ATTACHMENT_TEXTURE2D, 0)
+    assert rlFramebufferComplete(target.id)
+    rlDisableFramebuffer()
+    # Bilinear filtering is what turns the blurred moments into smooth shadows.
+    rlTextureParameters(target.texture.id, RL_TEXTURE_MIN_FILTER, RL_TEXTURE_FILTER_LINEAR)
+    rlTextureParameters(target.texture.id, RL_TEXTURE_MAG_FILTER, RL_TEXTURE_FILTER_LINEAR)
+    rlTextureParameters(target.texture.id, RL_TEXTURE_WRAP_S, RL_TEXTURE_WRAP_CLAMP)
+    rlTextureParameters(target.texture.id, RL_TEXTURE_WRAP_T, RL_TEXTURE_WRAP_CLAMP)
+    return target
+
+
 def unload_shadow_map(target):
     if target.id > 0:
+        rlUnloadFramebuffer(target.id)
+
+
+def unload_shadow_evsm_map(target):
+    if target.id > 0:
+        rlUnloadTexture(target.texture.id)
         rlUnloadFramebuffer(target.id)
 
 
@@ -195,12 +236,15 @@ def end_gbuffer(window_width, window_height):
 class RenderTargets:
     """Own all screen-sized render resources for one viewer instance."""
 
-    def __init__(self, width: int, height: int, shading: str, shadow_resolution: int = 2048):
+    def __init__(self, width: int, height: int, shading: str, shadow_resolution: int = 1024):
         self.width = width
         self.height = height
         self.shading = shading
         self.shadow_resolution = shadow_resolution
         self.shadow_maps = []
+        self.shadow_blurred = []
+        self.evsm_scratch = None
+        self.evsm_blur_shader = None
         self.shadow_map = None
         self.gbuffer = None
         self.lighting = None
@@ -210,11 +254,28 @@ class RenderTargets:
 
     def initialize(self) -> "RenderTargets":
         shadow_count = 3 if self.shading == "pbr" else 1
+        # PBR cascades render EVSM moments (RGBA32F color + depth); legacy
+        # keeps the depth-only map.
         self.shadow_maps = [
-            load_shadow_map(self.shadow_resolution, self.shadow_resolution)
+            (load_shadow_evsm_map(self.shadow_resolution, self.shadow_resolution) if self.shading == "pbr" else load_shadow_map(self.shadow_resolution, self.shadow_resolution))
             for _ in range(shadow_count)
         ]
         self.shadow_map = self.shadow_maps[0]
+        if self.shading == "pbr":
+            # EVSM chain: one blurred moment map per cascade plus one ping
+            # buffer at half resolution for the separable blur.
+            blurred_size = max(self.shadow_resolution // 2, 1)
+            self.shadow_blurred = [
+                load_color_target(blurred_size, blurred_size, PIXELFORMAT_UNCOMPRESSED_R32G32B32A32)
+                for _ in range(shadow_count)
+            ]
+            self.evsm_scratch = load_color_target(blurred_size, blurred_size, PIXELFORMAT_UNCOMPRESSED_R32G32B32A32)
+            for target in (*self.shadow_blurred, self.evsm_scratch):
+                # Bilinear sampling keeps the half-res blur chain smooth.
+                rlTextureParameters(target.texture.id, RL_TEXTURE_MIN_FILTER, RL_TEXTURE_FILTER_LINEAR)
+                rlTextureParameters(target.texture.id, RL_TEXTURE_MAG_FILTER, RL_TEXTURE_FILTER_LINEAR)
+                rlTextureParameters(target.texture.id, RL_TEXTURE_WRAP_S, RL_TEXTURE_WRAP_CLAMP)
+                rlTextureParameters(target.texture.id, RL_TEXTURE_WRAP_T, RL_TEXTURE_WRAP_CLAMP)
         self.gbuffer = load_gbuffer(self.width, self.height)
         self.lighting = (
             load_color_target(self.width, self.height, PIXELFORMAT_UNCOMPRESSED_R16G16B16A16)
@@ -242,4 +303,14 @@ class RenderTargets:
         if self.gbuffer is not None:
             unload_gbuffer(self.gbuffer)
         for shadow_map in self.shadow_maps:
-            unload_shadow_map(shadow_map)
+            if self.shading == "pbr":
+                unload_shadow_evsm_map(shadow_map)
+            else:
+                unload_shadow_map(shadow_map)
+        for blurred in self.shadow_blurred:
+            if blurred is not None and self.shading == "pbr":
+                rlUnloadTexture(blurred.texture.id)
+                rlUnloadFramebuffer(blurred.id)
+        if self.evsm_scratch is not None:
+            rlUnloadTexture(self.evsm_scratch.texture.id)
+            rlUnloadFramebuffer(self.evsm_scratch.id)

@@ -48,6 +48,17 @@ class Renderer:
         if view.shading == "pbr":
             splits, shadow_lights, shadow_biases = _update_cascade_shadow_lights(view)
             light_view_projs = []
+            evsm_pos_k_ptr = view.evsm_pos_k_ptr
+            evsm_neg_k_ptr = view.evsm_neg_k_ptr
+            for shader_key in ("shadow", "skinned_shadow"):
+                SetShaderValue(
+                    view.shaders[shader_key], view.shader_locs[f"{shader_key}_evsm_pos_k"],
+                    evsm_pos_k_ptr, SHADER_UNIFORM_FLOAT,
+                )
+                SetShaderValue(
+                    view.shaders[shader_key], view.shader_locs[f"{shader_key}_evsm_neg_k"],
+                    evsm_neg_k_ptr, SHADER_UNIFORM_FLOAT,
+                )
             for index, (shadow_light, _, _) in enumerate(shadow_lights):
                 begin_shadow_map(view.shadow_maps[index], shadow_light)
                 light_view_projs.append(MatrixMultiply(rlGetMatrixModelview(), rlGetMatrixProjection()))
@@ -56,6 +67,7 @@ class Renderer:
                     render_object.model.materials[0].shader = view.shaders[shader_key]
                     DrawModel(render_object.model, render_object.position, render_object.scale, WHITE)
                 end_shadow_map()
+            self._blur_shadow_moments()
             return light_view_projs, splits, shadow_biases
 
         begin_shadow_map(view.shadow_maps[0], view.shadow_light)
@@ -74,6 +86,50 @@ class Renderer:
             DrawModel(render_object.model, render_object.position, render_object.scale, WHITE)
         end_shadow_map()
         return light_view_proj
+
+    def _blur_shadow_moments(self):
+        """Downsample + separable Gaussian each cascade's moments, in order.
+
+        moments map (full res) --horizontal--> scratch (half res)
+                                 --vertical --> shadow_blurred[i]
+        """
+        view = self.view
+        shader = view.shaders["evsm_blur"]
+        inv_resolution_ptr = ffi.new("float[2]")
+        direction_ptr = ffi.new("float[2]")
+        blur_slot_ptr = view.evsm_blur_texture_slot_ptr
+        scratch = view.render_targets.evsm_scratch
+        for index, moments in enumerate(view.shadow_maps):
+            blurred = view.render_targets.shadow_blurred[index]
+            for direction, source, destination in (
+                ((1.0, 0.0), moments.texture, scratch),
+                ((0.0, 1.0), scratch.texture, blurred),
+            ):
+                BeginTextureMode(destination)
+                BeginShaderMode(shader)
+                # Explicit slot binding: SetShaderValueTexture keys samplers off
+                # texture.id and these RGBA32F names collide with slots 10-25.
+                set_shader_value_texture_slot(shader, view.shader_locs["evsm_blur_input_texture"], source, blur_slot_ptr)
+                inv_resolution_ptr[0] = 1.0 / float(source.width)
+                inv_resolution_ptr[1] = 1.0 / float(source.height)
+                SetShaderValue(
+                    shader, view.shader_locs["evsm_blur_inv_resolution"],
+                    ffi.addressof(inv_resolution_ptr, 0), SHADER_UNIFORM_VEC2,
+                )
+                direction_ptr[0], direction_ptr[1] = direction
+                SetShaderValue(
+                    shader, view.shader_locs["evsm_blur_direction"],
+                    ffi.addressof(direction_ptr, 0), SHADER_UNIFORM_VEC2,
+                )
+                ClearBackground(BLACK)
+                DrawTexturePro(
+                    source,
+                    Rectangle(0, 0, float(source.width), float(source.height)),
+                    Rectangle(0, 0, float(destination.texture.width), float(destination.texture.height)),
+                    Vector2(0.0, 0.0), 0.0, WHITE,
+                )
+                EndShaderMode()
+                EndTextureMode()
 
     def render_gbuffer(self):
         view = self.view
@@ -173,9 +229,9 @@ class Renderer:
         if view.shading == "pbr":
             light_view_projs, cascade_splits, shadow_biases = shadow_data
             for index in range(CSM_CASCADE_COUNT):
-                set_shader_value_shadow_map(
+                set_shader_value_texture_slot(
                     view.shaders["lighting"], view.shader_locs[f"lighting_shadow_map_{index}"],
-                    view.shadow_maps[index], view.shadow_texture_slot_ptrs[index],
+                    view.render_targets.shadow_blurred[index].texture, view.shadow_texture_slot_ptrs[index],
                 )
                 SetShaderValueMatrix(
                     view.shaders["lighting"], view.shader_locs[f"lighting_light_view_proj_{index}"],
@@ -186,12 +242,10 @@ class Renderer:
                 view.shaders["lighting"], view.shader_locs["lighting_cascade_splits"],
                 view.shadow_cascade_splits_ptr, SHADER_UNIFORM_VEC3,
             )
-            for index in range(CSM_CASCADE_COUNT):
-                view.shadow_bias_ptr[index] = shadow_biases[index]
-            SetShaderValue(
-                view.shaders["lighting"], view.shader_locs["lighting_shadow_bias"],
-                view.shadow_bias_ptr, SHADER_UNIFORM_VEC3,
-            )
+            SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_evsm_pos_k"], view.evsm_pos_k_ptr, SHADER_UNIFORM_FLOAT)
+            SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_evsm_neg_k"], view.evsm_neg_k_ptr, SHADER_UNIFORM_FLOAT)
+            SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_evsm_light_bleed"], view.evsm_light_bleed_ptr, SHADER_UNIFORM_FLOAT)
+            SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_evsm_min_variance"], view.evsm_min_variance_ptr, SHADER_UNIFORM_FLOAT)
             set_shader_value_texture_slot(
                 view.shaders["lighting"], view.shader_locs["lighting_material_ao"],
                 view.gbuffer.material_ao, view.material_ao_texture_slot_ptr,
@@ -237,9 +291,6 @@ class Renderer:
             SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_white_background"], view.white_background_ptr, SHADER_UNIFORM_INT)
             view.debug_mode_ptr[0] = LIGHTING_DEBUG_MODES[view.debug_view]
             SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_debug_mode"], view.debug_mode_ptr, SHADER_UNIFORM_INT)
-            view.shadow_texel_size.x = 1.0 / float(view.shadow_maps[0].depth.width)
-            view.shadow_texel_size.y = view.shadow_texel_size.x
-            SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_shadow_texel_size"], ffi.addressof(view.shadow_texel_size), SHADER_UNIFORM_VEC2)
             SetShaderValueMatrix(view.shaders["lighting"], view.shader_locs["lighting_cam_view"], cam_view)
         ClearBackground(RAYWHITE)
         DrawTextureRec(view.gbuffer.color, Rectangle(0, 0, view.gbuffer.color.width, -view.gbuffer.color.height), Vector2(0, 0), WHITE)
@@ -371,6 +422,13 @@ from stylized_motion.anim.render_targets import (
 CSM_CASCADE_COUNT = 3
 CSM_SPLIT_LAMBDA = 0.75
 CSM_Z_PADDING = 2.0
+# EVSM revision: keep the light-space depth span tight so the exponential
+# warp stays in float32's usable range. The near plane sits back from the
+# frustum's nearest corner (nothing occludes the light closer than the
+# character, ~1.5 units of headroom) and the ortho extent is capped so a
+# wide camera frustum cannot dilute cascade 0's texel density.
+CSM_LIGHT_NEAR_MIN = 1.5
+CSM_EXTENT_MAX = 40.0
 
 
 def _vector3_array(value):
@@ -429,7 +487,7 @@ def _update_cascade_shadow_lights(view):
         corners = _frustum_corners(camera, previous_split, split, aspect)
         center = corners.mean(axis=0)
         radius = float(np.max(np.linalg.norm(corners - center, axis=1)))
-        extent = np.ceil((radius + 0.5) * view.shadow_resolution) / view.shadow_resolution
+        extent = min(CSM_EXTENT_MAX, np.ceil((radius + 0.5) * view.shadow_resolution) / view.shadow_resolution)
         texel_size = 2.0 * extent / view.shadow_resolution
         center_x = float(np.dot(center, light_right))
         center_y = float(np.dot(center, light_up))
@@ -447,7 +505,7 @@ def _update_cascade_shadow_lights(view):
             ],
             dtype=np.float32,
         )
-        light_near = max(0.01, float(-light_space[:, 2].max()) - CSM_Z_PADDING)
+        light_near = max(CSM_LIGHT_NEAR_MIN, float(-light_space[:, 2].max()) - CSM_Z_PADDING)
         light_far = float(-light_space[:, 2].min()) + CSM_Z_PADDING
         depth_range = light_far - light_near
         shadow_biases.append(max(2.0 / 65535.0, 0.25 * texel_size / depth_range))

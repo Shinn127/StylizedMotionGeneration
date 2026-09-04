@@ -50,17 +50,29 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         assert "texture(materialAO, fragTexCoord).r" in pbr_lighting
         assert "uniform float prefilterMaxLod" in pbr_lighting
         assert "textureLod(prefilterMap" in pbr_lighting
-        # Three-cascade CSM with 3x3 PCF and the procedural sky background
-        assert "uniform vec2 shadowTexelSize" in pbr_lighting
-        assert "uniform vec3 shadowBias" in pbr_lighting
+        # Three-cascade CSM with 4-moment EVSM shadows and the procedural sky
+        # background. The moments pass stores both warp pairs, the lighting
+        # pass bounds transmittance from both sides (the mirrored negative
+        # bound suppresses light bleeding), and a pre-blurred map replaces
+        # PCF: the blur radius IS the penumbra.
+        assert "float ChebyshevUpperBound(vec2 moments, float mean, float minVariance)" in pbr_lighting
+        assert "float ChebyshevUpperBoundNeg(vec2 moments, float mean, float minVariance)" in pbr_lighting
+        assert "1.0 - 2.0 * moments.x + moments.y" in pbr_lighting
+        assert "uniform float evsmPosK" in pbr_lighting
+        assert "uniform float evsmNegK" in pbr_lighting
+        assert "uniform float evsmLightBleed" in pbr_lighting
+        assert "uniform float evsmMinVariance" in pbr_lighting
+        assert "float meanPos = exp(evsmPosK * (receiverZ - 1.0));" in pbr_lighting
+        assert "float meanNeg = exp(evsmNegK * (1.0 - receiverZ));" in pbr_lighting
+        assert "float shadow = min(shadowPos, shadowNeg);" in pbr_lighting
+        assert "shadow = clamp((shadow - evsmLightBleed) / (1.0 - evsmLightBleed), 0.0, 1.0);" in pbr_lighting
+        assert "uniform vec3 shadowBias" not in pbr_lighting
+        assert "shadowTexelSize" not in pbr_lighting
+        assert "shadow / 9.0" not in pbr_lighting
         assert "uniform vec3 cascadeSplits" in pbr_lighting
         assert "float cameraDepth = -(camView * vec4(position, 1.0)).z;" in pbr_lighting
-        assert "float receiverDepth = lightPosition.z;" in pbr_lighting
+        assert "float receiverZ = lightPosition.z;" in pbr_lighting
         assert "float LinearDepth" not in pbr_lighting
-        assert "float depthSlope = max(abs(dFdx(receiverDepth)), abs(dFdy(receiverDepth)));" in pbr_lighting
-        assert "float depthBias = baseBias + 1.5 * depthSlope;" in pbr_lighting
-        assert "vec2 sampleCoord = clamp" in pbr_lighting
-        assert "shadow / 9.0" in pbr_lighting
         # Sky background samples linear-radiance environment data directly.
         assert "textureLod(environmentMap, viewDir, 0.0)" in pbr_lighting
         assert "SRGBToLinear(textureLod(prefilterMap" not in pbr_lighting
@@ -78,11 +90,22 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         assert "sampleTexcoord = clamp" in blur
         assert "sampleDepth >= 0.99999" in blur
         assert "totalWeight > 0.0f" in blur
-    for shader in ("pbr.fs", "lighting.fs", "pbrLighting.fs", "pbrShadow.fs", "shadow.fs", "ssao.fs", "blur.fs", "tonemap.fs", "debug.fs"):
+    for shader in ("pbr.fs", "lighting.fs", "pbrLighting.fs", "pbrShadow.fs", "shadow.fs", "ssao.fs", "blur.fs", "tonemap.fs", "debug.fs", "evsmBlur.fs"):
         assert (RESOURCE_DIR / shader).read_bytes() == (SOMA_RESOURCE_DIR / shader).read_bytes()
 
     pbr_shadow = (RESOURCE_DIR / "pbrShadow.fs").read_text(encoding="utf-8")
     assert "gl_FragDepth = gl_FragCoord.z;" in pbr_shadow
+    # 4-moment EVSM: both warp pairs stored per texel, positive warp fades to
+    # exp(k) at the near face, negative warp to 1, so ClearBackground(WHITE)
+    # remains the correct "no occluder" clear.
+    assert "vec4(sPos, sPos * sPos, sNeg, sNeg * sNeg)" in pbr_shadow
+    assert "float sPos = exp(evsmPosK * (z - 1.0));" in pbr_shadow
+    assert "float sNeg = exp(evsmNegK * (1.0 - z));" in pbr_shadow
+
+    evsm_blur = (RESOURCE_DIR / "evsmBlur.fs").read_text(encoding="utf-8")
+    assert "uniform sampler2D inputTexture" in evsm_blur
+    assert "uniform vec2 blurDirection" in evsm_blur
+    assert "texture(inputTexture, fragTexCoord + step * float(i)).rgba" in evsm_blur
 
 
 def test_debug_view_contract_is_shared_between_viewers():

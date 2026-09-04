@@ -594,6 +594,16 @@ raylib 的 `SetShaderValueTexture` 以 `texture.id` 作为采样器 unit 键值�
 
 论文图像可视化需要天空背景为精确纯白（255,255,255），且不能影响角色 PBR 光照（往环境贴图塞白天气会污染 IBL）。方案：`--white-background`（或 `white_background=True`）下，pbrLighting.fs 的背景分支输出哨兵辐射度 `BACKGROUND_SENTINEL=6e4`，tonemap.fs 检测 `hdr.r > 3e4` 时绕过 exposure 与 tone curve 直接输出显示白，因此任意 tone curve（aces/reinhard/agx）下背景都是精确 255；debug 显示 pass 的背景分支同步改为白底。两个实现约束记录在案：(1) lighting 全屏 quad 实际运行在 `(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)` 混合下——`rlDisableColorBlend` 在 raylib 5.5 的批次刷新时不生效——因此背景标记必须带 alpha=1 完整替换 clear 色，不能依赖 alpha 通道语义；(2) RGBA16F 存储为半精度（上限 65504），哨兵不能超出该范围，6e4 与场景辐射度（≤ ~1.3）相距四个数量级，误检风险可忽略。关闭该开关时逐像素与原输出一致（已验证）。
 
+### 20.9 EVSM 替换 PCF 阴影（2026-09-05）
+
+debug:shadow 视图暴露的地面大面积"阴影"根因是 PCF 的深度比较痤疮：cascade 0 的纹素在掠射角下深度量化误差超过 bias 补偿能力，3×3 均值无法掩盖。评估 VSM/MSM/EVSM 后选择 4 矩 EVSM：与前向指数 warp 下首个矩的 Cantelli 上界 + 反向 warp 的镜像界取 min，能同时抑制 light bleeding 与漏光，且实现量最小（单张 RGBA32F 级联图 + 一次分离高斯模糊）。关键决策与依据：
+
+- **矩端存储**：`vec4(sPos, sPos², sNeg, sNeg²)`，其中 `sPos=exp(k⁺(z-1))`、`sNeg=exp(k⁻(1-z))`。远平面处两个 warp 都退化为 1，故 `ClearBackground(WHITE)` 天然保持"无遮挡物"语义，无需改 clear 流程。k⁺=20（正向外推锐利）、k⁻=10（反向兜底）、bleed=0.15、min_variance=1e-5。float32 存储是硬需求：k⁻=10 时 m1≈2.2e4、m1²≈4.8e8，8-bit/16-bit 存储直接摧毁矩端。
+- **镜像 Chebyshev 推导**（M2 的核心修正）：反向 warp 的分布随深度递减，"受光面被遮挡"意味着其 warp 值小于存储均值。将分布按 Y=1-X 镜像后翻回上尾，共享 Cantelli 界；镜像矩为 E[Y]=1-m1、E[Y²]=1-2·m1+m2（方差镜像不变）。初版错误公式 `vec2(1-m2, 1-m1)` 在地面纹素（m1=1.22）上产生负矩，把全场打入 p≈0 的全黑阴影——教训：镜像变换必须作用于分布而非逐通道套用公式，且 float32 下 m1² 与 m2 的灾难性相消使 min_variance 下限成为正确性组件而非调优参数。
+- **级联收紧**：指数 warp 对光空间深度跨度敏感，`CSM_LIGHT_NEAR_MIN=1.5`（角色之外无更近遮挡物，近平面回撤换取 span 收紧）、`CSM_EXTENT_MAX=40.0`（相机拉远时限制 cascade 0 纹素密度被稀释）。probe 脚本必须复现 app 的 `rlSetClipPlanes(0.01, 50.0)`，否则 cascade 跨度膨胀两个数量级、warp 饱和，现象与镜像矩 bug 难以区分（本次排障因此绕弯）。
+- **模糊链与性能**：2048² RGBA32F 矩端图 × 3 级联，downsample + H + V 分离高斯（9-tap，半分辨率）。实测该链为带宽受限：9-tap 折叠成 5-fetch 双线性对（数学等价）、以及合并为单 pass 2D 外积（25 fetch，pass 数减半）两种"教科书优化"实测分别无收益/劣化 46.7 fps（2D 散布 fetch 击穿缓存），均已回退，保留分离 9-tap。最终帧耗 11.9 ms（84 fps @1280x720）对比 PCF 6.6 ms（152 fps）：EVSM 的模糊 pass 换掉 PCF 采样的净成本约 +5.3 ms。`shadow_resolution=1024` 时实测 120.1 fps 达标；**默认即 1024**（2026-09-05 用户决策：120fps 优先于 2048 的边缘锐度），genoview CLI 以 `--shadow-resolution` 覆盖，基线图全部按默认 1024 重新生成。
+- **槽位**：模糊链沿用显式槽绑定（26 号槽），sm_0/1/2 采样槽 23-25；RGBA32F 纹理名与 10-21 槽位冲突风险同 20.6 口径处理。
+
 ## 20. 完成定义
 
 当 Phase 1 完成并满足以下条件时，称为“PBR 管线结构修订完成”：

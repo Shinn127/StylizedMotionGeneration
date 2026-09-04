@@ -34,11 +34,16 @@ uniform float iblStrength;
 uniform float prefilterMaxLod;
 uniform int useIBL;
 uniform int whiteBackground;
-uniform vec2 shadowTexelSize;
-uniform vec3 shadowBias;
+// EVSM: warped-depth moments replace depth-compare + PCF entirely. No bias,
+// no texel size — variance bounds handle self-shadowing without acne.
+uniform float evsmPosK;
+uniform float evsmNegK;
+uniform float evsmLightBleed;
+uniform float evsmMinVariance;
 uniform vec3 cascadeSplits;
 // 0 final image, 1 shadow, 2 direct diffuse, 3 direct specular, 4 indirect light
 uniform int debugMode;
+
 
 out vec4 finalColor;
 
@@ -83,41 +88,66 @@ vec3 FresnelSchlick(float vDotH, vec3 f0)
     return f0 + (1.0 - f0) * pow(1.0 - vDotH, 5.0);
 }
 
+float ChebyshevUpperBound(vec2 moments, float mean, float minVariance)
+{
+    // One-sided Chebyshev (Cantrell's inequality) on the warped depth:
+    // P(x > mean) <= variance / (variance + (mean - m1)^2).
+    float d = mean - moments.x;
+    float variance = max(moments.y - moments.x * moments.x, minVariance);
+    float p = variance / (variance + d * d);
+    // Behind the mean depth the bound is meaningless; that region is lit.
+    return max(mean <= moments.x ? 1.0 : p, 0.0);
+}
+
+// Mirror of ChebyshevUpperBound for the negative-warp distribution. There the
+// warp exp(k(1-z)) DECREASES with depth, so "receiver occluded" means its
+// warped value is SMALLER than the stored mean. Mirroring the distribution
+// through Y = 1 - X flips the guarded tail back to the upper side where the
+// shared Cantelli bound applies; the mirrored moments are E[Y] = 1 - m1 and
+// E[Y^2] = 1 - 2 m1 + m2 (variance is mirror-invariant). Background texels
+// (m1 = m2 = 1, receiver mean <= 1) land in the always-lit branch.
+float ChebyshevUpperBoundNeg(vec2 moments, float mean, float minVariance)
+{
+    float mirroredMean = 1.0 - mean;
+    float mirroredM1 = 1.0 - moments.x;
+    float mirroredM2 = 1.0 - 2.0 * moments.x + moments.y;
+    return ChebyshevUpperBound(vec2(mirroredM1, mirroredM2), mirroredMean, minVariance);
+}
+
 float ShadowFactorFor(vec3 position, vec3 normal, mat4 lightViewProj, sampler2D shadowMap, float baseBias)
 {
-    vec4 lightPosition = lightViewProj * vec4(position + 0.01 * normal, 1.0);
+    vec4 lightPosition = lightViewProj * vec4(position, 1.0);
     lightPosition.xyz = (lightPosition.xyz / lightPosition.w + 1.0) * 0.5;
     bool inside = lightPosition.x > 0.0 && lightPosition.x < 1.0 &&
         lightPosition.y > 0.0 && lightPosition.y < 1.0 &&
         lightPosition.z > 0.0 && lightPosition.z < 1.0;
     if (!inside) { return 1.0; }
-    float receiverDepth = lightPosition.z;
-    float depthSlope = max(abs(dFdx(receiverDepth)), abs(dFdy(receiverDepth)));
-    float depthBias = baseBias + 1.5 * depthSlope;
-    // 3x3 percentage-closer filtering over the shadow map; the constant depth
-    // bias stays per-sample and shadow never routes through the SSAO blur.
-    float shadow = 0.0;
-    for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
-            vec2 sampleCoord = clamp(
-                lightPosition.xy + vec2(x, y) * shadowTexelSize,
-                vec2(0.0), vec2(1.0));
-            float blockerDepth = texture(shadowMap, sampleCoord).r;
-            shadow += 1.0 - float(receiverDepth - depthBias > blockerDepth);
-        }
-    }
-    return shadow / 9.0;
+    // Warped moments were blurred offline (evsmBlur.fs), so this is a single
+    // bilinear fetch — the blur radius IS the penumbra. The positive-warp pair
+    // bounds transmittance from one side; the negative-warp pair from the
+    // other, which is what suppresses light bleeding through thin occluders
+    // (arms, feet). min() of both bounds, then reshape the residual
+    // over-transmittance the bound allows.
+    vec4 m = texture(shadowMap, lightPosition.xy);
+    float receiverZ = lightPosition.z;
+    float meanPos = exp(evsmPosK * (receiverZ - 1.0));
+    float meanNeg = exp(evsmNegK * (1.0 - receiverZ));
+    float shadowPos = ChebyshevUpperBound(m.rg, meanPos, evsmMinVariance);
+    float shadowNeg = ChebyshevUpperBoundNeg(m.ba, meanNeg, evsmMinVariance);
+    float shadow = min(shadowPos, shadowNeg);
+    shadow = clamp((shadow - evsmLightBleed) / (1.0 - evsmLightBleed), 0.0, 1.0);
+    return shadow;
 }
 
 float ShadowFactor(vec3 position, vec3 normal, float cameraDepth)
 {
     if (cameraDepth <= cascadeSplits.x) {
-        return ShadowFactorFor(position, normal, lightViewProj0, shadowMap0, shadowBias.x);
+        return ShadowFactorFor(position, normal, lightViewProj0, shadowMap0, 0.0);
     }
     if (cameraDepth <= cascadeSplits.y) {
-        return ShadowFactorFor(position, normal, lightViewProj1, shadowMap1, shadowBias.y);
+        return ShadowFactorFor(position, normal, lightViewProj1, shadowMap1, 0.0);
     }
-    return ShadowFactorFor(position, normal, lightViewProj2, shadowMap2, shadowBias.z);
+    return ShadowFactorFor(position, normal, lightViewProj2, shadowMap2, 0.0);
 }
 
 void main()
