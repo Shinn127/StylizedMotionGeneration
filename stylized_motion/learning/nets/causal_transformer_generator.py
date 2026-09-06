@@ -623,6 +623,161 @@ class TrajectoryConditionEncoder(nn.Module):
         return self.norm(self.output_projection(F.silu(self.input_projection(inputs))))
 
 
+class FSQCanonicalTransformerGenerator(FSQCausalTransformerGenerator):
+    """Trajectory-controlled neutral FSQ token generator.
+
+    This class intentionally has no style embedding or FiLM branch.  It is the
+    frozen canonical prior that future style effects can read without becoming
+    part of its autoregressive state.
+    """
+
+    def __init__(
+        self,
+        num_coordinates: int,
+        num_levels: int,
+        trajectory_dim: int = 18,
+        trajectory_hidden_dim: int = 128,
+        **kwargs,
+    ) -> None:
+        if trajectory_dim <= 0 or trajectory_hidden_dim <= 0:
+            raise ValueError("trajectory_dim and trajectory_hidden_dim must be positive")
+        super().__init__(num_coordinates=num_coordinates, num_levels=num_levels, **kwargs)
+        self.trajectory_dim = int(trajectory_dim)
+        self.trajectory_hidden_dim = int(trajectory_hidden_dim)
+        self.trajectory_encoder = TrajectoryConditionEncoder(
+            trajectory_dim=self.trajectory_dim,
+            model_dim=self.dim,
+            hidden_dim=self.trajectory_hidden_dim,
+        )
+        self.config = {
+            **self.config,
+            "model_kind": "canonical_generator",
+            "trajectory_dim": self.trajectory_dim,
+            "trajectory_hidden_dim": self.trajectory_hidden_dim,
+        }
+        nn.init.normal_(self.trajectory_encoder.input_projection.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.trajectory_encoder.input_projection.bias)
+        nn.init.normal_(self.trajectory_encoder.output_projection.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.trajectory_encoder.output_projection.bias)
+
+    def _conditioned_frames(
+        self,
+        indices: torch.Tensor,
+        trajectory: torch.Tensor | None,
+        trajectory_valid: torch.Tensor | None,
+    ) -> torch.Tensor:
+        hidden = self._embed_frames(indices)
+        if trajectory is None:
+            trajectory = hidden.new_zeros((indices.shape[0], indices.shape[1], self.trajectory_dim))
+            trajectory_valid = hidden.new_zeros((indices.shape[0], indices.shape[1]))
+        else:
+            trajectory = trajectory.to(device=hidden.device, dtype=hidden.dtype)
+            if trajectory.shape[:2] != indices.shape[:2]:
+                raise ValueError("trajectory must have the same batch and frame dimensions as indices")
+            if trajectory_valid is not None:
+                trajectory_valid = trajectory_valid.to(device=hidden.device)
+        return hidden + self.trajectory_encoder(trajectory, trajectory_valid)
+
+    def forward(
+        self,
+        indices: torch.Tensor,
+        trajectory: torch.Tensor | None = None,
+        trajectory_valid: torch.Tensor | None = None,
+        cache: FSQGeneratorCache | None = None,
+        use_cache: bool = False,
+    ) -> dict[str, torch.Tensor | FSQGeneratorCache | None]:
+        return self._forward_embedded(
+            self._conditioned_frames(indices, trajectory, trajectory_valid),
+            cache=cache,
+            use_cache=use_cache,
+        )
+
+    def prefill(
+        self,
+        seed_indices: torch.Tensor,
+        seed_trajectory: torch.Tensor | None = None,
+        seed_trajectory_valid: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, FSQGeneratorCache]:
+        output = self(
+            seed_indices,
+            trajectory=seed_trajectory,
+            trajectory_valid=seed_trajectory_valid,
+            use_cache=True,
+        )
+        cache = output["cache"]
+        if not isinstance(cache, FSQGeneratorCache):
+            raise RuntimeError("Canonical prefill did not produce a KV cache")
+        return output["logits"][:, -1], cache
+
+    def decode_step(
+        self,
+        current_indices: torch.Tensor,
+        cache: FSQGeneratorCache,
+        trajectory: torch.Tensor | None = None,
+        trajectory_valid: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, FSQGeneratorCache]:
+        if current_indices.ndim == 2:
+            current_indices = current_indices[:, None]
+        if current_indices.ndim != 3 or current_indices.shape[1] != 1:
+            raise ValueError("Canonical decode_step expects [B,K] or [B,1,K]")
+        if trajectory is not None and trajectory.ndim == 2:
+            trajectory = trajectory[:, None]
+        if trajectory_valid is not None and trajectory_valid.ndim == 1:
+            trajectory_valid = trajectory_valid[:, None]
+        output = self(
+            current_indices,
+            trajectory=trajectory,
+            trajectory_valid=trajectory_valid,
+            cache=cache,
+            use_cache=True,
+        )
+        next_cache = output["cache"]
+        if not isinstance(next_cache, FSQGeneratorCache):
+            raise RuntimeError("Canonical decode_step did not produce a KV cache")
+        return output["logits"][:, -1], next_cache
+
+    def generate_controlled(
+        self,
+        seed_indices: torch.Tensor,
+        num_steps: int,
+        seed_trajectory: torch.Tensor | None = None,
+        seed_trajectory_valid: torch.Tensor | None = None,
+        future_trajectory: torch.Tensor | None = None,
+        future_trajectory_valid: torch.Tensor | None = None,
+        temperature: float = 1.0,
+        greedy: bool = False,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        if num_steps <= 0:
+            raise ValueError("num_steps must be positive")
+        next_logits, cache = self.prefill(seed_indices, seed_trajectory, seed_trajectory_valid)
+        if future_trajectory is None:
+            future_trajectory = seed_indices.new_zeros(
+                (seed_indices.shape[0], num_steps, self.trajectory_dim)
+            ).float()
+            future_trajectory_valid = future_trajectory.new_zeros((seed_indices.shape[0], num_steps))
+        elif future_trajectory.ndim == 2:
+            future_trajectory = future_trajectory[:, None]
+        if future_trajectory.shape[1] < num_steps:
+            raise ValueError("future_trajectory must contain at least num_steps frames")
+        generated = []
+        for step in range(num_steps):
+            current = self.sample_next(next_logits, temperature=temperature, greedy=greedy, generator=generator)
+            generated.append(current)
+            if step + 1 < num_steps:
+                next_logits, cache = self.decode_step(
+                    current,
+                    cache,
+                    trajectory=future_trajectory[:, step : step + 1],
+                    trajectory_valid=(
+                        None
+                        if future_trajectory_valid is None
+                        else future_trajectory_valid[:, step : step + 1]
+                    ),
+                )
+        return torch.stack(generated, dim=1)
+
+
 class FSQConditionalTransformerGenerator(FSQCausalTransformerGenerator):
     """FSQ generator with causal dynamic style FiLM and trajectory controls."""
 

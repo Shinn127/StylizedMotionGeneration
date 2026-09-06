@@ -1,0 +1,46 @@
+data:
+  token_database: data/processed/100style_pruned_90/latent_residual_fsq_v2_40x9
+  trajectory_database: data/processed/100style_pruned_90/latent_residual_fsq_v2_40x9_trajectory
+  required_data_schema_version: 3
+
+sampling:
+  strategy: frame_uniform
+  target_frames: 64
+  samples_per_epoch: 100000
+  seed: 3407
+  mirror_probability: 0.5
+
+model:
+  model_kind: canonical_generator
+  coordinate_embedding_dim: 16
+  d_model: 256
+  num_layers: 6
+  num_query_heads: 8
+  num_kv_heads: 4
+  ff_dim: 768
+  dropout: 0.1
+  context_frames: 64
+  rope_theta: 10000.0
+  qk_norm: true
+  norm_eps: 0.00001
+  trajectory_hidden_dim: 128
+
+training:
+  epochs: 100
+  lr: 0.0003
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  seed: 3407
+  deterministic: false
+  device: auto
+  output_dir: outputs/canonical_generator_latent_residual_fsq_v2_40x9
+
+loader:
+  batch_size: 128
+  num_workers: 4
+  pin_memory: auto
+  persistent_workers: true
+  prefetch_factor: 2
+  drop_last_train: true
+  max_open_shards: 32
+  prefetch_memory_limit_mb: 512

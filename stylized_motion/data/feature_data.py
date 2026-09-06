@@ -13,13 +13,12 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from stylized_motion.anim.features import MotionFeatureStats
+from stylized_motion.anim.features import MotionFeatureStats, joint_feature_dim
 from .sampling import SampleRequest
 
 
 DATA_SCHEMA_VERSION = 3
 FRAME_RATE = 60
-MOTION_DIM = 230
 _SPLIT_IDS = {"train": 0, "val": 1, "test": 2}
 
 
@@ -90,7 +89,9 @@ class FeatureCache:
 
     @property
     def motion_dim(self) -> int:
-        return MOTION_DIM
+        # Feature width is a per-skeleton property: 230 for the 25-bone pruned
+        # Geno/100STYLE skeleton, 248 for the pruned SOMA skeleton, etc.
+        return joint_feature_dim(len(self.names))
 
     def read_motion(self, shard_idx: int, start: int = 0, frames: int | None = None) -> np.ndarray:
         if self._cache is None:
@@ -151,7 +152,7 @@ def open_feature_cache(database: str | Path, *, max_open_shards: int = 32) -> Fe
         shard_files,
         frames,
         dtype=np.float32,
-        tail_shape=(MOTION_DIM,),
+        tail_shape=(joint_feature_dim(len(names)),),
         label="Feature cache",
     )
     return FeatureCache(
@@ -480,8 +481,9 @@ def open_feature_store(database: str | Path, *, max_open_shards: int = 32) -> Fe
     if not names or parents.shape != (len(names),):
         raise ValueError("Feature schema names/parents are invalid")
     motion_dim = int(manifest.get("motion_dim", schema.get("motion_dim", 0)))
-    if motion_dim != MOTION_DIM:
-        raise ValueError(f"FeatureStore motion_dim must be {MOTION_DIM}, got {motion_dim}")
+    expected_dim = joint_feature_dim(len(names))
+    if motion_dim != expected_dim:
+        raise ValueError(f"FeatureStore motion_dim {motion_dim} does not match the skeleton-derived width {expected_dim}")
     _validate_shard_arrays(
         shard_files,
         index["shard_num_frames"],

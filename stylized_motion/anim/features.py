@@ -134,6 +134,16 @@ WEIGHTS_MESH = {
     "LeftToeBaseEnd": 0.00063045,
     "LeftLegEnd": 0.00063045,
     "LeftUpLegEnd": 0.00063045,
+    # SOMA-only joints (BONES-SEED), mapped to their Geno analogues: the shin
+    # is Geno's "Leg", the chest sits at Geno's "Spine3" height, and eyes/jaw
+    # carry end-joint-level influence.
+    "Chest": 0.07508411,
+    "Neck2": 0.00639638,
+    "Jaw": 0.00639638,
+    "LeftEye": 0.00063045,
+    "RightEye": 0.00063045,
+    "LeftShin": 0.02033588,
+    "RightShin": 0.02043630,
 }
 
 

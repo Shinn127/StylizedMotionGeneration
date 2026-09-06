@@ -20,9 +20,8 @@ import torch
 from tqdm import tqdm
 
 from stylized_motion.anim import bvh, quat
-from stylized_motion.anim.features import MotionFeatureStats, build_motion_feature_components, default_joint_weights, serialize_motion_feature_stats
+from stylized_motion.anim.features import MotionFeatureStats, build_motion_feature_components, default_joint_weights, joint_feature_dim, serialize_motion_feature_stats
 from stylized_motion.data.feature_data import (
-    MOTION_DIM,
     _validate_shard_hashes,
     canonical_json_bytes,
     open_feature_cache,
@@ -42,6 +41,7 @@ STYLE100_SOURCE = RAW_DIR / "100style"
 
 STYLE100_CLIPS = ["BR", "BW", "FR", "FW", "ID", "SR", "SW", "TR1"]
 FINGER_TOKENS = ("Thumb", "Index", "Middle", "Ring", "Pinky")
+_TARGET_FRAME_TIME = 1.0 / 60.0
 MOTION_FRAME_KEYS = ("positions", "velocities", "rotations", "angular_velocities", "contacts")
 UNKNOWN_LABEL = "__unknown__"
 FSQ_WINDOW_FRAMES = 64
@@ -170,12 +170,74 @@ def _compute_contacts(global_velocities, bone_names):
     return contacts
 
 
+def _normalize_to_60fps(bvh_data):
+    """Decimate BVH frames to the pipeline's 60 fps contract.
+
+    Velocity differences, smoothing windows, and store manifests all assume
+    1/60 s frames. BONES-SEED soma_uniform BVHs are natively 120 fps, so their
+    frames are verbatim-decimated (keep every Nth frame, matching
+    ``scripts/downsample_bvh.py``) before any processing; 60 fps inputs pass
+    through untouched. Inputs whose rate is not an integer multiple of 60 fps
+    are rejected instead of being silently resampled. Data without a frame
+    time keeps the historical 60 fps assumption.
+    """
+    frametime = float(bvh_data.get("frametime") or 0.0)
+    if frametime <= 0.0:
+        return bvh_data
+    factor = _TARGET_FRAME_TIME / frametime
+    rounded = int(round(factor))
+    if rounded < 1 or abs(factor - rounded) > 0.01 * rounded:
+        raise ValueError(
+            f"BVH frame time {frametime:.6g}s is not an integer multiple of the "
+            f"60 fps pipeline contract (factor {factor:.4g})"
+        )
+    if rounded == 1:
+        return bvh_data
+    return {
+        **bvh_data,
+        "positions": bvh_data["positions"][::rounded],
+        "rotations": bvh_data["rotations"][::rounded],
+        "frametime": frametime * rounded,
+    }
+
+
+def _drop_static_rig_root(names, parents, positions, rotations):
+    """Drop a static BVH root joint named ``Root`` (the BONES-SEED SOMA convention).
+
+    SOMA rigs pin a ``Root`` joint at the world origin while the pelvis
+    translation flows through ``Hips``. Keeping it would occupy feature index 1
+    — the hardcoded hips slot of the motion-feature layout — and reduce every
+    root-motion signal to a mirrored duplicate, so the processed skeleton must
+    start at ``Hips`` like Geno/100STYLE. The drop only fires for a root joint
+    literally named ``Root`` whose global position never moves, leaving other
+    rigs (whose roots are animated joints such as ``Hips``) untouched.
+    """
+    if len(names) == 0 or str(names[0]) != "Root" or int(np.asarray(parents)[0]) != -1:
+        return names, parents, positions, rotations
+    _, global_positions = quat.fk(rotations, positions, parents)
+    if float(np.std(global_positions[:, 0], axis=0).max()) > 1e-6:
+        return names, parents, positions, rotations
+    return (
+        names[1:],
+        np.asarray(parents, dtype=np.int32)[1:] - 1,
+        positions[:, 1:],
+        rotations[:, 1:],
+    )
+
+
 def _process_motion_data(bvh_data, mirror, prune_ends_and_fingers=False):
+    bvh_data = _normalize_to_60fps(bvh_data)
     positions = bvh_data["positions"].astype(np.float32) * 0.01
     rotations = quat.unroll(quat.from_euler(np.radians(bvh_data["rotations"]), order=bvh_data["order"])).astype(np.float32)
-    names, parents, positions, rotations = _prune_skeleton(
+    names, parents, positions, rotations = _drop_static_rig_root(
         bvh_data["names"],
         bvh_data["parents"],
+        positions,
+        rotations,
+    )
+    names, parents, positions, rotations = _prune_skeleton(
+        names,
+        parents,
         positions,
         rotations,
         prune_ends_and_fingers=prune_ends_and_fingers,
@@ -657,7 +719,8 @@ def build_feature_cache(
                 position_count += len(components.positions)
         if names is None or parents is None or position_sum is None or position_count <= 0:
             raise ValueError("No motion shards were processed")
-        schema_payload = {"name": "motion_feature_v2", "motion_dim": MOTION_DIM, "joint_subset": "prune_ends_and_fingers" if prune_ends_and_fingers else "full", "names": names, "parents": parents.tolist()}
+        motion_dim = joint_feature_dim(len(names))
+        schema_payload = {"name": "motion_feature_v2", "motion_dim": motion_dim, "joint_subset": "prune_ends_and_fingers" if prune_ends_and_fingers else "full", "names": names, "parents": parents.tolist()}
         schema_hash = hashlib.sha256(canonical_json_bytes(schema_payload)).hexdigest()
         np.savez(
             staging / "index.npz",
@@ -674,7 +737,7 @@ def build_feature_cache(
             "shard_sha256": [sha256_file(staging / value) for value in motion_files],
             "feature_schema_hash": schema_hash,
             "created_by": "stylized_motion.data.preprocess",
-            "motion_dim": MOTION_DIM,
+            "motion_dim": motion_dim,
             "range_names": range_names,
             "source_clips": source_records,
             "unseen_style_names": list(_heldout_style_names() if dataset_name in {"100style", "combined"} else ()),
@@ -690,8 +753,9 @@ def build_feature_cache(
 
 
 def _window_stats(cache: Any, train_records: list[tuple[int, int, int]]) -> MotionFeatureStats:
-    total = np.zeros(MOTION_DIM, dtype=np.float64)
-    squared = np.zeros(MOTION_DIM, dtype=np.float64)
+    motion_dim = joint_feature_dim(len(cache.names))
+    total = np.zeros(motion_dim, dtype=np.float64)
+    squared = np.zeros(motion_dim, dtype=np.float64)
     count = 0
     for shard_idx, start, stop in train_records:
         values = cache.read_motion(shard_idx, start, stop - start).astype(np.float64)
@@ -791,9 +855,9 @@ def build_fsq_window_index(
         for key in ("offset", "scale", "weights", "ref_pos"):
             stats_sha256.update(key.encode("ascii"))
             stats_sha256.update(np.asarray(getattr(stats, key), dtype=np.float32).tobytes())
-        schema_payload = {"name": "motion_feature_v2", "motion_dim": MOTION_DIM, "joint_subset": cache.joint_subset, "names_sha256": names_sha256, "stats_sha256": stats_sha256.hexdigest()}
+        schema_payload = {"name": "motion_feature_v2", "motion_dim": joint_feature_dim(len(cache.names)), "joint_subset": cache.joint_subset, "names_sha256": names_sha256, "stats_sha256": stats_sha256.hexdigest()}
         schema_hash = hashlib.sha256(canonical_json_bytes(schema_payload)).hexdigest()
-        manifest = {"data_schema_version": 3, "store_type": "feature", "frame_rate": 60, "num_shards": len(motion_files), "shard_files": motion_files, "shard_sha256": [sha256_file(staging / value) for value in motion_files], "split_manifest_hash": hashlib.sha256(canonical_json_bytes({"policy": "fixed_window_random_v1", "seed": int(seed), "window_frames": FSQ_WINDOW_FRAMES, "ratios": FSQ_SPLIT_RATIOS, "records": records})).hexdigest(), "feature_schema_hash": schema_hash, "created_by": "stylized_motion.data.preprocess", "motion_dim": MOTION_DIM, "range_names": range_names, "source_clip_names": sorted(source_names), "feature_schema": {**schema_payload, "names": cache.names, "parents": cache.parents.tolist()}, "normalization_train_frames": len(train_records) * FSQ_WINDOW_FRAMES, "split_policy": "fixed_window_random_v1", "window_frames": FSQ_WINDOW_FRAMES, "split_seed": int(seed), "split_ratios": FSQ_SPLIT_RATIOS, "unseen_style_names": sorted(heldout)}
+        manifest = {"data_schema_version": 3, "store_type": "feature", "frame_rate": 60, "num_shards": len(motion_files), "shard_files": motion_files, "shard_sha256": [sha256_file(staging / value) for value in motion_files], "split_manifest_hash": hashlib.sha256(canonical_json_bytes({"policy": "fixed_window_random_v1", "seed": int(seed), "window_frames": FSQ_WINDOW_FRAMES, "ratios": FSQ_SPLIT_RATIOS, "records": records})).hexdigest(), "feature_schema_hash": schema_hash, "created_by": "stylized_motion.data.preprocess", "motion_dim": joint_feature_dim(len(cache.names)), "range_names": range_names, "source_clip_names": sorted(source_names), "feature_schema": {**schema_payload, "names": cache.names, "parents": cache.parents.tolist()}, "normalization_train_frames": len(train_records) * FSQ_WINDOW_FRAMES, "split_policy": "fixed_window_random_v1", "window_frames": FSQ_WINDOW_FRAMES, "split_seed": int(seed), "split_ratios": FSQ_SPLIT_RATIOS, "unseen_style_names": sorted(heldout)}
         (staging / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=True, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         unseen_rows: list[tuple[int, int, int]] = []
         for shard_idx, start, stop in unseen:

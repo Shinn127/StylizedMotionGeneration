@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from stylized_motion.anim.features import MotionFeatureStats
+from stylized_motion.anim.features import MotionFeatureStats, joint_feature_dim
 from stylized_motion.data.feature_data import (
     FeatureDataset,
     _stats_sha256,
@@ -47,21 +47,22 @@ def _motion(nframes: int) -> dict[str, np.ndarray | list[str]]:
 def _write_feature_store(tmp_path: Path) -> None:
     shard_dir = tmp_path / "motion"
     shard_dir.mkdir()
-    motion = np.arange(128 * 230, dtype=np.float32).reshape(128, 230)
+    motion_dim = joint_feature_dim(2)  # the fixture skeleton is Simulation + Hips
+    motion = np.arange(128 * motion_dim, dtype=np.float32).reshape(128, motion_dim)
     shard = shard_dir / "shard_00000.npy"
     np.save(shard, motion)
     stats = MotionFeatureStats(
-        offset=np.zeros(230, dtype=np.float32),
-        scale=np.ones(230, dtype=np.float32),
-        dist=np.ones(230, dtype=np.float32),
-        weights=np.ones(230, dtype=np.float32),
+        offset=np.zeros(motion_dim, dtype=np.float32),
+        scale=np.ones(motion_dim, dtype=np.float32),
+        dist=np.ones(motion_dim, dtype=np.float32),
+        weights=np.ones(motion_dim, dtype=np.float32),
         ref_pos=np.zeros((2, 3), dtype=np.float32),
     )
     names = ["Simulation", "Hips"]
     parents = [-1, 0]
     schema_payload = {
         "name": "motion_feature_v2",
-        "motion_dim": 230,
+        "motion_dim": motion_dim,
         "joint_subset": "full",
         "names_sha256": hashlib.sha256(canonical_json_bytes(names)).hexdigest(),
         "stats_sha256": _stats_sha256(stats),
@@ -77,7 +78,7 @@ def _write_feature_store(tmp_path: Path) -> None:
         "split_manifest_hash": "split-hash",
         "feature_schema_hash": schema_hash,
         "created_by": "tests",
-        "motion_dim": 230,
+        "motion_dim": motion_dim,
         "range_names": ["style_action"],
         "source_clip_names": ["style_action"],
         "style_names": ["style"],
@@ -259,13 +260,13 @@ def test_schema_v3_feature_store_returns_64_frame_causal_batch(tmp_path: Path):
         dataset = FeatureDataset("train", store, requests=[request])
         item = dataset[0]
         batch = dataset.__getitems__([request])
-        assert item["motion"].shape == (64, 230)
+        assert item["motion"].shape == (64, joint_feature_dim(2))
         assert item["motion"].is_contiguous()
         assert item["loss_mask"].shape == (64,)
         assert int(item["loss_mask"].sum()) == 64
         assert bool(item["loss_mask"].all())
         assert batch["motion"].is_contiguous()
-        assert batch["motion"].shape == (1, 64, 230)
+        assert batch["motion"].shape == (1, 64, joint_feature_dim(2))
         assert validate_data(feature_database=tmp_path, full=True) == {
             "feature": True,
             "token": False,
