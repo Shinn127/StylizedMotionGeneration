@@ -374,6 +374,12 @@ class IBLResources:
     prefilter_max_lod: float = 0.0
 
     def initialize(self) -> "IBLResources":
+        # Keep the state object for fallback uniforms, but avoid all CPU
+        # convolution and GPU uploads when IBL is explicitly disabled.
+        if not self.enabled:
+            self.cleanup()
+            self.prefilter_max_lod = 0.0
+            return self
         # Full split-sum chain from one procedural sky: environment cubemap,
         # cosine-convolved irradiance, GGX importance-sampled prefilter mips,
         # and the CPU-integrated BRDF LUT. The face arrays are cached on disk
@@ -395,10 +401,9 @@ class IBLResources:
         return self
 
     def cleanup(self) -> None:
-        UnloadTexture(self.brdf_lut)
-        UnloadTexture(self.prefilter)
-        UnloadTexture(self.irradiance)
-        UnloadTexture(self.environment)
+        for texture in (self.brdf_lut, self.prefilter, self.irradiance, self.environment):
+            if texture is not None and texture.id > 0:
+                UnloadTexture(texture)
         self.brdf_lut = None
         self.prefilter = None
         self.irradiance = None

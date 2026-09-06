@@ -9,7 +9,7 @@ from pathlib import Path
 
 import cffi
 import numpy as np
-from pyray import BoneInfo, Camera3D, Color, Matrix, Mesh, Model, Rectangle, Transform, Vector2, Vector3, Vector4, take_screenshot
+from pyray import BoneInfo, Camera3D, Color, Matrix, Mesh, Model, Rectangle, Transform, Vector2, Vector3, Vector4
 from raylib import *
 from raylib.defines import *
 
@@ -17,7 +17,7 @@ from stylized_motion.anim.features import deserialize_motion_feature_stats, reco
 from stylized_motion.anim import quat
 from stylized_motion.anim.environment import IBLResources
 from stylized_motion.anim.materials import Material, load_material_texture
-from stylized_motion.anim.render_targets import RenderTargets
+from stylized_motion.anim.render_targets import RenderTargets, export_render_target
 from stylized_motion.anim.scene import DirectionalLight, RenderObject, Scene
 from stylized_motion.data import open_feature_store
 from stylized_motion.util.paths import RESOURCE_DIR
@@ -894,6 +894,7 @@ class GenoView:
         self.gbuffer = None
         self.lighted = None
         self.tonemapped = None
+        self.final = None
         self.ssao_front = None
         self.ssao_back = None
         self.render_targets = None
@@ -941,6 +942,7 @@ class GenoView:
         self.shadow_texture_slot_ptr = ffi.new("int*")
         self.shadow_texture_slot_ptrs = [ffi.new("int*") for _ in range(3)]
         self.shadow_cascade_splits_ptr = ffi.new("float[3]")
+        self.cascade_blend_fraction_ptr = ffi.new("float*")
         self.shadow_bias_ptr = ffi.new("float[3]")
         self.evsm_pos_k_ptr = ffi.new("float*")
         self.evsm_neg_k_ptr = ffi.new("float*")
@@ -985,6 +987,8 @@ class GenoView:
         # EVSM blur input lives beyond the lighting pass's occupied slots.
         self.evsm_blur_texture_slot_ptr = ffi.new("int*")
         self.evsm_blur_texture_slot_ptr[0] = 26
+        self.evsm_blur_inv_resolution_ptr = ffi.new("float[2]")
+        self.evsm_blur_direction_ptr = ffi.new("float[2]")
         self.prefilter_max_lod_ptr[0] = 5.0
         self.evsm_pos_k_ptr[0] = self.evsm_pos_k
         self.evsm_neg_k_ptr[0] = self.evsm_neg_k
@@ -1138,6 +1142,9 @@ class GenoView:
             self.shader_locs["lighting_evsm_light_bleed"] = GetShaderLocation(self.shaders["lighting"], b"evsmLightBleed")
             self.shader_locs["lighting_evsm_min_variance"] = GetShaderLocation(self.shaders["lighting"], b"evsmMinVariance")
             self.shader_locs["lighting_cascade_splits"] = GetShaderLocation(self.shaders["lighting"], b"cascadeSplits")
+            self.shader_locs["lighting_cascade_blend_fraction"] = GetShaderLocation(
+                self.shaders["lighting"], b"cascadeBlendFraction"
+            )
             self.shader_locs["lighting_cam_view"] = GetShaderLocation(self.shaders["lighting"], b"camView")
 
         if self.shading == "pbr":
@@ -1182,6 +1189,7 @@ class GenoView:
         self.gbuffer = self.render_targets.gbuffer
         self.lighted = self.render_targets.lighting
         self.tonemapped = self.render_targets.tonemapped
+        self.final = self.render_targets.final
         self.ssao_front = self.render_targets.ssao_front
         self.ssao_back = self.render_targets.ssao_back
 
@@ -1268,8 +1276,18 @@ class GenoView:
     def _cleanup(self):
         if self.ibl is not None:
             self.ibl.cleanup()
+            self.ibl = None
         if self.render_targets is not None:
             self.render_targets.cleanup()
+            self.render_targets = None
+            self.shadow_maps = []
+            self.shadow_map = None
+            self.gbuffer = None
+            self.lighted = None
+            self.tonemapped = None
+            self.final = None
+            self.ssao_front = None
+            self.ssao_back = None
         if self.default_material is not None:
             for texture in (
                 self.default_material.base_color_map,
@@ -1278,17 +1296,24 @@ class GenoView:
             ):
                 if texture is not None:
                     UnloadTexture(texture)
+            self.default_material.base_color_map = None
+            self.default_material.metallic_roughness_map = None
+            self.default_material.normal_map = None
         if self.geno_model is not None:
             UnloadModel(self.geno_model)
+            self.geno_model = None
         if self.compare_model is not None:
             UnloadModel(self.compare_model)
+            self.compare_model = None
         if self.ground_model is not None:
             UnloadModel(self.ground_model)
+            self.ground_model = None
         for grid_model in self.grid_models:
             UnloadModel(grid_model)
         self.grid_models = []
         for shader in self.shaders.values():
             UnloadShader(shader)
+        self.shaders.clear()
 
     def _frame_range_name(self):
         for name, start, stop in zip(self.range_names, self.range_starts, self.range_stops):
@@ -1530,7 +1555,7 @@ class GenoView:
                     self.playback.draw_ui(screen_width, screen_height, "Sample" if self.indices is not None else "Frame")
                 EndDrawing()
                 if frame_dir is not None:
-                    take_screenshot(str(frame_dir / f"frame_{recorded_frames:06d}.png"))
+                    export_render_target(self.final, frame_dir / f"frame_{recorded_frames:06d}.png")
                     recorded_frames += 1
                     if recorded_frames >= self.playback.frame_count:
                         break

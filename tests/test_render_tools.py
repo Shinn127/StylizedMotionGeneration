@@ -35,11 +35,15 @@ def test_render_stills_supports_viewer_and_debug_options():
         "--base-color-map",
         "--disable-ibl",
         "--sun-strength",
+        "--shadow-resolution",
     ):
         assert flag in source, flag
-    assert "render_frame" in source and "draw_output" in source
-    # Reads the render-target texture, not the window framebuffer.
-    assert "LoadImageFromTexture" in source
+    assert "render_frame" in source and "render_presentation" in source
+    assert "rlSetClipPlanes(0.01, 50.0)" in source
+    # The reusable helper reads the same final target as video export.
+    targets_source = (PROJECT_ROOT / "stylized_motion" / "anim" / "render_targets.py").read_text(encoding="utf-8")
+    assert "def export_render_target" in targets_source
+    assert "ImageFlipVertical" in targets_source
 
 
 def test_compare_stills_has_thresholded_comparison():

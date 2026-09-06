@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import cffi
+from pathlib import Path
 import numpy as np
 from pyray import RenderTexture, Texture
 from raylib import *
@@ -91,13 +92,32 @@ def load_shadow_evsm_map(width, height):
 
 def unload_shadow_map(target):
     if target.id > 0:
+        _unload_texture(target.depth)
         rlUnloadFramebuffer(target.id)
+        target.id = 0
 
 
 def unload_shadow_evsm_map(target):
     if target.id > 0:
-        rlUnloadTexture(target.texture.id)
+        _unload_texture(target.texture)
+        _unload_texture(target.depth)
         rlUnloadFramebuffer(target.id)
+        target.id = 0
+
+
+def _unload_texture(texture: Texture) -> None:
+    """Release a manually-owned texture once and mark its handle invalid."""
+    if texture.id > 0:
+        rlUnloadTexture(texture.id)
+        texture.id = 0
+
+
+def unload_color_target(target: RenderTexture) -> None:
+    """Release a color-only framebuffer created by :func:`load_color_target`."""
+    if target.id > 0:
+        _unload_texture(target.texture)
+        rlUnloadFramebuffer(target.id)
+        target.id = 0
 
 
 def begin_shadow_map(target, shadow_light):
@@ -195,7 +215,25 @@ def load_gbuffer(width, height):
 
 def unload_gbuffer(target):
     if target.id > 0:
+        _unload_texture(target.color)
+        _unload_texture(target.normal)
+        _unload_texture(target.material_ao)
+        _unload_texture(target.depth)
         rlUnloadFramebuffer(target.id)
+        target.id = 0
+
+
+def export_render_target(target: RenderTexture, output_path: Path) -> None:
+    """Write a render target using raylib's established texture readback path."""
+    image = LoadImageFromTexture(target.texture)
+    try:
+        # Render-target memory has the OpenGL origin; files and the window
+        # framebuffer use a top-left origin. Keep every export path upright.
+        ImageFlipVertical(ffi.addressof(image))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        ExportImage(image, str(output_path).encode("utf-8"))
+    finally:
+        UnloadImage(image)
 
 
 def begin_gbuffer(target, camera):
@@ -249,6 +287,7 @@ class RenderTargets:
         self.gbuffer = None
         self.lighting = None
         self.tonemapped = None
+        self.final = None
         self.ssao_front = None
         self.ssao_back = None
 
@@ -283,6 +322,9 @@ class RenderTargets:
             else LoadRenderTexture(self.width, self.height)
         )
         self.tonemapped = LoadRenderTexture(self.width, self.height) if self.shading == "pbr" else None
+        # This is the exact image shown in the window: FXAA is already applied
+        # for normal views, while debug views intentionally remain unfiltered.
+        self.final = LoadRenderTexture(self.width, self.height)
         self.ssao_front = LoadRenderTexture(self.width, self.height)
         self.ssao_back = LoadRenderTexture(self.width, self.height)
         return self
@@ -290,27 +332,36 @@ class RenderTargets:
     def cleanup(self) -> None:
         if self.lighting is not None:
             if self.shading == "pbr":
-                rlUnloadTexture(self.lighting.texture.id)
-                rlUnloadFramebuffer(self.lighting.id)
+                unload_color_target(self.lighting)
             else:
                 UnloadRenderTexture(self.lighting)
+            self.lighting = None
         if self.tonemapped is not None:
             UnloadRenderTexture(self.tonemapped)
+            self.tonemapped = None
+        if self.final is not None:
+            UnloadRenderTexture(self.final)
+            self.final = None
         if self.ssao_back is not None:
             UnloadRenderTexture(self.ssao_back)
+            self.ssao_back = None
         if self.ssao_front is not None:
             UnloadRenderTexture(self.ssao_front)
+            self.ssao_front = None
         if self.gbuffer is not None:
             unload_gbuffer(self.gbuffer)
+            self.gbuffer = None
         for shadow_map in self.shadow_maps:
             if self.shading == "pbr":
                 unload_shadow_evsm_map(shadow_map)
             else:
                 unload_shadow_map(shadow_map)
+        self.shadow_maps = []
+        self.shadow_map = None
         for blurred in self.shadow_blurred:
-            if blurred is not None and self.shading == "pbr":
-                rlUnloadTexture(blurred.texture.id)
-                rlUnloadFramebuffer(blurred.id)
+            if blurred is not None:
+                unload_color_target(blurred)
+        self.shadow_blurred = []
         if self.evsm_scratch is not None:
-            rlUnloadTexture(self.evsm_scratch.texture.id)
-            rlUnloadFramebuffer(self.evsm_scratch.id)
+            unload_color_target(self.evsm_scratch)
+            self.evsm_scratch = None

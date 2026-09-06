@@ -70,6 +70,9 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         assert "shadowTexelSize" not in pbr_lighting
         assert "shadow / 9.0" not in pbr_lighting
         assert "uniform vec3 cascadeSplits" in pbr_lighting
+        assert "uniform float cascadeBlendFraction" in pbr_lighting
+        assert "smoothstep(cascadeSplits.x - blendWidth0, cascadeSplits.x, cameraDepth)" in pbr_lighting
+        assert "mix(shadow0, shadow1, blend)" in pbr_lighting
         assert "float cameraDepth = -(camView * vec4(position, 1.0)).z;" in pbr_lighting
         assert "float receiverZ = lightPosition.z;" in pbr_lighting
         assert "float LinearDepth" not in pbr_lighting
@@ -168,6 +171,19 @@ def test_pbr_uses_three_cascaded_shadow_maps():
     assert "shadow_count = 3 if self.shading == \"pbr\" else 1" in render_targets_source
     assert "CSM_CASCADE_COUNT = 3" in renderer_source
     assert "_update_cascade_shadow_lights(view)" in renderer_source
+
+
+def test_cascade_render_ranges_overlap_shader_blend_regions():
+    from stylized_motion.anim.renderer import CSM_BLEND_FRACTION, _cascade_splits_and_ranges
+
+    splits, ranges = _cascade_splits_and_ranges(0.01, 50.0)
+    assert CSM_BLEND_FRACTION == 0.10
+    assert len(splits) == len(ranges) == 3
+    for boundary in range(2):
+        nominal_near = 0.01 if boundary == 0 else splits[boundary - 1]
+        blend_width = (splits[boundary] - nominal_near) * CSM_BLEND_FRACTION
+        assert ranges[boundary][1] == splits[boundary]
+        assert ranges[boundary + 1][0] <= splits[boundary] - blend_width
 
 
 def test_pbr_light_rig_is_retuned_while_legacy_stays_frozen():

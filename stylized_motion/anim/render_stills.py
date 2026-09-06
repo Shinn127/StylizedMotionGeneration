@@ -6,8 +6,8 @@ of the window framebuffer, so the result is independent of window
 compositing (macOS hidden/short-lived windows capture black through
 ``take_screenshot``, which made ``--output-video`` useless for stills).
 
-The final view is captured pre-FXAA; everything else (debug views, legacy
-lighting, tone curve, overlays) is pixel-identical to the interactive path.
+The final view is captured after FXAA; debug views deliberately bypass FXAA,
+matching the interactive path.
 """
 
 from __future__ import annotations
@@ -22,15 +22,14 @@ from raylib import (
     CloseWindow,
     DrawTexturePro,
     EndTextureMode,
-    ExportImage,
     FLAG_WINDOW_HIDDEN,
     InitWindow,
-    LoadImageFromTexture,
     LoadRenderTexture,
     SetConfigFlags,
     UnloadRenderTexture,
     rlDisableColorBlend,
     rlEnableColorBlend,
+    rlSetClipPlanes,
     Vector3Add,
     Vector3Scale,
 )
@@ -46,6 +45,7 @@ from stylized_motion.anim.genoview import (
     load_database_dict,
 )
 from stylized_motion.anim.renderer import Renderer
+from stylized_motion.anim.render_targets import export_render_target
 from stylized_motion.anim.somaview import SOMA_RIG
 from stylized_motion.util.paths import RESOURCE_DIR, SOMA_RESOURCE_DIR
 
@@ -81,10 +81,15 @@ def render_still(args: argparse.Namespace) -> Path:
         scene_mode=args.scene,
         white_background=args.white_background,
         rig=rig,
+        shadow_resolution=args.shadow_resolution,
     )
 
     SetConfigFlags(FLAG_WINDOW_HIDDEN)
     InitWindow(args.width, args.height, b"render_stills")
+    # Keep CSM split depths identical to the interactive viewer. Raylib's
+    # default far plane is much larger and would move the cascade transitions
+    # out of the scene, hiding split-boundary regressions in baseline images.
+    rlSetClipPlanes(0.01, 50.0)
     viewer.screen_width = args.width
     viewer.screen_height = args.height
     try:
@@ -114,7 +119,7 @@ def render_still(args: argparse.Namespace) -> Path:
         rlDisableColorBlend()
         viewer.renderer.render_frame(global_rot, global_pos, viewer.sample_index, None, None)
         if args.hud:
-            # Bake the HUD into the tonemapped target before FXAA so stills
+            # Bake the HUD into the display target before FXAA so stills
             # document the UI layout. The HUD is drawn on its own LDR target
             # (window orientation) and composited in with a flipped blit,
             # because render targets are Y-inverted versus the window.
@@ -125,7 +130,8 @@ def render_still(args: argparse.Namespace) -> Path:
             viewer._draw_hud(args.width, args.height)
             viewer.playback.draw_ui(args.width, args.height, "Sample" if viewer.indices is not None else "Frame")
             EndTextureMode()
-            BeginTextureMode(viewer.tonemapped)
+            display_target = viewer.tonemapped if viewer.shading == "pbr" else viewer.lighted
+            BeginTextureMode(display_target)
             rlEnableColorBlend()
             DrawTexturePro(
                 hud_target.texture,
@@ -137,14 +143,10 @@ def render_still(args: argparse.Namespace) -> Path:
             )
             EndTextureMode()
             UnloadRenderTexture(hud_target)
-        viewer.renderer.draw_output()
-
-        target = viewer.tonemapped if viewer.shading == "pbr" else viewer.lighted
-        image = LoadImageFromTexture(target.texture)
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        ExportImage(image, str(args.output).encode("utf-8"))
-        from raylib import UnloadImage
-        UnloadImage(image)
+        # HUD is composited after render_frame, so resolve the final FXAA
+        # target once more before exporting it.
+        viewer.renderer.render_presentation()
+        export_render_target(viewer.final, args.output)
     finally:
         viewer._cleanup()
         CloseWindow()
@@ -166,6 +168,7 @@ def main():
     parser.add_argument("--hud", action="store_true", help="Draw the interactive HUD panels into the still.")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
+    parser.add_argument("--shadow-resolution", type=int, default=1024)
     parser.add_argument("--metallic", type=float, default=0.0)
     parser.add_argument("--roughness", type=float, default=0.58)
     parser.add_argument("--exposure", type=float, default=0.9)

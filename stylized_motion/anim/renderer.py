@@ -43,6 +43,21 @@ class Renderer:
         if material.normal_map is not None:
             SetShaderValueTexture(view.shaders[shader_key], view.shader_locs[f"{prefix}_normal_map"], material.normal_map)
 
+    def _bind_ibl_textures(self) -> bool:
+        """Bind IBL textures only when the resource chain was initialized."""
+        view = self.view
+        resources = (view.ibl.environment, view.ibl.irradiance, view.ibl.prefilter, view.ibl.brdf_lut)
+        if not view.ibl.enabled or any(texture is None or texture.id <= 0 for texture in resources):
+            return False
+        set_shader_value_cubemap(view.shaders["lighting"], view.shader_locs["lighting_environment_map"], view.ibl.environment, view.environment_texture_slot_ptr)
+        set_shader_value_cubemap(view.shaders["lighting"], view.shader_locs["lighting_irradiance_map"], view.ibl.irradiance, view.irradiance_texture_slot_ptr)
+        set_shader_value_cubemap(view.shaders["lighting"], view.shader_locs["lighting_prefilter_map"], view.ibl.prefilter, view.prefilter_texture_slot_ptr)
+        rlEnableShader(view.shaders["lighting"].id)
+        rlActiveTextureSlot(view.brdf_lut_texture_slot_ptr[0])
+        rlEnableTexture(view.ibl.brdf_lut.id)
+        rlSetUniform(view.shader_locs["lighting_brdf_lut"], view.brdf_lut_texture_slot_ptr, SHADER_UNIFORM_INT, 1)
+        return True
+
     def render_shadow(self):
         view = self.view
         if view.shading == "pbr":
@@ -95,8 +110,8 @@ class Renderer:
         """
         view = self.view
         shader = view.shaders["evsm_blur"]
-        inv_resolution_ptr = ffi.new("float[2]")
-        direction_ptr = ffi.new("float[2]")
+        inv_resolution_ptr = view.evsm_blur_inv_resolution_ptr
+        direction_ptr = view.evsm_blur_direction_ptr
         blur_slot_ptr = view.evsm_blur_texture_slot_ptr
         scratch = view.render_targets.evsm_scratch
         for index, moments in enumerate(view.shadow_maps):
@@ -105,6 +120,7 @@ class Renderer:
                 ((1.0, 0.0), moments.texture, scratch),
                 ((0.0, 1.0), scratch.texture, blurred),
             ):
+                _require_distinct_source_destination(source, destination)
                 BeginTextureMode(destination)
                 BeginShaderMode(shader)
                 # Explicit slot binding: SetShaderValueTexture keys samplers off
@@ -114,12 +130,12 @@ class Renderer:
                 inv_resolution_ptr[1] = 1.0 / float(source.height)
                 SetShaderValue(
                     shader, view.shader_locs["evsm_blur_inv_resolution"],
-                    ffi.addressof(inv_resolution_ptr, 0), SHADER_UNIFORM_VEC2,
+                    inv_resolution_ptr, SHADER_UNIFORM_VEC2,
                 )
                 direction_ptr[0], direction_ptr[1] = direction
                 SetShaderValue(
                     shader, view.shader_locs["evsm_blur_direction"],
-                    ffi.addressof(direction_ptr, 0), SHADER_UNIFORM_VEC2,
+                    direction_ptr, SHADER_UNIFORM_VEC2,
                 )
                 ClearBackground(BLACK)
                 DrawTexturePro(
@@ -168,6 +184,11 @@ class Renderer:
 
     def render_ssao(self, cam_view, cam_proj, cam_inv_proj):
         view = self.view
+        # ssao.fs does not consume texture0, but DrawTextureRec still binds its
+        # source as texture0. Sampling an unrelated GBuffer attachment avoids
+        # OpenGL framebuffer feedback while the AO target is being written.
+        source = view.gbuffer.color
+        _require_distinct_source_destination(source, view.ssao_front)
         BeginTextureMode(view.ssao_front)
         BeginShaderMode(view.shaders["ssao"])
         SetShaderValueTexture(view.shaders["ssao"], view.shader_locs["ssao_gbuffer_normal"], view.gbuffer.normal)
@@ -180,7 +201,7 @@ class Renderer:
         view.ssao_intensity_ptr[0] = view.ssao_intensity
         SetShaderValue(view.shaders["ssao"], view.shader_locs["ssao_intensity"], view.ssao_intensity_ptr, SHADER_UNIFORM_FLOAT)
         ClearBackground(WHITE)
-        DrawTextureRec(view.ssao_front.texture, Rectangle(0, 0, view.ssao_front.texture.width, -view.ssao_front.texture.height), Vector2(0.0, 0.0), WHITE)
+        DrawTextureRec(source, Rectangle(0, 0, source.width, -source.height), Vector2(0.0, 0.0), WHITE)
         EndShaderMode()
         EndTextureMode()
 
@@ -188,29 +209,33 @@ class Renderer:
         view = self.view
         view.blur_inv_texture_resolution.x = 1.0 / view.ssao_front.texture.width
         view.blur_inv_texture_resolution.y = 1.0 / view.ssao_front.texture.height
+        source = view.ssao_front.texture
+        _require_distinct_source_destination(source, view.ssao_back)
         BeginTextureMode(view.ssao_back)
         BeginShaderMode(view.shaders["blur"])
         view.blur_direction.x = 1.0
         view.blur_direction.y = 0.0
         SetShaderValueTexture(view.shaders["blur"], view.shader_locs["blur_gbuffer_normal"], view.gbuffer.normal)
         SetShaderValueTexture(view.shaders["blur"], view.shader_locs["blur_gbuffer_depth"], view.gbuffer.depth)
-        SetShaderValueTexture(view.shaders["blur"], view.shader_locs["blur_input_texture"], view.ssao_front.texture)
+        SetShaderValueTexture(view.shaders["blur"], view.shader_locs["blur_input_texture"], source)
         SetShaderValueMatrix(view.shaders["blur"], view.shader_locs["blur_cam_inv_proj"], cam_inv_proj)
         SetShaderValue(view.shaders["blur"], view.shader_locs["blur_cam_clip_near"], view.cam_clip_near_ptr, SHADER_UNIFORM_FLOAT)
         SetShaderValue(view.shaders["blur"], view.shader_locs["blur_cam_clip_far"], view.cam_clip_far_ptr, SHADER_UNIFORM_FLOAT)
         SetShaderValue(view.shaders["blur"], view.shader_locs["blur_inv_texture_resolution"], ffi.addressof(view.blur_inv_texture_resolution), SHADER_UNIFORM_VEC2)
         SetShaderValue(view.shaders["blur"], view.shader_locs["blur_direction"], ffi.addressof(view.blur_direction), SHADER_UNIFORM_VEC2)
-        DrawTextureRec(view.ssao_back.texture, Rectangle(0, 0, view.ssao_back.texture.width, -view.ssao_back.texture.height), Vector2(0, 0), WHITE)
+        DrawTextureRec(source, Rectangle(0, 0, source.width, -source.height), Vector2(0, 0), WHITE)
         EndShaderMode()
         EndTextureMode()
 
+        source = view.ssao_back.texture
+        _require_distinct_source_destination(source, view.ssao_front)
         BeginTextureMode(view.ssao_front)
         BeginShaderMode(view.shaders["blur"])
         view.blur_direction.x = 0.0
         view.blur_direction.y = 1.0
-        SetShaderValueTexture(view.shaders["blur"], view.shader_locs["blur_input_texture"], view.ssao_back.texture)
+        SetShaderValueTexture(view.shaders["blur"], view.shader_locs["blur_input_texture"], source)
         SetShaderValue(view.shaders["blur"], view.shader_locs["blur_direction"], ffi.addressof(view.blur_direction), SHADER_UNIFORM_VEC2)
-        DrawTextureRec(view.ssao_front.texture, Rectangle(0, 0, view.ssao_front.texture.width, -view.ssao_front.texture.height), Vector2(0, 0), WHITE)
+        DrawTextureRec(source, Rectangle(0, 0, source.width, -source.height), Vector2(0, 0), WHITE)
         EndShaderMode()
         EndTextureMode()
 
@@ -242,6 +267,11 @@ class Renderer:
                 view.shaders["lighting"], view.shader_locs["lighting_cascade_splits"],
                 view.shadow_cascade_splits_ptr, SHADER_UNIFORM_VEC3,
             )
+            view.cascade_blend_fraction_ptr[0] = CSM_BLEND_FRACTION
+            SetShaderValue(
+                view.shaders["lighting"], view.shader_locs["lighting_cascade_blend_fraction"],
+                view.cascade_blend_fraction_ptr, SHADER_UNIFORM_FLOAT,
+            )
             SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_evsm_pos_k"], view.evsm_pos_k_ptr, SHADER_UNIFORM_FLOAT)
             SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_evsm_neg_k"], view.evsm_neg_k_ptr, SHADER_UNIFORM_FLOAT)
             SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_evsm_light_bleed"], view.evsm_light_bleed_ptr, SHADER_UNIFORM_FLOAT)
@@ -250,13 +280,7 @@ class Renderer:
                 view.shaders["lighting"], view.shader_locs["lighting_material_ao"],
                 view.gbuffer.material_ao, view.material_ao_texture_slot_ptr,
             )
-            set_shader_value_cubemap(view.shaders["lighting"], view.shader_locs["lighting_environment_map"], view.ibl.environment, view.environment_texture_slot_ptr)
-            set_shader_value_cubemap(view.shaders["lighting"], view.shader_locs["lighting_irradiance_map"], view.ibl.irradiance, view.irradiance_texture_slot_ptr)
-            set_shader_value_cubemap(view.shaders["lighting"], view.shader_locs["lighting_prefilter_map"], view.ibl.prefilter, view.prefilter_texture_slot_ptr)
-            rlEnableShader(view.shaders["lighting"].id)
-            rlActiveTextureSlot(view.brdf_lut_texture_slot_ptr[0])
-            rlEnableTexture(view.ibl.brdf_lut.id)
-            rlSetUniform(view.shader_locs["lighting_brdf_lut"], view.brdf_lut_texture_slot_ptr, SHADER_UNIFORM_INT, 1)
+            ibl_bound = self._bind_ibl_textures()
             SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_prefilter_max_lod"], view.prefilter_max_lod_ptr, SHADER_UNIFORM_FLOAT)
         else:
             set_shader_value_shadow_map(
@@ -285,7 +309,7 @@ class Renderer:
         if view.shading == "pbr":
             view.ibl_strength_ptr[0] = view.ibl.strength
             SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_ibl_strength"], view.ibl_strength_ptr, SHADER_UNIFORM_FLOAT)
-            view.use_ibl_ptr[0] = int(view.ibl.enabled)
+            view.use_ibl_ptr[0] = int(ibl_bound)
             SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_use_ibl"], view.use_ibl_ptr, SHADER_UNIFORM_INT)
             view.white_background_ptr[0] = int(view.white_background)
             SetShaderValue(view.shaders["lighting"], view.shader_locs["lighting_white_background"], view.white_background_ptr, SHADER_UNIFORM_INT)
@@ -374,6 +398,7 @@ class Renderer:
             if view.compare_mode and compare_global_rot is not None and compare_global_pos is not None:
                 self.render_skeleton(compare_global_rot, compare_global_pos, view.right_model_offset)
         self.render_tonemap()
+        self.render_presentation()
 
     def render_skeleton(self, global_rot, global_pos, model_offset):
         """Overlay the character skeleton onto the lighting target, GenoView debug style.
@@ -393,19 +418,30 @@ class Renderer:
         EndMode3D()
         EndTextureMode()
 
-    def draw_output(self):
+    def render_presentation(self):
+        """Resolve the display image to the persistent final render target."""
         view = self.view
         output_texture = view.tonemapped.texture if view.shading == "pbr" else view.lighted.texture
+        _require_distinct_source_destination(output_texture, view.final)
+        BeginTextureMode(view.final)
+        ClearBackground(BLACK)
         if view.shading == "pbr" and view.debug_view != "final":
             DrawTextureRec(output_texture, Rectangle(0, 0, output_texture.width, -output_texture.height), Vector2(0, 0), WHITE)
-            return
-        view.fxaa_inv_texture_resolution.x = 1.0 / output_texture.width
-        view.fxaa_inv_texture_resolution.y = 1.0 / output_texture.height
-        BeginShaderMode(view.shaders["fxaa"])
-        SetShaderValueTexture(view.shaders["fxaa"], view.shader_locs["fxaa_input_texture"], output_texture)
-        SetShaderValue(view.shaders["fxaa"], view.shader_locs["fxaa_inv_texture_resolution"], ffi.addressof(view.fxaa_inv_texture_resolution), SHADER_UNIFORM_VEC2)
+        else:
+            view.fxaa_inv_texture_resolution.x = 1.0 / output_texture.width
+            view.fxaa_inv_texture_resolution.y = 1.0 / output_texture.height
+            BeginShaderMode(view.shaders["fxaa"])
+            SetShaderValueTexture(view.shaders["fxaa"], view.shader_locs["fxaa_input_texture"], output_texture)
+            SetShaderValue(view.shaders["fxaa"], view.shader_locs["fxaa_inv_texture_resolution"], ffi.addressof(view.fxaa_inv_texture_resolution), SHADER_UNIFORM_VEC2)
+            DrawTextureRec(output_texture, Rectangle(0, 0, output_texture.width, -output_texture.height), Vector2(0, 0), WHITE)
+            EndShaderMode()
+        EndTextureMode()
+
+    def draw_output(self):
+        """Blit the already-resolved final target to the window framebuffer."""
+        view = self.view
+        output_texture = view.final.texture
         DrawTextureRec(output_texture, Rectangle(0, 0, output_texture.width, -output_texture.height), Vector2(0, 0), WHITE)
-        EndShaderMode()
 
 
 from stylized_motion.anim.genoview import DEBUG_MODES, LIGHTING_DEBUG_MODES, draw_skeleton, draw_trajectory, ffi, skeleton_overlay_pose
@@ -421,6 +457,7 @@ from stylized_motion.anim.render_targets import (
 
 CSM_CASCADE_COUNT = 3
 CSM_SPLIT_LAMBDA = 0.75
+CSM_BLEND_FRACTION = 0.10
 CSM_Z_PADDING = 2.0
 # EVSM revision: keep the light-space depth span tight so the exponential
 # warp stays in float32's usable range. The near plane sits back from the
@@ -429,6 +466,12 @@ CSM_Z_PADDING = 2.0
 # wide camera frustum cannot dilute cascade 0's texel density.
 CSM_LIGHT_NEAR_MIN = 1.5
 CSM_EXTENT_MAX = 40.0
+
+
+def _require_distinct_source_destination(source, destination) -> None:
+    """Reject framebuffer feedback before a fullscreen texture pass starts."""
+    if source.id == destination.texture.id:
+        raise ValueError("A fullscreen pass cannot sample from its framebuffer color attachment")
 
 
 def _vector3_array(value):
@@ -461,17 +504,34 @@ def _frustum_corners(camera, near, far, aspect):
     return np.asarray(corners, dtype=np.float32)
 
 
-def _update_cascade_shadow_lights(view):
-    camera = view.camera.cam3d
-    camera_near = float(rlGetCullDistanceNear())
-    camera_far = float(rlGetCullDistanceFar())
-    aspect = float(view.screen_width) / float(view.screen_height)
+def _cascade_splits_and_ranges(camera_near, camera_far):
+    """Return selection splits and overlapping render ranges for CSM."""
     splits = []
     for index in range(1, CSM_CASCADE_COUNT + 1):
         fraction = index / CSM_CASCADE_COUNT
         logarithmic = camera_near * (camera_far / camera_near) ** fraction
         uniform = camera_near + (camera_far - camera_near) * fraction
         splits.append(CSM_SPLIT_LAMBDA * logarithmic + (1.0 - CSM_SPLIT_LAMBDA) * uniform)
+
+    blend_widths = [
+        (splits[index] - (camera_near if index == 0 else splits[index - 1])) * CSM_BLEND_FRACTION
+        for index in range(CSM_CASCADE_COUNT - 1)
+    ]
+    ranges = []
+    for index, split in enumerate(splits):
+        nominal_near = camera_near if index == 0 else splits[index - 1]
+        render_near = nominal_near if index == 0 else max(camera_near, nominal_near - blend_widths[index - 1])
+        render_far = split
+        ranges.append((render_near, render_far))
+    return splits, ranges
+
+
+def _update_cascade_shadow_lights(view):
+    camera = view.camera.cam3d
+    camera_near = float(rlGetCullDistanceNear())
+    camera_far = float(rlGetCullDistanceFar())
+    aspect = float(view.screen_width) / float(view.screen_height)
+    splits, cascade_ranges = _cascade_splits_and_ranges(camera_near, camera_far)
 
     light_forward = _vector3_array(view.light_dir)
     light_forward /= np.linalg.norm(light_forward)
@@ -482,9 +542,8 @@ def _update_cascade_shadow_lights(view):
 
     shadow_lights = []
     shadow_biases = []
-    previous_split = camera_near
-    for index, split in enumerate(splits):
-        corners = _frustum_corners(camera, previous_split, split, aspect)
+    for index, (render_near, render_far) in enumerate(cascade_ranges):
+        corners = _frustum_corners(camera, render_near, render_far, aspect)
         center = corners.mean(axis=0)
         radius = float(np.max(np.linalg.norm(corners - center, axis=1)))
         extent = min(CSM_EXTENT_MAX, np.ceil((radius + 0.5) * view.shadow_resolution) / view.shadow_resolution)
@@ -518,5 +577,4 @@ def _update_cascade_shadow_lights(view):
         shadow_light.near = light_near
         shadow_light.far = light_far
         shadow_lights.append((shadow_light, light_near, light_far))
-        previous_split = split
     return splits, shadow_lights, shadow_biases

@@ -41,5 +41,5 @@ void main()
 
     float lumaB = dot(rgbB, luma);
     
-    finalColor.rgb = (lumaB < lumaMin) || (lumaB > lumaMax) ? rgbA : rgbB;
+    finalColor = vec4((lumaB < lumaMin) || (lumaB > lumaMax) ? rgbA : rgbB, 1.0);
 }

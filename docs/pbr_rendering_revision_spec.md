@@ -12,7 +12,7 @@
 
 当前实施记录（2026-09-04）：Phase 1～4 的功能项已落地；当前修订集中在 IBL HDR 精度、纹理入口、SSAO 边界和运行时验证。legacy 地面网格调制保留在 PBR GBuffer 中作为视觉兼容项。
 
-实施更新（2026-09-04，CSM）：PBR Shadow Pass 已升级为 3 级 cascaded shadow maps。viewer 每帧按相机深度生成 logarithmic/uniform 混合 split（lambda=0.75），对每级 light frustum 做 texel snapping 和独立 near/far fitting；lighting shader 按 camera depth 选择对应 shadow map，并继续使用 3×3 PCF。legacy 路径保留单张 shadow map。
+实施更新（2026-09-04，CSM）：PBR Shadow Pass 已升级为 3 级 cascaded shadow maps。viewer 每帧按相机深度生成 logarithmic/uniform 混合 split（lambda=0.75），对每级 light frustum 做 texel snapping 和独立 near/far fitting；lighting shader 按 camera depth 选择对应 EVSM moment map，并以 Chebyshev 界估计柔和阴影。legacy 路径保留单张 depth shadow map。
 
 实施更新（2026-09-04，GTAO）：SSAO Pass 已升级为轻量 horizon-based GTAO 近似。每个像素沿 8 条屏幕空间方向进行 4 步深度重建，按每条射线的最高 horizon 贡献计算接触遮蔽，再通过现有 bilateral blur 保留几何边界；天空采样、屏幕边缘和零权重邻域均显式处理，AO 仍只作用于间接光。
 
@@ -20,11 +20,11 @@
 
 实施更新（2026-09-04）：normal mapping、材质 AO、材质网格和三类材质纹理入口均已落地。顶点切线管线（含蒙皮切线变换）构建 TBN 并采样 `normalMap.rg`（z 分量由 xy 重建，兼容标准 RGB 法线贴图），退化切线回退几何法线。GBuffer 新增第三个 R8 attachment（`gbufferMaterialAO`），材质 ao（uniform 或 `metallicRoughnessMap.B`）经此进入 lighting，与 SSAO 相乘后仅作用于间接光。viewer CLI 通过 `--base-color-map`、`--normal-map` 与 `--metallic-roughness-map` 应用到角色默认材质；`--scene grid` 提供材质测试场景。
 
-实施更新（2026-09-03，阶段 B 视觉升级）：Shadow 升级为 3×3 PCF（`shadowTexelSize` uniform，spec 8.2 关闭）；Lighting Pass 背景从 RAYWHITE 清屏色改为程序化天空（沿视线采样 environment cubemap，`--disable-ibl` 时回退 skyColor 平色；调试视图背景仍由 debug.fs 按 GBuffer 深度判定为黑）；`tonemap.fs` 支持 `--tone-curve aces|reinhard|agx`（默认 aces 保持历史公式不变）；顺带移除 IBL 分支中未使用的 `environment` 采样死代码（environmentMap 现由天空背景真正消费）。
+实施更新（2026-09-03，阶段 B 视觉升级）：Lighting Pass 背景从 RAYWHITE 清屏色改为程序化天空（沿视线采样 environment cubemap，`--disable-ibl` 时回退 skyColor 平色；调试视图背景仍由 debug.fs 按 GBuffer 深度判定为黑）；`tonemap.fs` 支持 `--tone-curve aces|reinhard|agx`（默认 aces 保持历史公式不变）；顺带移除 IBL 分支中未使用的 `environment` 采样死代码（environmentMap 现由天空背景真正消费）。阴影实现已由后续 EVSM 记录取代。
 
 实施更新（2026-09-03，阶段 C2 IBL 资源真实化）：IBL 链从手工单色 cubemap 升级为从程序化天空梯度（冷天顶/亮地平线/暗地面）出发的完整 split-sum 资源管线：irradiance 由 Fibonacci 球余弦卷积生成（全求积覆盖、对称性 0.0）；prefilter 六级由 GGX importance sampling 生成并按 GL mip 链规范（逐级减半）打包为一张 cubemap，shader 的 `textureLod(prefilterMap, r, roughness*maxLod)` 现在采样的是精确 IS 级别而非 box-filter 近似。修掉两个 CPU 数学 bug（Hammersley 双重反转使 xi≈0、Fibonacci 采样缺 2x 拉伸只覆盖上半球）。prefilter 查表走 8² 代理 cubemap，初始化 CPU 成本从 514s 降到 ~6s。
 
-实施更新（2026-09-03，阶段 A 基线工具）：新增 `stylized_motion.anim.render_stills`（离屏渲染单帧到 PNG，直读 render-target 纹理，绕开 macOS 隐藏窗口 `take_screenshot` 抓黑帧问题；final 视图为 FXAA 前显示目标，其余与交互路径一致）与 `stylized_motion.anim.compare_stills`（阈值化像素对比，超差退出码 1）。`docs/assets/pbr_baseline/` 提交了 14 张基线图（12 个调试视图 + legacy + SomaView final）与再生成/回归说明；Phase 0 的基线截图交付项关闭。
+实施更新（2026-09-03，阶段 A 基线工具）：新增 `stylized_motion.anim.render_stills`（离屏渲染单帧到 PNG，直读最终 render target，绕开 macOS 隐藏窗口 `take_screenshot` 抓黑帧问题；final/legacy 均为 FXAA 后显示目标，调试视图按契约跳过 FXAA；导出前统一垂直翻转）与 `stylized_motion.anim.compare_stills`（阈值化像素对比，超差退出码 1）。`docs/assets/pbr_baseline/` 提交了 14 张基线图（12 个调试视图 + legacy + SomaView final）与再生成/回归说明；Phase 0 的基线截图交付项关闭。
 
 ## 1. 目标
 
@@ -54,7 +54,7 @@
 | 问题 | 当前行为 | 修订要求 |
 | --- | --- | --- |
 | Shadow/SSAO 耦合 | `ssao.fs` 同时计算 AO 和 Shadow，并把两者写入同一纹理 | Shadow 在 Lighting Pass 独立采样；SSAO 只输出 AO |
-| Shadow Blur 耦合 | AO 的 bilateral blur 同时作用于 shadow 通道 | Shadow 使用独立 PCF 策略，不经过 SSAO blur |
+| Shadow Blur 耦合 | AO 的 bilateral blur 同时作用于 shadow 通道 | Shadow 使用独立 EVSM moment blur，不经过 SSAO blur |
 | HDR 缺失 | Lighting shader 内部已经 ACES/Gamma，`lighted` 不是明确的 HDR 中间目标 | 增加显式 `RGBA16F` HDR target，Lighting 只输出线性 HDR |
 | Tone Mapping 位置错误 | `pbrLighting.fs` 同时承担 BRDF 和 Tone Mapping | 新增独立 `tonemap.fs` |
 | Ambient 非物理 | 使用 `skyColor`、`groundStrength`、`ambientStrength` 人工近似环境光 | 第一阶段保留兼容参数，后续替换为 Diffuse/Specular IBL |
@@ -274,17 +274,16 @@ indirectDiffuse = irradiance * baseColor / PI * kD * ao
 - Shadow factor 在 Lighting Pass 中计算；
 - 默认先使用单次比较采样，保证职责拆分后结果稳定。
 
-### 8.2 第二阶段 PCF（已落地 2026-09-03）
+### 8.2 EVSM 阴影（已落地 2026-09-05）
 
-`pbrLighting.fs` 的 `ShadowFactor` 使用 3×3 PCF：
+`pbrLighting.fs` 的 `ShadowFactor` 从三个 CSM EVSM moment map 计算正向与反向 Chebyshev 上界：
 
-- 使用 `shadowTexelSize` uniform（1/shadowResolution，viewer 初始化后缓存）；
-- PBR 使用 normal offset（世界空间 `0.01 * normal`）+ 至少一个 shadow texel 的归一化深度 bias；Legacy 保持原有 clip/bias 参数；
-- shadow sampling 不经过 SSAO blur；
+- PBR shadow pass 输出 RGBA32F 的四个指数深度矩，模糊链独立于 SSAO；
 - 超出 shadow projection 范围时返回 `shadow = 1.0`；
-- `ssao.fs` 不计算或输出 shadow。
+- `ssao.fs` 不计算或输出 shadow；
+- Legacy 保持原有单张 `shadow.fs` depth-map contract。
 
-PBR 在此基础上使用 3 级 CSM：近裁剪面到远裁剪面的 split 采用 logarithmic/uniform 混合，级联投影中心按 shadow texel 对齐，避免相机平移造成阴影抖动；每级独立绑定 shadow map 和 light matrix。PBR 的正交 Shadow Pass 直接使用归一化 light-space depth，Lighting 侧使用按 texel 尺寸下限约束的 bias；Legacy 保持单级 `shadow.fs` contract。
+PBR 使用 3 级 CSM：近裁剪面到远裁剪面的 split 采用 logarithmic/uniform 混合，级联投影中心按 shadow texel 对齐，避免相机平移造成阴影抖动；每级独立绑定 EVSM map 和 light matrix。下一级联向前扩展上一深度段的 10%，lighting 在当前级联末端的同一范围内用 `smoothstep` 混合两个 shadow factor，避免不同投影尺度和 moment blur 半径形成可见分界线。
 
 ## 9. SSAO 规范
 
@@ -601,6 +600,7 @@ debug:shadow 视图暴露的地面大面积"阴影"根因是 PCF 的深度比较
 - **矩端存储**：`vec4(sPos, sPos², sNeg, sNeg²)`，其中 `sPos=exp(k⁺(z-1))`、`sNeg=exp(k⁻(1-z))`。远平面处两个 warp 都退化为 1，故 `ClearBackground(WHITE)` 天然保持"无遮挡物"语义，无需改 clear 流程。k⁺=20（正向外推锐利）、k⁻=10（反向兜底）、bleed=0.15、min_variance=1e-5。float32 存储是硬需求：k⁻=10 时 m1≈2.2e4、m1²≈4.8e8，8-bit/16-bit 存储直接摧毁矩端。
 - **镜像 Chebyshev 推导**（M2 的核心修正）：反向 warp 的分布随深度递减，"受光面被遮挡"意味着其 warp 值小于存储均值。将分布按 Y=1-X 镜像后翻回上尾，共享 Cantelli 界；镜像矩为 E[Y]=1-m1、E[Y²]=1-2·m1+m2（方差镜像不变）。初版错误公式 `vec2(1-m2, 1-m1)` 在地面纹素（m1=1.22）上产生负矩，把全场打入 p≈0 的全黑阴影——教训：镜像变换必须作用于分布而非逐通道套用公式，且 float32 下 m1² 与 m2 的灾难性相消使 min_variance 下限成为正确性组件而非调优参数。
 - **级联收紧**：指数 warp 对光空间深度跨度敏感，`CSM_LIGHT_NEAR_MIN=1.5`（角色之外无更近遮挡物，近平面回撤换取 span 收紧）、`CSM_EXTENT_MAX=40.0`（相机拉远时限制 cascade 0 纹素密度被稀释）。probe 脚本必须复现 app 的 `rlSetClipPlanes(0.01, 50.0)`，否则 cascade 跨度膨胀两个数量级、warp 饱和，现象与镜像矩 bug 难以区分（本次排障因此绕弯）。
+- **级联过渡**：原实现以 `cameraDepth <= cascadeSplits[i]` 硬选 shadow map，相邻 cascade 的正交投影尺度与半分辨率 EVSM 模糊对应到不同的世界空间半径，因而在地面阴影上形成一侧软、一侧硬的直线断层。现在下一级 shadow pass 向前扩展上一深度段的 10%，lighting 在当前级联末端的同一范围内对两个 EVSM shadow factor 做 `smoothstep` 混合；重叠覆盖和 shader 过渡宽度由同一常量驱动。
 - **模糊链与性能**：2048² RGBA32F 矩端图 × 3 级联，downsample + H + V 分离高斯（9-tap，半分辨率）。实测该链为带宽受限：9-tap 折叠成 5-fetch 双线性对（数学等价）、以及合并为单 pass 2D 外积（25 fetch，pass 数减半）两种"教科书优化"实测分别无收益/劣化 46.7 fps（2D 散布 fetch 击穿缓存），均已回退，保留分离 9-tap。最终帧耗 11.9 ms（84 fps @1280x720）对比 PCF 6.6 ms（152 fps）：EVSM 的模糊 pass 换掉 PCF 采样的净成本约 +5.3 ms。`shadow_resolution=1024` 时实测 120.1 fps 达标；**默认即 1024**（2026-09-05 用户决策：120fps 优先于 2048 的边缘锐度），genoview CLI 以 `--shadow-resolution` 覆盖，基线图全部按默认 1024 重新生成。
 - **槽位**：模糊链沿用显式槽绑定（26 号槽），sm_0/1/2 采样槽 23-25；RGBA32F 纹理名与 10-21 槽位冲突风险同 20.6 口径处理。
 

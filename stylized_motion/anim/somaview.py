@@ -69,7 +69,7 @@ def main():
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
     parser.add_argument("--ibl-strength", type=float, default=0.22)
     parser.add_argument("--disable-ibl", action="store_true")
-    parser.add_argument("--shadow-resolution", type=int, default=2048)
+    parser.add_argument("--shadow-resolution", type=int, default=1024)
     parser.add_argument("--output-video", type=Path, default=None, help="Render the full clip to an MP4 at this path.")
     parser.add_argument("--skeleton", action="store_true", help="Draw the character skeleton overlay (joints, bone links, per-joint XYZ frames). Toggle at runtime with B.")
     parser.add_argument("--debug-view", choices=DEBUG_MODES, default="final", help="Initial PBR debug view. Cycle at runtime with V (Shift+V to go back).")

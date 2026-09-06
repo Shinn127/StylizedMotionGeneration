@@ -41,6 +41,7 @@ uniform float evsmNegK;
 uniform float evsmLightBleed;
 uniform float evsmMinVariance;
 uniform vec3 cascadeSplits;
+uniform float cascadeBlendFraction;
 // 0 final image, 1 shadow, 2 direct diffuse, 3 direct specular, 4 indirect light
 uniform int debugMode;
 
@@ -141,11 +142,26 @@ float ShadowFactorFor(vec3 position, vec3 normal, mat4 lightViewProj, sampler2D 
 
 float ShadowFactor(vec3 position, vec3 normal, float cameraDepth)
 {
-    if (cameraDepth <= cascadeSplits.x) {
+    float blendWidth0 = max((cascadeSplits.x - camClipNear) * cascadeBlendFraction, 1e-4);
+    float blendWidth1 = max((cascadeSplits.y - cascadeSplits.x) * cascadeBlendFraction, 1e-4);
+
+    if (cameraDepth < cascadeSplits.x - blendWidth0) {
         return ShadowFactorFor(position, normal, lightViewProj0, shadowMap0, 0.0);
     }
-    if (cameraDepth <= cascadeSplits.y) {
+    if (cameraDepth <= cascadeSplits.x) {
+        float shadow0 = ShadowFactorFor(position, normal, lightViewProj0, shadowMap0, 0.0);
+        float shadow1 = ShadowFactorFor(position, normal, lightViewProj1, shadowMap1, 0.0);
+        float blend = smoothstep(cascadeSplits.x - blendWidth0, cascadeSplits.x, cameraDepth);
+        return mix(shadow0, shadow1, blend);
+    }
+    if (cameraDepth < cascadeSplits.y - blendWidth1) {
         return ShadowFactorFor(position, normal, lightViewProj1, shadowMap1, 0.0);
+    }
+    if (cameraDepth <= cascadeSplits.y) {
+        float shadow1 = ShadowFactorFor(position, normal, lightViewProj1, shadowMap1, 0.0);
+        float shadow2 = ShadowFactorFor(position, normal, lightViewProj2, shadowMap2, 0.0);
+        float blend = smoothstep(cascadeSplits.y - blendWidth1, cascadeSplits.y, cameraDepth);
+        return mix(shadow1, shadow2, blend);
     }
     return ShadowFactorFor(position, normal, lightViewProj2, shadowMap2, 0.0);
 }
