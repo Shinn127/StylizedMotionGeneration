@@ -113,6 +113,8 @@ float ShadowFactorFor(vec3 position, vec3 normal, mat4 lightViewProj, sampler2D 
         lightPosition.y > 0.0 && lightPosition.y < 1.0 &&
         lightPosition.z > 0.0 && lightPosition.z < 1.0;
     if (!inside) { return 1.0; }
+    // Stable receiver-plane bias: keep it large enough to suppress acne on
+    // animated meshes while capping it to avoid visible peter-panning.
     float bias = clamp(max(baseBias, 0.0015) + (1.0 - max(dot(normal, normalize(-lightDir)), 0.0)) * 0.002, 0.0015, 0.02);
     vec2 texel = vec2(shadowPcfRadius) / vec2(textureSize(shadowMap, 0));
     const float c = 0.70710678;

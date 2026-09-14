@@ -50,21 +50,20 @@ def test_render_target_cleanup_releases_manual_attachments_once(monkeypatch):
         depth=_texture(109),
     )
     targets.shadow_maps = [
-        SimpleNamespace(id=7, texture=_texture(110), depth=_texture(111)),
+        SimpleNamespace(id=7, depth=_texture(110)),
     ]
-    targets.shadow_blurred = [_color_target(8, 112)]
-    targets.evsm_scratch = _color_target(9, 113)
 
     targets.cleanup()
     targets.cleanup()
 
-    assert sorted(released_textures) == [101, *range(106, 114)]
-    assert sorted(released_framebuffers) == [1, 6, 7, 8, 9]
+    assert sorted(released_textures) == [101, *range(106, 111)]
+    assert sorted(released_framebuffers) == [1, 6, 7]
     assert sorted(released_render_textures) == [2, 3, 4, 5]
 
 
 def test_soma_shader_manifest_copies_every_runtime_shader():
-    assert {"debug.fs", "evsmBlur.fs"} <= set(SHADER_FILES)
+    assert "debug.fs" in SHADER_FILES
+    assert "evsmBlur.fs" not in SHADER_FILES
     for shader in SHADER_FILES:
         assert (RESOURCE_DIR / shader).is_file()
         assert (SOMA_RESOURCE_DIR / shader).is_file()

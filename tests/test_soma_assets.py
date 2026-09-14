@@ -140,13 +140,17 @@ def test_parse_and_mesh_conversion(mini_rig):
     # quad -> 2 triangles + one native triangle = 3 triangles
     assert viewer["triangle_count"] == 3
     assert viewer["indices"].shape == (9,)
-    # top-4 weights renormalized per vertex
+    # Face-varying UVs expand vertices at seams; weights stay normalized.
     assert np.allclose(viewer["bone_weights"].sum(axis=1), 1.0, atol=1e-6)
-    assert viewer["bone_ids"].shape == (5, 4)
+    assert viewer["vertex_count"] == 8
+    assert viewer["bone_ids"].shape == (8, 4)
     # ids index the full skeleton minus Simulation: Root, Hips, Spine2, Head
     assert viewer["bone_ids"].max() < 4
-    # vertices converted to meters
-    assert np.allclose(viewer["vertices"], mesh.points * 0.01)
+    # Expanded vertices are converted to meters and retain every source position.
+    assert all(
+        np.any(np.all(np.isclose(viewer["vertices"], point), axis=1))
+        for point in mesh.points * 0.01
+    )
     # bind pose joints mapped by name: Hips at 1.0 m, Head at 1.6 m (identity rotations)
     names = [str(n) for n in bind["names"]]
     assert names == ["Simulation", "Root", "Hips", "Spine2", "Head"]

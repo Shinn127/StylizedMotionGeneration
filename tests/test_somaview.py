@@ -43,39 +43,20 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         assert "in vec4 fragTangent" in pbr_gbuffer
         assert "layout (location = 2) out float gbufferMaterialAO" in pbr_gbuffer
         assert "gbufferMaterialAO = ao;" in pbr_gbuffer
-        assert "uniform sampler2D shadowMap0" in pbr_lighting
-        assert "uniform sampler2D shadowMap1" in pbr_lighting
-        assert "uniform sampler2D shadowMap2" in pbr_lighting
+        assert "uniform sampler2D shadowMap;" in pbr_lighting
         assert "uniform sampler2D materialAO" in pbr_lighting
         assert "texture(materialAO, fragTexCoord).r" in pbr_lighting
         assert "uniform float prefilterMaxLod" in pbr_lighting
         assert "textureLod(prefilterMap" in pbr_lighting
-        # Three-cascade CSM with 4-moment EVSM shadows and the procedural sky
-        # background. The moments pass stores both warp pairs, the lighting
-        # pass bounds transmittance from both sides (the mirrored negative
-        # bound suppresses light bleeding), and a pre-blurred map replaces
-        # PCF: the blur radius IS the penumbra.
-        assert "float ChebyshevUpperBound(vec2 moments, float mean, float minVariance)" in pbr_lighting
-        assert "float ChebyshevUpperBoundNeg(vec2 moments, float mean, float minVariance)" in pbr_lighting
-        assert "1.0 - 2.0 * moments.x + moments.y" in pbr_lighting
-        assert "uniform float evsmPosK" in pbr_lighting
-        assert "uniform float evsmNegK" in pbr_lighting
-        assert "uniform float evsmLightBleed" in pbr_lighting
-        assert "uniform float evsmMinVariance" in pbr_lighting
-        assert "float meanPos = exp(evsmPosK * (receiverZ - 1.0));" in pbr_lighting
-        assert "float meanNeg = exp(evsmNegK * (1.0 - receiverZ));" in pbr_lighting
-        assert "float shadow = min(shadowPos, shadowNeg);" in pbr_lighting
-        assert "shadow = clamp((shadow - evsmLightBleed) / (1.0 - evsmLightBleed), 0.0, 1.0);" in pbr_lighting
-        assert "uniform vec3 shadowBias" not in pbr_lighting
-        assert "shadowTexelSize" not in pbr_lighting
-        assert "shadow / 9.0" not in pbr_lighting
-        assert "uniform vec3 cascadeSplits" in pbr_lighting
-        assert "uniform float cascadeBlendFraction" in pbr_lighting
-        assert "smoothstep(cascadeSplits.x - blendWidth0, cascadeSplits.x, cameraDepth)" in pbr_lighting
-        assert "mix(shadow0, shadow1, blend)" in pbr_lighting
-        assert "float cameraDepth = -(camView * vec4(position, 1.0)).z;" in pbr_lighting
-        assert "float receiverZ = lightPosition.z;" in pbr_lighting
-        assert "float LinearDepth" not in pbr_lighting
+        # A single depth map is sampled through a rotated 3x3 PCF kernel.
+        assert "uniform float shadowBias;" in pbr_lighting
+        assert "uniform float shadowPcfRadius;" in pbr_lighting
+        assert "vec2 texel = vec2(shadowPcfRadius) / vec2(textureSize(shadowMap, 0));" in pbr_lighting
+        assert "for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x)" in pbr_lighting
+        assert "return lit / 9.0;" in pbr_lighting
+        assert "shadowMap0" not in pbr_lighting
+        assert "evsmPosK" not in pbr_lighting
+        assert "cascadeSplits" not in pbr_lighting
         # Sky background samples linear-radiance environment data directly.
         assert "textureLod(environmentMap, viewDir, 0.0)" in pbr_lighting
         assert "SRGBToLinear(textureLod(prefilterMap" not in pbr_lighting
@@ -93,22 +74,12 @@ def test_pbr_shader_contract_is_shared_between_viewers():
         assert "sampleTexcoord = clamp" in blur
         assert "sampleDepth >= 0.99999" in blur
         assert "totalWeight > 0.0f" in blur
-    for shader in ("pbr.fs", "lighting.fs", "pbrLighting.fs", "pbrShadow.fs", "shadow.fs", "ssao.fs", "blur.fs", "tonemap.fs", "debug.fs", "evsmBlur.fs"):
+    for shader in ("pbr.fs", "lighting.fs", "pbrLighting.fs", "pbrShadow.fs", "shadow.fs", "ssao.fs", "blur.fs", "tonemap.fs", "debug.fs"):
         assert (RESOURCE_DIR / shader).read_bytes() == (SOMA_RESOURCE_DIR / shader).read_bytes()
 
     pbr_shadow = (RESOURCE_DIR / "pbrShadow.fs").read_text(encoding="utf-8")
     assert "gl_FragDepth = gl_FragCoord.z;" in pbr_shadow
-    # 4-moment EVSM: both warp pairs stored per texel, positive warp fades to
-    # exp(k) at the near face, negative warp to 1, so ClearBackground(WHITE)
-    # remains the correct "no occluder" clear.
-    assert "vec4(sPos, sPos * sPos, sNeg, sNeg * sNeg)" in pbr_shadow
-    assert "float sPos = exp(evsmPosK * (z - 1.0));" in pbr_shadow
-    assert "float sNeg = exp(evsmNegK * (1.0 - z));" in pbr_shadow
-
-    evsm_blur = (RESOURCE_DIR / "evsmBlur.fs").read_text(encoding="utf-8")
-    assert "uniform sampler2D inputTexture" in evsm_blur
-    assert "uniform vec2 blurDirection" in evsm_blur
-    assert "texture(inputTexture, fragTexCoord + step * float(i)).rgba" in evsm_blur
+    assert "evsm" not in pbr_shadow.lower()
 
 
 def test_debug_view_contract_is_shared_between_viewers():
@@ -158,32 +129,19 @@ def test_multi_texture_passes_bind_explicit_slots():
     import stylized_motion.anim.genoview as genoview_module
 
     genoview_source = Path(genoview_module.__file__).read_text(encoding="utf-8")
-    for slot_ptr in ("material_ao_texture_slot_ptr", "ssao_texture_slot_ptr", "debug_lighted_slot_ptr", "shadow_texture_slot_ptrs"):
+    for slot_ptr in ("material_ao_texture_slot_ptr", "ssao_texture_slot_ptr", "debug_lighted_slot_ptr", "shadow_texture_slot_ptr"):
         assert slot_ptr in genoview_source
 
 
-def test_pbr_uses_three_cascaded_shadow_maps():
+def test_pbr_uses_one_depth_shadow_map():
     import stylized_motion.anim.render_targets as render_targets
     import stylized_motion.anim.renderer as renderer
 
     render_targets_source = Path(render_targets.__file__).read_text(encoding="utf-8")
     renderer_source = Path(renderer.__file__).read_text(encoding="utf-8")
-    assert "shadow_count = 3 if self.shading == \"pbr\" else 1" in render_targets_source
-    assert "CSM_CASCADE_COUNT = 3" in renderer_source
-    assert "_update_cascade_shadow_lights(view)" in renderer_source
-
-
-def test_cascade_render_ranges_overlap_shader_blend_regions():
-    from stylized_motion.anim.renderer import CSM_BLEND_FRACTION, _cascade_splits_and_ranges
-
-    splits, ranges = _cascade_splits_and_ranges(0.01, 50.0)
-    assert CSM_BLEND_FRACTION == 0.10
-    assert len(splits) == len(ranges) == 3
-    for boundary in range(2):
-        nominal_near = 0.01 if boundary == 0 else splits[boundary - 1]
-        blend_width = (splits[boundary] - nominal_near) * CSM_BLEND_FRACTION
-        assert ranges[boundary][1] == splits[boundary]
-        assert ranges[boundary + 1][0] <= splits[boundary] - blend_width
+    assert "shadow_count = 1" in render_targets_source
+    assert "view.shadow_maps[0]" in renderer_source
+    assert "CSM_CASCADE_COUNT" not in renderer_source
 
 
 def test_pbr_light_rig_is_retuned_while_legacy_stays_frozen():

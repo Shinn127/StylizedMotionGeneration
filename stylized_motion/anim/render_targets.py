@@ -121,7 +121,7 @@ def set_shader_value_texture_slot(shader, loc_index, texture, slot_ptr):
     """Bind a 2D texture to an explicit texture slot.
 
     raylib's SetShaderValueTexture keys samplers off texture.id, which collides
-    with the manually managed slots (shadow maps 10-12, environment 13-15,
+    with the manually managed slots (shadow map 10, environment 13-15,
     BRDF LUT 16) whenever a render target's GL texture name lands on those
     numbers. Multi-texture passes must bind their textures to dedicated slots
     instead.
