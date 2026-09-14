@@ -236,18 +236,41 @@ def build_viewer_mesh(skeleton: SomaSkeleton, mesh: SomaMesh, bind: dict[str, ob
             write += 3
         read += count
 
-    normals = _vertex_normals(mesh.points, indices, triangle_count)
-    texcoords = _vertex_texcoords(mesh, vertex_count)
+    # Expand indexed vertices at UV seams.  Raylib stores one UV per vertex,
+    # while USD face-varying UVs can assign different corners to the same
+    # position.  Keep each (position, UV corner) pair distinct.
+    corners = indices.reshape(-1, 3)
+    per_corner_uv = mesh.uv_indices if mesh.uv_indices is not None else mesh.face_vertex_indices
+    remap = {}
+    expanded = []
+    expanded_uv = []
+    expanded_indices = np.empty_like(indices)
+    for corner_index, position_index in enumerate(indices):
+        uv_index = int(per_corner_uv[corner_index]) if corner_index < len(per_corner_uv) else int(position_index)
+        key = (int(position_index), uv_index)
+        out_index = remap.get(key)
+        if out_index is None:
+            out_index = len(expanded)
+            remap[key] = out_index
+            expanded.append(int(position_index))
+            expanded_uv.append(mesh.uv_values[uv_index])
+        expanded_indices[corner_index] = out_index
+    expanded = np.asarray(expanded, dtype=np.int64)
+    expanded_uv = np.asarray(expanded_uv, dtype=np.float32)
+    expanded_points = mesh.points[expanded]
+    expanded_joints = top_joints[expanded]
+    expanded_weights = top_weights[expanded]
+    normals = _vertex_normals(expanded_points, expanded_indices, triangle_count)
 
     return {
-        "vertices": (mesh.points * 0.01).astype(np.float32),  # cm -> m to match the mesh unit the viewer expects
-        "texcoords": texcoords,
+        "vertices": (expanded_points * 0.01).astype(np.float32),  # cm -> m to match the mesh unit the viewer expects
+        "texcoords": expanded_uv,
         "normals": normals,
-        "bone_ids": top_joints.astype(np.uint8),
-        "bone_weights": top_weights.astype(np.float32),
-        "indices": indices.astype(np.uint16),
+        "bone_ids": expanded_joints.astype(np.uint8),
+        "bone_weights": expanded_weights.astype(np.float32),
+        "indices": expanded_indices.astype(np.uint16),
         "triangle_count": triangle_count,
-        "vertex_count": vertex_count,
+        "vertex_count": len(expanded),
     }
 
 
@@ -334,7 +357,7 @@ def write_soma_bin(path: Path, viewer_mesh: dict[str, np.ndarray], bind: dict[st
 
 SHADER_FILES = (
     "basic.fs", "basic.vs", "blur.fs", "fxaa.fs", "lighting.fs", "post.vs",
-    "pbr.fs", "pbrLighting.fs", "pbrShadow.fs", "shadow.fs", "shadow.vs", "skinnedBasic.vs", "skinnedShadow.vs", "ssao.fs", "tonemap.fs", "debug.fs", "evsmBlur.fs",
+    "pbr.fs", "pbrLighting.fs", "pbrShadow.fs", "shadow.fs", "shadow.vs", "skinnedBasic.vs", "skinnedShadow.vs", "ssao.fs", "tonemap.fs", "debug.fs",
 )
 
 

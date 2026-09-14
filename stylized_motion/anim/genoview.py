@@ -66,19 +66,6 @@ TONE_CURVES = ("aces", "reinhard", "agx")
 SCENE_MODES = ("character", "grid")
 
 
-# EVSM (exponential variance shadow mapping) configuration. The moment warp
-# constants shape the Chebyshev bound: posK sharpens the lit/shadow decision,
-# negK suppresses light bleeding through thin occluders (arms, feet), and
-# light_bleed re-normalizes the residual over-transmittance the bound allows.
-# min_variance guards the variance division against float32 cancellation.
-EVSM_CONFIG = {
-    "pos_k": 20.0,
-    "neg_k": 10.0,
-    "light_bleed": 0.15,
-    "min_variance": 1.0e-5,
-}
-
-
 # Lighting rig inherited from GenoViewPython, frozen so `--shading legacy`
 # keeps rendering exactly the way it always has.
 LEGACY_LIGHT_RIG = {
@@ -741,8 +728,6 @@ class GenoView:
         ibl_strength: float = 0.22,
         ibl_enabled: bool = True,
         shadow_resolution: int = 1024,
-        evsm_light_bleed: float | None = None,
-        evsm_pos_k: float | None = None,
         output_video: Path | None = None,
         draw_skeleton: bool = False,
         debug_view: str = "final",
@@ -763,12 +748,6 @@ class GenoView:
             raise ValueError(f"Unknown tone curve {tone_curve!r}; expected one of {TONE_CURVES}")
         if scene_mode not in SCENE_MODES:
             raise ValueError(f"Unknown scene {scene_mode!r}; expected one of {SCENE_MODES}")
-        self.evsm_pos_k = float(evsm_pos_k) if evsm_pos_k is not None else float(EVSM_CONFIG["pos_k"])
-        self.evsm_neg_k = float(EVSM_CONFIG["neg_k"])
-        self.evsm_light_bleed = (
-            float(evsm_light_bleed) if evsm_light_bleed is not None else float(EVSM_CONFIG["light_bleed"])
-        )
-        self.evsm_min_variance = float(EVSM_CONFIG["min_variance"])
         self.scene_mode = scene_mode
         self.rig = rig
         self.skeleton_enabled = bool(draw_skeleton)
@@ -888,7 +867,6 @@ class GenoView:
         self.shadow_light.height = 5.0
         self.shadow_light.near = 0.01
         self.shadow_light.far = 10.0
-        self.shadow_lights = [ShadowLight() for _ in range(3)]
 
         self.shadow_map = None
         self.gbuffer = None
@@ -940,14 +918,6 @@ class GenoView:
         self.exposure_ptr = ffi.new("float*")
         self.ssao_intensity_ptr = ffi.new("float*")
         self.shadow_texture_slot_ptr = ffi.new("int*")
-        self.shadow_texture_slot_ptrs = [ffi.new("int*") for _ in range(3)]
-        self.shadow_cascade_splits_ptr = ffi.new("float[3]")
-        self.cascade_blend_fraction_ptr = ffi.new("float*")
-        self.shadow_bias_ptr = ffi.new("float[3]")
-        self.evsm_pos_k_ptr = ffi.new("float*")
-        self.evsm_neg_k_ptr = ffi.new("float*")
-        self.evsm_light_bleed_ptr = ffi.new("float*")
-        self.evsm_min_variance_ptr = ffi.new("float*")
         self.environment_texture_slot_ptr = ffi.new("int*")
         self.irradiance_texture_slot_ptr = ffi.new("int*")
         self.prefilter_texture_slot_ptr = ffi.new("int*")
@@ -962,8 +932,6 @@ class GenoView:
         self.debug_mode_ptr = ffi.new("int*")
         self.white_background_ptr = ffi.new("int*")
         self.shadow_texture_slot_ptr[0] = 10
-        for index, slot in enumerate((23, 24, 25)):
-            self.shadow_texture_slot_ptrs[index][0] = slot
         self.environment_texture_slot_ptr[0] = 13
         self.irradiance_texture_slot_ptr[0] = 14
         self.prefilter_texture_slot_ptr[0] = 15
@@ -984,16 +952,7 @@ class GenoView:
         self.debug_gbuffer_depth_slot_ptr[0] = 20
         self.debug_ssao_slot_ptr[0] = 21
         self.debug_lighted_slot_ptr[0] = 22
-        # EVSM blur input lives beyond the lighting pass's occupied slots.
-        self.evsm_blur_texture_slot_ptr = ffi.new("int*")
-        self.evsm_blur_texture_slot_ptr[0] = 26
-        self.evsm_blur_inv_resolution_ptr = ffi.new("float[2]")
-        self.evsm_blur_direction_ptr = ffi.new("float[2]")
         self.prefilter_max_lod_ptr[0] = 5.0
-        self.evsm_pos_k_ptr[0] = self.evsm_pos_k
-        self.evsm_neg_k_ptr[0] = self.evsm_neg_k
-        self.evsm_light_bleed_ptr[0] = self.evsm_light_bleed
-        self.evsm_min_variance_ptr[0] = self.evsm_min_variance
         self.ground_pattern_ptr[0] = 0
         self.specularity_ptr[0] = 0.5
         self.glossiness_ptr[0] = 10.0
@@ -1029,8 +988,6 @@ class GenoView:
         shadow_fs = "pbrShadow.fs" if self.shading == "pbr" else "shadow.fs"
         self.shaders["shadow"] = LoadShader(self._res("shadow.vs"), self._res(shadow_fs))
         self.shaders["skinned_shadow"] = LoadShader(self._res("skinnedShadow.vs"), self._res(shadow_fs))
-        if self.shading == "pbr":
-            self.shaders["evsm_blur"] = LoadShader(self._res("post.vs"), self._res("evsmBlur.fs"))
         self.shaders["ssao"] = LoadShader(self._res("post.vs"), self._res("ssao.fs"))
         self.shaders["blur"] = LoadShader(self._res("post.vs"), self._res("blur.fs"))
         self.shaders["lighting"] = LoadShader(self._res("post.vs"), self._res(lighting_fs))
@@ -1069,14 +1026,6 @@ class GenoView:
             self.shader_locs["shadow_light_clip_far"] = GetShaderLocation(self.shaders["shadow"], b"lightClipFar")
             self.shader_locs["skinned_shadow_light_clip_near"] = GetShaderLocation(self.shaders["skinned_shadow"], b"lightClipNear")
             self.shader_locs["skinned_shadow_light_clip_far"] = GetShaderLocation(self.shaders["skinned_shadow"], b"lightClipFar")
-        else:
-            self.shader_locs["shadow_evsm_pos_k"] = GetShaderLocation(self.shaders["shadow"], b"evsmPosK")
-            self.shader_locs["shadow_evsm_neg_k"] = GetShaderLocation(self.shaders["shadow"], b"evsmNegK")
-            self.shader_locs["skinned_shadow_evsm_pos_k"] = GetShaderLocation(self.shaders["skinned_shadow"], b"evsmPosK")
-            self.shader_locs["skinned_shadow_evsm_neg_k"] = GetShaderLocation(self.shaders["skinned_shadow"], b"evsmNegK")
-            self.shader_locs["evsm_blur_input_texture"] = GetShaderLocation(self.shaders["evsm_blur"], b"inputTexture")
-            self.shader_locs["evsm_blur_inv_resolution"] = GetShaderLocation(self.shaders["evsm_blur"], b"invTextureResolution")
-            self.shader_locs["evsm_blur_direction"] = GetShaderLocation(self.shaders["evsm_blur"], b"blurDirection")
 
         self.shader_locs["ssao_gbuffer_normal"] = GetShaderLocation(self.shaders["ssao"], b"gbufferNormal")
         self.shader_locs["ssao_gbuffer_depth"] = GetShaderLocation(self.shaders["ssao"], b"gbufferDepth")
@@ -1121,13 +1070,8 @@ class GenoView:
             self.shader_locs["lighting_light_clip_near"] = GetShaderLocation(self.shaders["lighting"], b"lightClipNear")
             self.shader_locs["lighting_light_clip_far"] = GetShaderLocation(self.shaders["lighting"], b"lightClipFar")
         else:
-            for index in range(3):
-                self.shader_locs[f"lighting_shadow_map_{index}"] = GetShaderLocation(
-                    self.shaders["lighting"], f"shadowMap{index}".encode()
-                )
-                self.shader_locs[f"lighting_light_view_proj_{index}"] = GetShaderLocation(
-                    self.shaders["lighting"], f"lightViewProj{index}".encode()
-                )
+            self.shader_locs["lighting_shadow_map"] = GetShaderLocation(self.shaders["lighting"], b"shadowMap")
+            self.shader_locs["lighting_light_view_proj"] = GetShaderLocation(self.shaders["lighting"], b"lightViewProj")
             self.shader_locs["lighting_environment_map"] = GetShaderLocation(self.shaders["lighting"], b"environmentMap")
             self.shader_locs["lighting_irradiance_map"] = GetShaderLocation(self.shaders["lighting"], b"irradianceMap")
             self.shader_locs["lighting_prefilter_map"] = GetShaderLocation(self.shaders["lighting"], b"prefilterMap")
@@ -1137,14 +1081,6 @@ class GenoView:
             self.shader_locs["lighting_use_ibl"] = GetShaderLocation(self.shaders["lighting"], b"useIBL")
             self.shader_locs["lighting_white_background"] = GetShaderLocation(self.shaders["lighting"], b"whiteBackground")
             self.shader_locs["lighting_debug_mode"] = GetShaderLocation(self.shaders["lighting"], b"debugMode")
-            self.shader_locs["lighting_evsm_pos_k"] = GetShaderLocation(self.shaders["lighting"], b"evsmPosK")
-            self.shader_locs["lighting_evsm_neg_k"] = GetShaderLocation(self.shaders["lighting"], b"evsmNegK")
-            self.shader_locs["lighting_evsm_light_bleed"] = GetShaderLocation(self.shaders["lighting"], b"evsmLightBleed")
-            self.shader_locs["lighting_evsm_min_variance"] = GetShaderLocation(self.shaders["lighting"], b"evsmMinVariance")
-            self.shader_locs["lighting_cascade_splits"] = GetShaderLocation(self.shaders["lighting"], b"cascadeSplits")
-            self.shader_locs["lighting_cascade_blend_fraction"] = GetShaderLocation(
-                self.shaders["lighting"], b"cascadeBlendFraction"
-            )
             self.shader_locs["lighting_cam_view"] = GetShaderLocation(self.shaders["lighting"], b"camView")
 
         if self.shading == "pbr":
@@ -1597,8 +1533,6 @@ class GenoViewCompare(GenoView):
         ibl_strength: float = 0.22,
         ibl_enabled: bool = True,
         shadow_resolution: int = 1024,
-        evsm_light_bleed: float | None = None,
-        evsm_pos_k: float | None = None,
         output_video: Path | None = None,
         draw_skeleton: bool = False,
         debug_view: str = "final",
@@ -1631,8 +1565,6 @@ class GenoViewCompare(GenoView):
             ibl_strength=ibl_strength,
             ibl_enabled=ibl_enabled,
             shadow_resolution=shadow_resolution,
-            evsm_light_bleed=evsm_light_bleed,
-            evsm_pos_k=evsm_pos_k,
             output_video=output_video,
             draw_skeleton=draw_skeleton,
             debug_view=debug_view,
@@ -1678,8 +1610,6 @@ def main():
     parser.add_argument("--sun-temperature", type=float, default=None, metavar="K", help="Direct light color temperature in Kelvin (1500-20000). Overrides the rig's baked-in sun color.")
     parser.add_argument("--sky-temperature", type=float, default=None, metavar="K", help="Ambient/sky color temperature in Kelvin (1500-20000). Overrides the rig's baked-in sky color.")
     parser.add_argument("--ssao-intensity", type=float, default=0.15)
-    parser.add_argument("--evsm-light-bleed", type=float, default=None, metavar="P", help="EVSM light bleeding reshaping floor (0-1, default from EVSM_CONFIG).")
-    parser.add_argument("--evsm-k", type=float, default=None, metavar="K", help="EVSM positive warp constant (default from EVSM_CONFIG).")
     parser.add_argument("--ibl-strength", type=float, default=0.22)
     parser.add_argument("--disable-ibl", action="store_true")
     parser.add_argument("--shadow-resolution", type=int, default=1024)
@@ -1726,8 +1656,6 @@ def main():
         ibl_strength=args.ibl_strength,
         ibl_enabled=not args.disable_ibl,
         shadow_resolution=args.shadow_resolution,
-        evsm_light_bleed=args.evsm_light_bleed,
-        evsm_pos_k=args.evsm_k,
         output_video=args.output_video,
         draw_skeleton=args.skeleton,
         debug_view=args.debug_view,

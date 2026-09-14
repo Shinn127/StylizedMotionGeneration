@@ -86,9 +86,6 @@ def render_still(args: argparse.Namespace) -> Path:
 
     SetConfigFlags(FLAG_WINDOW_HIDDEN)
     InitWindow(args.width, args.height, b"render_stills")
-    # Keep CSM split depths identical to the interactive viewer. Raylib's
-    # default far plane is much larger and would move the cascade transitions
-    # out of the scene, hiding split-boundary regressions in baseline images.
     rlSetClipPlanes(0.01, 50.0)
     viewer.screen_width = args.width
     viewer.screen_height = args.height

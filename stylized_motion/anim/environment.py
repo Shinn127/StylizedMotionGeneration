@@ -264,7 +264,17 @@ def _prefilter_environment(environment: np.ndarray, face_size: int, output_size:
                 l = 2.0 * np.einsum("psc,pc->ps", hw, nf)[..., None] * hw - nf[:, None, :]
                 l /= np.maximum(np.linalg.norm(l, axis=2, keepdims=True), 1e-8)
                 colors = _sample_env(env_dirs, env_colors, l.reshape(-1, 3)).reshape(nf.shape[0], -1, 3)
-                acc[start : start + chunk] = colors.mean(axis=1)
+                # The GGX samples are generated from the half-vector NDF.  Only
+                # reflected directions on the visible hemisphere contribute;
+                # weight them by the projected solid angle to avoid leaking
+                # back-facing environment radiance into rough reflections.
+                n_dot_l = np.maximum(np.einsum("psc,pc->ps", l, nf), 0.0)
+                weighted = colors * n_dot_l[..., None]
+                denom = n_dot_l.sum(axis=1, keepdims=True)
+                fallback = colors[:, 0, :]
+                acc[start : start + chunk] = np.where(
+                    denom > 1e-6, weighted.sum(axis=1) / np.maximum(denom, 1e-6), fallback
+                )
             prefiltered[face] = acc.reshape(level_size, level_size, 3)
         mips_out.append(prefiltered)
     return mips_out
@@ -336,7 +346,7 @@ def _ibl_cache_path(sky: np.ndarray) -> Path:
     base = os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")
     cache_dir = Path(base) / "stylized_motion" / "ibl"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f"procedural_sky_{digest}_v2.npz"
+    return cache_dir / f"procedural_sky_{digest}_v3.npz"
 
 
 def _load_or_build_ibl_arrays(sky: np.ndarray) -> tuple[np.ndarray, list[np.ndarray]]:

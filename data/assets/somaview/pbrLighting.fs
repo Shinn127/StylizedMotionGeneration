@@ -7,9 +7,7 @@ uniform sampler2D gbufferNormal;
 uniform sampler2D gbufferDepth;
 uniform sampler2D ssao;
 uniform sampler2D materialAO;
-uniform sampler2D shadowMap0;
-uniform sampler2D shadowMap1;
-uniform sampler2D shadowMap2;
+uniform sampler2D shadowMap;
 uniform samplerCube environmentMap;
 uniform samplerCube irradianceMap;
 uniform samplerCube prefilterMap;
@@ -18,9 +16,7 @@ uniform sampler2D brdfLut;
 uniform vec3 camPos;
 uniform mat4 camView;
 uniform mat4 camInvViewProj;
-uniform mat4 lightViewProj0;
-uniform mat4 lightViewProj1;
-uniform mat4 lightViewProj2;
+uniform mat4 lightViewProj;
 uniform vec3 lightDir;
 uniform vec3 sunColor;
 uniform float sunStrength;
@@ -34,14 +30,8 @@ uniform float iblStrength;
 uniform float prefilterMaxLod;
 uniform int useIBL;
 uniform int whiteBackground;
-// EVSM: warped-depth moments replace depth-compare + PCF entirely. No bias,
-// no texel size — variance bounds handle self-shadowing without acne.
-uniform float evsmPosK;
-uniform float evsmNegK;
-uniform float evsmLightBleed;
-uniform float evsmMinVariance;
-uniform vec3 cascadeSplits;
-uniform float cascadeBlendFraction;
+uniform float shadowBias;
+uniform float shadowPcfRadius;
 // 0 final image, 1 shadow, 2 direct diffuse, 3 direct specular, 4 indirect light
 uniform int debugMode;
 
@@ -123,47 +113,22 @@ float ShadowFactorFor(vec3 position, vec3 normal, mat4 lightViewProj, sampler2D 
         lightPosition.y > 0.0 && lightPosition.y < 1.0 &&
         lightPosition.z > 0.0 && lightPosition.z < 1.0;
     if (!inside) { return 1.0; }
-    // Warped moments were blurred offline (evsmBlur.fs), so this is a single
-    // bilinear fetch — the blur radius IS the penumbra. The positive-warp pair
-    // bounds transmittance from one side; the negative-warp pair from the
-    // other, which is what suppresses light bleeding through thin occluders
-    // (arms, feet). min() of both bounds, then reshape the residual
-    // over-transmittance the bound allows.
-    vec4 m = texture(shadowMap, lightPosition.xy);
-    float receiverZ = lightPosition.z;
-    float meanPos = exp(evsmPosK * (receiverZ - 1.0));
-    float meanNeg = exp(evsmNegK * (1.0 - receiverZ));
-    float shadowPos = ChebyshevUpperBound(m.rg, meanPos, evsmMinVariance);
-    float shadowNeg = ChebyshevUpperBoundNeg(m.ba, meanNeg, evsmMinVariance);
-    float shadow = min(shadowPos, shadowNeg);
-    shadow = clamp((shadow - evsmLightBleed) / (1.0 - evsmLightBleed), 0.0, 1.0);
-    return shadow;
+    float bias = clamp(max(baseBias, 0.0015) + (1.0 - max(dot(normal, normalize(-lightDir)), 0.0)) * 0.002, 0.0015, 0.02);
+    vec2 texel = vec2(shadowPcfRadius) / vec2(textureSize(shadowMap, 0));
+    const float c = 0.70710678;
+    const float s = 0.70710678;
+    mat2 rot = mat2(c, -s, s, c);
+    float lit = 0.0;
+    for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
+        vec2 offset = rot * (vec2(float(x), float(y)) * texel);
+        lit += lightPosition.z - bias <= texture(shadowMap, lightPosition.xy + offset).r ? 1.0 : 0.0;
+    }
+    return lit / 9.0;
 }
 
 float ShadowFactor(vec3 position, vec3 normal, float cameraDepth)
 {
-    float blendWidth0 = max((cascadeSplits.x - camClipNear) * cascadeBlendFraction, 1e-4);
-    float blendWidth1 = max((cascadeSplits.y - cascadeSplits.x) * cascadeBlendFraction, 1e-4);
-
-    if (cameraDepth < cascadeSplits.x - blendWidth0) {
-        return ShadowFactorFor(position, normal, lightViewProj0, shadowMap0, 0.0);
-    }
-    if (cameraDepth <= cascadeSplits.x) {
-        float shadow0 = ShadowFactorFor(position, normal, lightViewProj0, shadowMap0, 0.0);
-        float shadow1 = ShadowFactorFor(position, normal, lightViewProj1, shadowMap1, 0.0);
-        float blend = smoothstep(cascadeSplits.x - blendWidth0, cascadeSplits.x, cameraDepth);
-        return mix(shadow0, shadow1, blend);
-    }
-    if (cameraDepth < cascadeSplits.y - blendWidth1) {
-        return ShadowFactorFor(position, normal, lightViewProj1, shadowMap1, 0.0);
-    }
-    if (cameraDepth <= cascadeSplits.y) {
-        float shadow1 = ShadowFactorFor(position, normal, lightViewProj1, shadowMap1, 0.0);
-        float shadow2 = ShadowFactorFor(position, normal, lightViewProj2, shadowMap2, 0.0);
-        float blend = smoothstep(cascadeSplits.y - blendWidth1, cascadeSplits.y, cameraDepth);
-        return mix(shadow1, shadow2, blend);
-    }
-    return ShadowFactorFor(position, normal, lightViewProj2, shadowMap2, 0.0);
+    return ShadowFactorFor(position, normal, lightViewProj, shadowMap, shadowBias);
 }
 
 void main()
@@ -239,7 +204,8 @@ void main()
         vec3 prefiltered = textureLod(prefilterMap, reflection, roughness * prefilterMaxLod).rgb;
         vec2 brdf = texture(brdfLut, vec2(nDotV, roughness)).rg;
         vec3 iblFresnel = FresnelSchlick(nDotV, f0);
-        vec3 diffuseIBL = (1.0 - metallic) * albedo * irradiance;
+        vec3 kD = (1.0 - iblFresnel) * (1.0 - metallic);
+        vec3 diffuseIBL = kD * albedo * irradiance;
         vec3 specularIBL = prefiltered * (iblFresnel * brdf.x + brdf.y);
         ambient = (diffuseIBL + specularIBL) * ao * iblStrength;
     }
