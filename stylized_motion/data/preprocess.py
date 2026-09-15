@@ -995,8 +995,14 @@ def build_feature_database(
         if names is None or parents is None:
             raise ValueError("No motion shards were processed")
         stats = stats_accumulator.finalize(names)
-        if stats.offset.shape != (230,):
-            raise ValueError(f"Canonical FeatureStore requires motion_dim=230, got {stats.offset.shape}")
+        # Feature width is a per-skeleton property (230 for the 25-joint pruned
+        # Geno skeleton, 248 for the 27-joint pruned SOMA skeleton).
+        motion_dim = joint_feature_dim(len(names))
+        if stats.offset.shape != (motion_dim,):
+            raise ValueError(
+                f"Canonical FeatureStore requires motion_dim={motion_dim} for {len(names)} joints, "
+                f"got {stats.offset.shape}"
+            )
         for relative in motion_files:
             _normalize_motion_shard(staging / relative, stats)
         if writer is not None:
@@ -1066,7 +1072,7 @@ def build_feature_database(
         stats_hash = stats_sha256.hexdigest()
         schema_payload = {
             "name": "motion_feature_v2",
-            "motion_dim": 230,
+            "motion_dim": motion_dim,
             "joint_subset": "prune_ends_and_fingers" if prune_ends_and_fingers else "full",
             "names_sha256": names_sha256,
             "stats_sha256": stats_hash,
@@ -1082,7 +1088,7 @@ def build_feature_database(
             "split_manifest_hash": split_manifest_hash,
             "feature_schema_hash": feature_schema_hash,
             "created_by": "stylized_motion.data.preprocess",
-            "motion_dim": 230,
+            "motion_dim": motion_dim,
             "range_names": range_names,
             "source_clip_names": source_clip_names,
             "style_names": style_names,
@@ -1223,6 +1229,7 @@ def build_token_database(
             "residual_part_fsq": "residual_part_fsq",
             "latent_residual_fsq": "latent_residual_part_fsq",
             "latent_residual_fsq_v2": "latent_residual_part_fsq_v2",
+            "nef_fsq": "nef_fsq",
         }.get(str(representation.get("family", "")), "")
         manifest = {
             "data_schema_version": 3,
@@ -1245,7 +1252,7 @@ def build_token_database(
             "representation_id": str(representation.get("representation_id", "")),
             "model_family_legacy": str(legacy_family),
             "checkpoint_sha256": str(checkpoint_sha256),
-            "motion_dim": 230,
+            "motion_dim": int(feature_store.motion_dim),
             "num_coordinates": 40,
             "num_levels": 9,
             "coordinate_order": list(representation.get("coordinate_order", [])),
@@ -1255,6 +1262,11 @@ def build_token_database(
             "lookahead_frames": int(representation.get("lookahead_frames", 0)),
             "decoder_passes_inference": int(representation.get("decoder_passes_inference", 1)),
         }
+        # The TokenStore inherits the FeatureStore's split policy; without it a
+        # window-split store is re-validated under the source-clip policy.
+        for split_key in ("split_policy", "window_frames", "split_seed", "split_ratios", "unseen_style_names"):
+            if split_key in feature_store.manifest:
+                manifest[split_key] = feature_store.manifest[split_key]
         if save_codes:
             manifest["code_shard_files"] = code_files
             manifest["code_shard_sha256"] = [sha256_file(staging / relative) for relative in code_files]

@@ -10,6 +10,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from stylized_motion.learning.nef_layout import NEF_STREAM_COORDINATES, NEF_STREAM_NAMES, NEFLayout
+
 from .feature_data import (
     DATA_SCHEMA_VERSION,
     MMapShardCache,
@@ -81,7 +83,7 @@ class TokenStore:
 
     @property
     def representation_metadata(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "family": self.representation_family,
             "variant": self.representation_variant,
             "representation_id": self.representation_id,
@@ -96,6 +98,64 @@ class TokenStore:
             "decoder_passes_inference": self.decoder_passes_inference,
             "feature_schema": self.feature_schema,
         }
+        if self.representation_family == "nef_fsq":
+            representation = self.manifest.get("representation")
+            if isinstance(representation, Mapping):
+                result["architecture_version"] = representation.get("architecture_version")
+                result["nef_layout"] = representation.get("nef_layout")
+        return result
+
+    def _validate_motion_schema(self) -> None:
+        """The motion width is a per-skeleton property: D = 9J + 5."""
+        motion_dim = int(self.motion_dim)
+        if motion_dim < 14 or (motion_dim - 5) % 9 != 0:
+            raise ValueError(
+                f"TokenStore motion_dim={motion_dim} is not a skeleton-derived 9J+5 feature width"
+            )
+        feature_schema = self.manifest.get("feature_schema")
+        if not isinstance(feature_schema, Mapping):
+            return
+        schema_dim = feature_schema.get("motion_dim")
+        if schema_dim is not None and int(schema_dim) != motion_dim:
+            raise ValueError("TokenStore motion_dim does not match its feature_schema")
+        names = feature_schema.get("names")
+        if isinstance(names, (list, tuple)) and len(names):
+            expected = 9 * len(names) + 5
+            if expected != motion_dim:
+                raise ValueError(f"TokenStore motion_dim must be 9*J+5={expected} for its skeleton")
+
+    @staticmethod
+    def _validated_nef_layout(representation: Mapping[str, object]) -> dict[str, object]:
+        """Rebuild and validate the persisted semantic layout, ignoring stored hashes."""
+        metadata = representation.get("nef_layout")
+        if not isinstance(metadata, Mapping):
+            raise ValueError("NEF-FSQ representation metadata must persist its node/edge layout")
+        names = metadata.get("names")
+        parents = metadata.get("parents")
+        if not isinstance(names, (list, tuple)) or not isinstance(parents, (list, tuple)):
+            raise ValueError("NEF-FSQ layout metadata is missing skeleton names or parents")
+        resolved = NEFLayout.from_skeleton(names, parents, skeleton=str(metadata.get("skeleton", "")))
+        canonical = resolved.to_dict()
+        semantic_keys = (
+            "skeleton", "names", "parents", "stream_order", "stream_coordinates",
+            "stream_slices", "stream_joint_indices", "families",
+        )
+        for key in semantic_keys:
+            if metadata.get(key) != canonical[key]:
+                raise ValueError(f"NEF-FSQ layout metadata mismatch at {key!r}")
+        return {key: canonical[key] for key in semantic_keys}
+
+    def _validate_nef_skeleton(self, representation: Mapping[str, object]) -> None:
+        """NEF-FSQ tokens are only interchangeable within one semantic layout."""
+        expected = self._validated_nef_layout(representation)
+        if 9 * len(expected["names"]) + 5 != int(self.motion_dim):
+            raise ValueError("NEF-FSQ layout skeleton does not match the TokenStore motion width")
+        stored = self.manifest.get("representation")
+        if not isinstance(stored, Mapping):
+            raise ValueError("NEF-FSQ TokenStore is missing representation metadata")
+        actual = self._validated_nef_layout(stored)
+        if expected != actual:
+            raise ValueError("TokenStore was built with a different NEF-FSQ skeleton or feature ownership")
 
     def validate_contract(
         self,
@@ -104,8 +164,9 @@ class TokenStore:
         representation: Mapping[str, object] | None = None,
         feature_schema: Mapping[str, object] | None = None,
     ) -> None:
-        if (self.motion_dim, self.num_coordinates, self.num_levels) != (230, 40, 9):
-            raise ValueError("TokenStore must use the canonical 230D / 40x9 contract")
+        if (self.num_coordinates, self.num_levels) != (40, 9):
+            raise ValueError("TokenStore must use the canonical 40x9 contract")
+        self._validate_motion_schema()
         if self.frame_rate != 60 or self.temporal_downsample != 1:
             raise ValueError("TokenStore frame-rate and temporal-downsample metadata are invalid")
         if (self.receptive_field, self.lookahead_frames) != (64, 0):
@@ -116,6 +177,7 @@ class TokenStore:
             "residual_part_fsq": "residual_part_fsq",
             "latent_residual_fsq": "latent_residual_part_fsq",
             "latent_residual_fsq_v2": "latent_residual_part_fsq_v2",
+            "nef_fsq": "nef_fsq",
         }
         expected_variant = {
             "flat_fsq": "flat",
@@ -123,6 +185,7 @@ class TokenStore:
             "residual_part_fsq": "default",
             "latent_residual_fsq": "v2",
             "latent_residual_fsq_v2": "v2",
+            "nef_fsq": "independent",
         }
         expected_layout = {
             "flat_fsq": (("flat",), {"flat": 40}),
@@ -130,6 +193,7 @@ class TokenStore:
             "residual_part_fsq": (("base", "torso", "left_leg", "right_leg", "left_arm", "right_arm"), {"base": 20, "torso": 6, "left_leg": 4, "right_leg": 4, "left_arm": 3, "right_arm": 3}),
             "latent_residual_fsq": (("base", "torso", "left_leg", "right_leg", "left_arm", "right_arm"), {"base": 20, "torso": 6, "left_leg": 4, "right_leg": 4, "left_arm": 3, "right_arm": 3}),
             "latent_residual_fsq_v2": (("base", "torso", "left_leg", "right_leg", "left_arm", "right_arm"), {"base": 20, "torso": 6, "left_leg": 4, "right_leg": 4, "left_arm": 3, "right_arm": 3}),
+            "nef_fsq": (tuple(NEF_STREAM_NAMES), dict(NEF_STREAM_COORDINATES)),
         }
         if self.representation_family not in expected_legacy:
             raise ValueError(f"Unsupported TokenStore representation family: {self.representation_family!r}")
@@ -140,8 +204,18 @@ class TokenStore:
         order, counts = expected_layout[self.representation_family]
         if tuple(self.coordinate_order) != order or dict(self.coordinate_counts) != counts:
             raise ValueError("TokenStore coordinate layout does not match its canonical representation family")
-        if self.representation_id != f"{self.representation_family}_40x9":
+        expected_id = (
+            f"nef_fsq_{expected_variant['nef_fsq']}_{self.num_coordinates}x{self.num_levels}"
+            if self.representation_family == "nef_fsq"
+            else f"{self.representation_family}_{self.num_coordinates}x{self.num_levels}"
+        )
+        if self.representation_id != expected_id:
             raise ValueError("TokenStore representation_id does not match the canonical dimensions")
+        if self.representation_family == "nef_fsq":
+            stored_representation = self.manifest.get("representation")
+            if not isinstance(stored_representation, Mapping):
+                raise ValueError("NEF-FSQ TokenStore is missing representation metadata")
+            self._validate_nef_skeleton(stored_representation)
         expected_decoder_passes = 2 if self.representation_family == "residual_part_fsq" else 1
         if self.decoder_passes_inference != expected_decoder_passes:
             raise ValueError("TokenStore decoder_passes_inference does not match its representation family")
@@ -157,6 +231,8 @@ class TokenStore:
                 actual = self.representation_metadata.get(key)
                 if expected is not None and actual != expected:
                     raise ValueError(f"TokenStore representation mismatch at {key!r}")
+            if self.representation_family == "nef_fsq":
+                self._validate_nef_skeleton(representation)
         if feature_schema is not None:
             expected_hash = feature_schema.get("feature_schema_hash")
             if expected_hash is not None and str(expected_hash) != self.feature_schema_hash:
