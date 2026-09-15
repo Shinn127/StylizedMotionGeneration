@@ -105,6 +105,11 @@ desktop.ini
 !requirements.txt
 !environment.yml
 
+# The Quinn -> SOMA conversion output is committed as-is: its SOMA.bin carries
+# the 45,979-vertex Quinn mesh, which is not rebuildable from the repo alone.
+!data/assets/somaview_quinn/*.bin
+!data/assets/somaview_quinn/*.bvh
+
 
 ideaspark_run/
 .zcode/
