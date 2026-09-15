@@ -6,7 +6,7 @@
 python -m stylized_motion.run --mode <mode> --pipeline <pipeline> [options]
 ```
 
-当前可运行的主线是五种 canonical FSQ motion representation；它们共用数据读取、训练/验证/测试、checkpoint 和 token 接口。实验代码以可复现和快速验证为目标，不是通用训练平台。
+当前可运行的主线是六种 canonical FSQ motion representation；它们共用数据读取、训练/验证/测试、checkpoint 和 token 接口。实验代码以可复现和快速验证为目标，不是通用训练平台。
 
 ## 当前实现
 
@@ -17,8 +17,11 @@ python -m stylized_motion.run --mode <mode> --pipeline <pipeline> [options]
 | `residual-part-fsq` | `residual_part_fsq` | holistic base 加 feature-space 局部 residual |
 | `latent-residual-fsq` | `latent_residual_fsq` | 旧版 latent-residual 对照 |
 | `latent-residual-fsq-v2` | `latent_residual_fsq_v2` | 全维 part residual projection 与 compensated part edit |
+| `nef-fsq` | `nef_fsq` | Node–Edge Factorized：13 个独立量化 stream，Geno/SOMA 各自 layout |
 
-五条主线固定使用 `motion_dim=230`、每帧 40 个 9-level FSQ coordinate、60 FPS、64 帧 causal receptive field 和 0 帧 lookahead。representation 训练窗口为 64 帧；generator 使用前 64 帧 token 预测接下来的 64 帧 token。checkpoint 会校验 family、coordinate layout、feature schema、normalization 和 causal metadata，不能跨 family 混用。
+前五条主线固定使用 `motion_dim=230`、每帧 40 个 9-level FSQ coordinate、60 FPS、64 帧 causal receptive field 和 0 帧 lookahead。representation 训练窗口为 64 帧；generator 使用前 64 帧 token 预测接下来的 64 帧 token。checkpoint 会校验 family、coordinate layout、feature schema、normalization 和 causal metadata，不能跨 family 混用。
+
+`nef_fsq` 的 motion width 由 skeleton 决定（Geno `9J+5=230`、SOMA `9J+5=248`），coordinate order 固定为 13 个 Node/Edge stream，skeleton、layout、feature schema 或 coordinate order 不匹配时拒绝加载和 token 交换。设计与验收标准见 [docs/NEF-FSQ_Design.md](docs/NEF-FSQ_Design.md)。
 
 `latent_residual_fsq_v2` 是当前的局部编辑实验主线：base latent 与 part projection 均为稠密 latent，不预先分配 body-part channel；编辑时会将 donor 的 part state 重新表示到 target base 条件下。模型细节、损失和限制见 [docs/latent_residual_part_fsq_v2_spec.md](docs/latent_residual_part_fsq_v2_spec.md)。
 
@@ -27,7 +30,7 @@ python -m stylized_motion.run --mode <mode> --pipeline <pipeline> [options]
 ## 目录
 
 ```text
-args/                         五条 FSQ 训练预设
+args/                         FSQ 训练预设
 data/configs/                 representation 与 generator YAML 配置
 data/assets/                  GenoView / SomaView 着色器及可再生资产位置
 stylized_motion/
@@ -109,6 +112,20 @@ python -m stylized_motion.run \
   --mode train --pipeline representation \
   --representation latent-residual-fsq-v2 \
   --config data/configs/latent_residual_fsq_v2_40x9.yaml \
+  --device cuda
+```
+
+NEF-FSQ 使用 `args/nef_fsq_args.txt`（Geno）或 `args/nef_fsq_soma_args.txt`（SOMA），分别对应 `data/configs/nef_fsq_40x9.yaml` 与 `data/configs/nef_fsq_soma_40x9.yaml`。训练后的 per-stream 报告与编辑评估：
+
+```bash
+python -m stylized_motion.run \
+  --mode evaluate --pipeline nef-fsq \
+  --metric transfer \
+  --checkpoint outputs/nef_fsq_40x9/best.pt \
+  --feature-database data/processed/100style_pruned_90/fsq_window_index \
+  --target-range-idx 0 --target-start 0 \
+  --donor-range-idx 40 --donor-start 0 --length 64 \
+  --part left_arm --edit strict --edit-start 10 --edit-stop 40 \
   --device cuda
 ```
 
