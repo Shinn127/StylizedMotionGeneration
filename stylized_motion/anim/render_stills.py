@@ -50,6 +50,17 @@ from stylized_motion.anim.somaview import SOMA_RIG
 from stylized_motion.util.paths import RESOURCE_DIR, SOMA_RESOURCE_DIR
 
 
+def _camera_target(override: list[float] | None, root_x: float, root_z: float) -> tuple[float, float, float]:
+    """Camera target in meters: one override value sets the height, three set the point."""
+    if override is None:
+        return (root_x, 0.75, root_z)
+    if len(override) == 1:
+        return (root_x, float(override[0]), root_z)
+    if len(override) == 3:
+        return (float(override[0]), float(override[1]), float(override[2]))
+    raise ValueError("--camera-target takes one value (height) or three (X Y Z)")
+
+
 def render_still(args: argparse.Namespace) -> Path:
     rig = SOMA_RIG if args.pipeline == "somaview" else GENO_RIG
     resources_root = args.resources_root or (SOMA_RESOURCE_DIR if args.pipeline == "somaview" else RESOURCE_DIR)
@@ -74,6 +85,7 @@ def render_still(args: argparse.Namespace) -> Path:
         draw_skeleton=args.skeleton,
         normal_map=args.normal_map,
         metallic_roughness_map=args.metallic_roughness_map,
+        character_tint=args.character_tint,
         sun_strength=args.sun_strength,
         sun_temperature=args.sun_temperature,
         sky_temperature=args.sky_temperature,
@@ -107,9 +119,11 @@ def render_still(args: argparse.Namespace) -> Path:
         viewer.shadow_light.position = Vector3Add(
             viewer.shadow_light.target, Vector3Scale(viewer.light_dir, -5.0)
         )
-        viewer.camera.distance = 8.5 if viewer.scene_mode == "grid" else 4.0
+        viewer.camera.distance = args.camera_distance if args.camera_distance is not None else (8.5 if viewer.scene_mode == "grid" else 4.0)
+        if args.camera_altitude is not None:
+            viewer.camera.altitude = args.camera_altitude
         viewer.camera.update(
-            Vector3(target_x, 0.75 if viewer.scene_mode == "character" else 0.4, target_z),
+            Vector3(*_camera_target(args.camera_target, target_x, target_z)),
             0.0, 0.0, 0.0, 0.0, 0.0, 1.0 / 60.0,
         )
 
@@ -179,8 +193,12 @@ def main():
     parser.add_argument("--scene", choices=SCENE_MODES, default="character")
     parser.add_argument("--normal-map", type=Path, default=None)
     parser.add_argument("--metallic-roughness-map", type=Path, default=None)
+    parser.add_argument("--character-tint", type=int, nargs="+", default=None, metavar="C", help="Draw tint applied to the character (RGB or RGBA, 0-255). Defaults to white when a base-color map is set.")
     parser.add_argument("--disable-ibl", action="store_true")
     parser.add_argument("--skeleton", action="store_true")
+    parser.add_argument("--camera-distance", type=float, default=None, help="Override the camera distance in meters (close-ups for joint inspection).")
+    parser.add_argument("--camera-altitude", type=float, default=None, help="Override the camera altitude in radians (0 is level with the target).")
+    parser.add_argument("--camera-target", type=float, nargs="+", default=None, metavar="V", help="Camera target override in meters: one value sets the height (x/z follow the character root), three set the full point.")
     args = parser.parse_args()
 
     output = render_still(args)

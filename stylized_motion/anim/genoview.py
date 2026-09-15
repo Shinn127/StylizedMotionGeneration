@@ -116,6 +116,16 @@ def kelvin_to_rgb(kelvin: float) -> tuple[float, float, float]:
     return tuple(rgb / rgb.max())
 
 
+def normalize_character_tint(values: list[int] | tuple[int, ...] | None) -> tuple[int, ...] | None:
+    """Validate a CLI character tint, expanding RGB to RGBA."""
+    if values is None:
+        return None
+    expanded = [*values, 255] if len(values) == 3 else list(values)
+    if len(expanded) != 4 or any(not 0 <= int(value) <= 255 for value in expanded):
+        raise ValueError(f"--character-tint expects three or four values in 0-255, got {values}")
+    return tuple(int(value) for value in expanded)
+
+
 @dataclass(frozen=True)
 class RigSpec:
     """Character assets and skeleton conventions used by the viewer.
@@ -734,6 +744,7 @@ class GenoView:
         base_color_map: Path | None = None,
         normal_map: Path | None = None,
         metallic_roughness_map: Path | None = None,
+        character_tint: tuple[int, ...] | None = None,
         sun_strength: float | None = None,
         sun_temperature: float | None = None,
         sky_temperature: float | None = None,
@@ -756,6 +767,7 @@ class GenoView:
         self.base_color_map_path = base_color_map
         self.normal_map_path = normal_map
         self.metallic_roughness_map_path = metallic_roughness_map
+        self.character_tint = normalize_character_tint(character_tint)
         self.shading = shading
         self.metallic = float(metallic)
         self.roughness = float(roughness)
@@ -940,6 +952,12 @@ class GenoView:
         # texture names collide with SetShaderValueTexture's id-keyed samplers.
         self.material_ao_texture_slot_ptr = ffi.new("int*")
         self.material_ao_texture_slot_ptr[0] = 17
+        self.base_color_map_slot_ptr = ffi.new("int*")
+        self.base_color_map_slot_ptr[0] = 4
+        self.normal_map_slot_ptr = ffi.new("int*")
+        self.normal_map_slot_ptr[0] = 5
+        self.metallic_roughness_map_slot_ptr = ffi.new("int*")
+        self.metallic_roughness_map_slot_ptr[0] = 6
         self.ssao_texture_slot_ptr = ffi.new("int*")
         self.ssao_texture_slot_ptr[0] = 21
         self.debug_gbuffer_color_slot_ptr = ffi.new("int*")
@@ -1114,6 +1132,13 @@ class GenoView:
                     self.metallic_roughness_map_path, "metallic_roughness_map"
                 )
 
+        # The draw tint multiplies the base-color map, so a textured character
+        # keeps its own albedo unless a tint is requested explicitly.
+        tint = self.character_tint
+        if tint is None:
+            tint = (255, 255, 255, 255) if self.default_material.base_color_map is not None else tuple(ORANGE)
+        self.character_color = Color(*tint)
+
         self.shader_locs["fxaa_input_texture"] = GetShaderLocation(self.shaders["fxaa"], b"inputTexture")
         self.shader_locs["fxaa_inv_texture_resolution"] = GetShaderLocation(self.shaders["fxaa"], b"invTextureResolution")
 
@@ -1168,7 +1193,7 @@ class GenoView:
                     model=self.geno_model,
                     material=self.default_material,
                     position=self.left_model_offset,
-                    draw_color=Color(70, 125, 255, 255) if self.compare_mode else ORANGE,
+                    draw_color=Color(70, 125, 255, 255) if self.compare_mode else self.character_color,
                     skinned=True,
                 )
             )
@@ -1178,7 +1203,7 @@ class GenoView:
                         model=self.compare_model,
                         material=self.default_material,
                         position=self.right_model_offset,
-                        draw_color=ORANGE,
+                        draw_color=self.character_color,
                         skinned=True,
                     )
                 )
@@ -1539,6 +1564,7 @@ class GenoViewCompare(GenoView):
         base_color_map: Path | None = None,
         normal_map: Path | None = None,
         metallic_roughness_map: Path | None = None,
+        character_tint: tuple[int, ...] | None = None,
         sun_strength: float | None = None,
         sun_temperature: float | None = None,
         sky_temperature: float | None = None,
@@ -1571,6 +1597,7 @@ class GenoViewCompare(GenoView):
             base_color_map=base_color_map,
             normal_map=normal_map,
             metallic_roughness_map=metallic_roughness_map,
+            character_tint=character_tint,
             sun_strength=sun_strength,
             sun_temperature=sun_temperature,
             sky_temperature=sky_temperature,
@@ -1619,6 +1646,7 @@ def main():
     parser.add_argument("--base-color-map", type=Path, default=None, help="Optional sRGB base-color map applied to the character's default material.")
     parser.add_argument("--normal-map", type=Path, default=None, help="Optional tangent-space normal map applied to the character's default material.")
     parser.add_argument("--metallic-roughness-map", type=Path, default=None, help="Optional linear map (R=metallic, G=roughness, B=AO) applied to the character's default material.")
+    parser.add_argument("--character-tint", type=int, nargs="+", default=None, metavar="C", help="Draw tint applied to the character (RGB or RGBA, 0-255). Defaults to white when a base-color map is set, else the viewer's character color.")
     args = parser.parse_args()
 
     selected_inputs = [args.database is not None, args.bvh is not None, args.features is not None]
@@ -1662,6 +1690,7 @@ def main():
         base_color_map=args.base_color_map,
         normal_map=args.normal_map,
         metallic_roughness_map=args.metallic_roughness_map,
+        character_tint=args.character_tint,
         sun_strength=args.sun_strength,
         sun_temperature=args.sun_temperature,
         sky_temperature=args.sky_temperature,

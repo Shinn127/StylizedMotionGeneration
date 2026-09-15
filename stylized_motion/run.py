@@ -45,6 +45,7 @@ COMMANDS: dict[tuple[str, str], str] = {
     ("visualize", "realtime"): "stylized_motion.anim.realtime_fsq_controller",
     ("visualize", "plot"): "stylized_motion.anim.visualization",
     ("preprocess", "soma-assets"): "stylized_motion.anim.soma_assets",
+    ("preprocess", "quinn-assets"): "stylized_motion.anim.quinn_to_soma_assets",
 }
 
 

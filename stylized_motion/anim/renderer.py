@@ -37,11 +37,20 @@ class Renderer:
         SetShaderValue(view.shaders[shader_key], view.shader_locs[f"{prefix}_use_normal_map"], view.use_normal_map_ptr, SHADER_UNIFORM_INT)
         SetShaderValue(view.shaders[shader_key], view.shader_locs[f"{prefix}_ground_pattern"], view.ground_pattern_ptr, SHADER_UNIFORM_INT)
         if material.base_color_map is not None:
-            SetShaderValueTexture(view.shaders[shader_key], view.shader_locs[f"{prefix}_base_color_map"], material.base_color_map)
+            set_shader_value_texture_slot(
+                view.shaders[shader_key], view.shader_locs[f"{prefix}_base_color_map"],
+                material.base_color_map, view.base_color_map_slot_ptr,
+            )
         if material.metallic_roughness_map is not None:
-            SetShaderValueTexture(view.shaders[shader_key], view.shader_locs[f"{prefix}_metallic_roughness_map"], material.metallic_roughness_map)
+            set_shader_value_texture_slot(
+                view.shaders[shader_key], view.shader_locs[f"{prefix}_metallic_roughness_map"],
+                material.metallic_roughness_map, view.metallic_roughness_map_slot_ptr,
+            )
         if material.normal_map is not None:
-            SetShaderValueTexture(view.shaders[shader_key], view.shader_locs[f"{prefix}_normal_map"], material.normal_map)
+            set_shader_value_texture_slot(
+                view.shaders[shader_key], view.shader_locs[f"{prefix}_normal_map"],
+                material.normal_map, view.normal_map_slot_ptr,
+            )
 
     def _bind_ibl_textures(self) -> bool:
         """Bind IBL textures only when the resource chain was initialized."""

@@ -76,6 +76,7 @@ def main():
     parser.add_argument("--base-color-map", type=Path, default=None, help="Optional sRGB base-color map applied to the character's default material.")
     parser.add_argument("--normal-map", type=Path, default=None, help="Optional tangent-space normal map applied to the character's default material.")
     parser.add_argument("--metallic-roughness-map", type=Path, default=None, help="Optional linear map (R=metallic, G=roughness, B=AO) applied to the character's default material.")
+    parser.add_argument("--character-tint", type=int, nargs="+", default=None, metavar="C", help="Draw tint applied to the character (RGB or RGBA, 0-255). Defaults to white when a base-color map is set, else the viewer's character color.")
     parser.add_argument("--sun-strength", type=float, default=None, help="Direct light intensity. Defaults to the per-shading light rig value (PBR: 0.55, legacy: 0.25).")
     parser.add_argument("--sun-temperature", type=float, default=None, metavar="K", help="Direct light color temperature in Kelvin (1500-20000).")
     parser.add_argument("--sky-temperature", type=float, default=None, metavar="K", help="Ambient/sky color temperature in Kelvin (1500-20000).")
@@ -123,6 +124,7 @@ def main():
         base_color_map=args.base_color_map,
         normal_map=args.normal_map,
         metallic_roughness_map=args.metallic_roughness_map,
+        character_tint=args.character_tint,
         sun_strength=args.sun_strength,
         sun_temperature=args.sun_temperature,
         sky_temperature=args.sky_temperature,
