@@ -20,6 +20,13 @@ import yaml
 from .fsq import FSQMotionAutoencoder
 from .latent_residual_fsq import LatentResidualPartFSQMotionAutoencoder
 from .latent_residual_fsq_v2 import LatentResidualPartFSQV2MotionAutoencoder
+from .nef_fsq import NEFMotionAutoencoder
+from .nef_layout import (
+    NEF_ARCHITECTURE_VERSION,
+    NEF_STREAM_COORDINATES,
+    NEF_STREAM_NAMES,
+    NEF_VARIANT,
+)
 from .part_fsq import HierarchicalPartFSQMotionAutoencoder
 from .part_layout import GROUP_COORDINATES as PART_GROUP_COORDINATES
 from .part_layout import GROUP_NAMES as PART_GROUP_NAMES
@@ -35,6 +42,7 @@ PART_FSQ_FAMILY = "part_fsq"
 RESIDUAL_PART_FSQ_FAMILY = "residual_part_fsq"
 LATENT_RESIDUAL_FSQ_FAMILY = "latent_residual_fsq"
 LATENT_RESIDUAL_FSQ_V2_FAMILY = "latent_residual_fsq_v2"
+NEF_FSQ_FAMILY = "nef_fsq"
 REPRESENTATION_FAMILIES = frozenset(
     {
         FLAT_FSQ_FAMILY,
@@ -42,6 +50,7 @@ REPRESENTATION_FAMILIES = frozenset(
         RESIDUAL_PART_FSQ_FAMILY,
         LATENT_RESIDUAL_FSQ_FAMILY,
         LATENT_RESIDUAL_FSQ_V2_FAMILY,
+        NEF_FSQ_FAMILY,
     }
 )
 
@@ -51,6 +60,7 @@ LEGACY_MODEL_FAMILY = {
     RESIDUAL_PART_FSQ_FAMILY: "residual_part_fsq",
     LATENT_RESIDUAL_FSQ_FAMILY: "latent_residual_part_fsq",
     LATENT_RESIDUAL_FSQ_V2_FAMILY: "latent_residual_part_fsq_v2",
+    NEF_FSQ_FAMILY: "nef_fsq",
 }
 
 
@@ -142,6 +152,10 @@ def _default_layout(family: str, coordinates: int) -> tuple[tuple[str, ...], tup
         return tuple(PART_GROUP_NAMES), tuple(
             (name, int(PART_GROUP_COORDINATES[name])) for name in PART_GROUP_NAMES
         )
+    if family == NEF_FSQ_FAMILY:
+        return tuple(NEF_STREAM_NAMES), tuple(
+            (name, int(NEF_STREAM_COORDINATES[name])) for name in NEF_STREAM_NAMES
+        )
     if family in {RESIDUAL_PART_FSQ_FAMILY, LATENT_RESIDUAL_FSQ_FAMILY, LATENT_RESIDUAL_FSQ_V2_FAMILY}:
         return tuple(RESIDUAL_GROUP_NAMES), tuple(
             (name, int(RESIDUAL_GROUP_COORDINATES[name])) for name in RESIDUAL_GROUP_NAMES
@@ -231,20 +245,30 @@ def _spec_from_values(
         architecture_version = 3 if architecture_version is None else int(architecture_version)
         if architecture_version != 3:
             raise ValueError("Latent Residual-FSQ V2 requires architecture_version=3")
+    if family == NEF_FSQ_FAMILY:
+        architecture_version = (
+            NEF_ARCHITECTURE_VERSION if architecture_version is None else int(architecture_version)
+        )
+        if architecture_version != NEF_ARCHITECTURE_VERSION:
+            raise ValueError(f"NEF-FSQ requires architecture_version={NEF_ARCHITECTURE_VERSION}")
     expected_variant = {
         FLAT_FSQ_FAMILY: "flat",
         PART_FSQ_FAMILY: "hierarchical",
         RESIDUAL_PART_FSQ_FAMILY: "default",
         LATENT_RESIDUAL_FSQ_FAMILY: "v2",
         LATENT_RESIDUAL_FSQ_V2_FAMILY: "v2",
+        NEF_FSQ_FAMILY: NEF_VARIANT,
     }[family]
     if variant != expected_variant:
         raise ValueError(f"{family} requires variant={expected_variant!r}")
-    representation_id = str(
-        metadata.get("representation_id")
-        or f"{family}_{coordinates}x{levels}"
+    # NEF-FSQ folds its variant into the persisted identity: 40x9 alone does
+    # not identify a coordinate order, so the family/variant pair must match.
+    expected_id = (
+        f"{family}_{expected_variant}_{coordinates}x{levels}"
+        if family == NEF_FSQ_FAMILY
+        else f"{family}_{coordinates}x{levels}"
     )
-    expected_id = f"{family}_{coordinates}x{levels}"
+    representation_id = str(metadata.get("representation_id") or expected_id)
     if representation_id != expected_id:
         raise ValueError(f"representation_id={representation_id!r} does not match {expected_id!r}")
     temporal_downsample = int(metadata.get("temporal_downsample", 1))
@@ -341,7 +365,8 @@ class RepresentationAdapter(nn.Module):
                 "group_codes", "group_indices", "base_codes", "base_indices",
                 "part_codes", "part_indices", "base_recon_state", "edit_recon_state",
                 "part_residuals", "part_latent_residuals", "latent_residual_energy",
-                "group_coordinate_change_rates", "edit_part", "donor_permutation",
+                "group_coordinate_change_rates", "stream_codes", "stream_indices",
+                "stream_coordinate_change_rates", "edit_part", "donor_permutation",
             }
             metrics = {key: value for key, value in result.items() if key not in standard}
         result["representation_metrics"] = metrics
@@ -379,6 +404,10 @@ class RepresentationAdapter(nn.Module):
         }
         if self.family == LATENT_RESIDUAL_FSQ_FAMILY:
             result["part_latent_dims"] = list(getattr(self.module, "part_latent_dims"))
+        if self.family == NEF_FSQ_FAMILY:
+            # Persist the stream/feature ownership so a restore can reject a
+            # checkpoint whose partition no longer matches.
+            result["nef_layout"] = self.module.layout.to_dict()
         return result
 
     def compute_representation_losses(
@@ -425,6 +454,7 @@ def build_representation(
         RESIDUAL_PART_FSQ_FAMILY: ResidualPartFSQMotionAutoencoder,
         LATENT_RESIDUAL_FSQ_FAMILY: LatentResidualPartFSQMotionAutoencoder,
         LATENT_RESIDUAL_FSQ_V2_FAMILY: LatentResidualPartFSQV2MotionAutoencoder,
+        NEF_FSQ_FAMILY: NEFMotionAutoencoder,
     }
     model = classes[family](**model_config)
     if int(getattr(model, "motion_dim")) != int(model_config["motion_dim"]):
@@ -503,11 +533,14 @@ def load_representation_checkpoint(
         feature_schema=feature_schema or representation_metadata_value.get("feature_schema"),
     )
     expected = adapter.representation_metadata()
-    for key in (
+    compared_keys = [
         "family", "variant", "representation_id", "num_coordinates", "num_levels",
         "coordinate_order", "coordinate_counts", "temporal_downsample", "lookahead_frames",
         "receptive_field", "decoder_passes_inference", "architecture_version",
-    ):
+    ]
+    if expected.get("nef_layout") is not None:
+        compared_keys.append("nef_layout")
+    for key in compared_keys:
         if representation_metadata_value.get(key) != expected.get(key):
             raise ValueError(f"Checkpoint representation metadata mismatch at {key!r}")
     checkpoint_schema = representation_metadata_value.get("feature_schema")
@@ -535,6 +568,7 @@ __all__ = [
     "RESIDUAL_PART_FSQ_FAMILY",
     "LATENT_RESIDUAL_FSQ_FAMILY",
     "LATENT_RESIDUAL_FSQ_V2_FAMILY",
+    "NEF_FSQ_FAMILY",
     "REPRESENTATION_FAMILIES",
     "RepresentationAdapter",
     "RepresentationProtocol",

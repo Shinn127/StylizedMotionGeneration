@@ -11,6 +11,7 @@ from stylized_motion.learning.representation import (
     FLAT_FSQ_FAMILY,
     LATENT_RESIDUAL_FSQ_FAMILY,
     LATENT_RESIDUAL_FSQ_V2_FAMILY,
+    NEF_FSQ_FAMILY,
     PART_FSQ_FAMILY,
     RESIDUAL_PART_FSQ_FAMILY,
     build_representation,
@@ -50,6 +51,10 @@ def _config(name: str, *, small: bool = True) -> dict[str, object]:
     model_config = dict(representation["config"])
     if representation["family"] == FLAT_FSQ_FAMILY:
         model_config.update({"motion_dim": 230, "code_dim": 8, "width": 8})
+    elif representation["family"] == NEF_FSQ_FAMILY:
+        # NEF-FSQ resolves its streams from the recorded Geno/SOMA tables, so
+        # this synthetic skeleton only carries the spec-level contract.
+        model_config.update({"motion_dim": 230, "names": names, "parents": parents, "stream_dim": 8})
     else:
         model_config.update({"motion_dim": 230, "names": names, "parents": parents})
         if small:
@@ -75,6 +80,7 @@ def test_canonical_configs_and_specs_are_explicit():
         "residual_part_fsq_40x9.yaml": (RESIDUAL_PART_FSQ_FAMILY, "default", "residual_part_fsq_40x9"),
         "latent_residual_fsq_40x9.yaml": (LATENT_RESIDUAL_FSQ_FAMILY, "v2", "latent_residual_fsq_40x9"),
         "latent_residual_fsq_v2_40x9.yaml": (LATENT_RESIDUAL_FSQ_V2_FAMILY, "v2", "latent_residual_fsq_v2_40x9"),
+        "nef_fsq_40x9.yaml": (NEF_FSQ_FAMILY, "independent", "nef_fsq_independent_40x9"),
     }
     for filename, identity in expected.items():
         spec = representation_spec(_config(filename))

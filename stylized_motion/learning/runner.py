@@ -810,6 +810,7 @@ def _family_cli(value: str) -> str:
         "residual-part-fsq": "residual_part_fsq",
         "latent-residual-fsq": "latent_residual_fsq",
         "latent-residual-fsq-v2": "latent_residual_fsq_v2",
+        "nef-fsq": "nef_fsq",
     }
     if value not in mapping:
         raise ValueError(f"Unsupported --representation {value!r}")
@@ -819,7 +820,7 @@ def _family_cli(value: str) -> str:
 def build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train, validate, or test one canonical FSQ representation.")
     parser.add_argument("--workflow-mode", choices=["train", "validate", "test"], required=True)
-    parser.add_argument("--representation", choices=["flat-fsq", "part-fsq", "residual-part-fsq", "latent-residual-fsq", "latent-residual-fsq-v2"], required=True)
+    parser.add_argument("--representation", choices=["flat-fsq", "part-fsq", "residual-part-fsq", "latent-residual-fsq", "latent-residual-fsq-v2", "nef-fsq"], required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")

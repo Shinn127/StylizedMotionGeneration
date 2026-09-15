@@ -1,0 +1,5 @@
+# NEF-FSQ canonical training preset (pruned Geno/100STYLE skeleton).
+--mode train
+--pipeline representation
+--representation nef-fsq
+--config data/configs/nef_fsq_40x9.yaml

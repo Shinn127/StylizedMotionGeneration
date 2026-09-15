@@ -37,6 +37,7 @@ COMMANDS: dict[tuple[str, str], str] = {
     ("test", "representation"): "stylized_motion.learning.runner",
     ("train", "generator"): "stylized_motion.learning.generate",
     ("generate", "motion"): "stylized_motion.learning.generate",
+    ("evaluate", "nef-fsq"): "stylized_motion.learning.nef_eval",
     ("visualize", "motion"): "stylized_motion.anim.view_motion_sequence",
     ("visualize", "part-edit"): "stylized_motion.anim.view_part_edit",
     ("visualize", "genoview"): "stylized_motion.anim.genoview",
@@ -149,6 +150,7 @@ def _validate_representation_dispatch(raw_args: list[str], parser: argparse.Argu
         "residual-part-fsq": "residual_part_fsq",
         "latent-residual-fsq": "latent_residual_fsq",
         "latent-residual-fsq-v2": "latent_residual_fsq_v2",
+        "nef-fsq": "nef_fsq",
     }.get(representation_cli)
     if expected is None:
         parser.error(f"Unsupported canonical representation {representation_cli!r}")
