@@ -45,6 +45,7 @@ docs/
   MTS_FSQ_SIGGRAPH_Implementation_Plan_zh.md  MTS-FSQ 研究方案
   mts_operator_landing.md                     MTS-FSQ 落地对照与未验证项
   nef_phase0_probe.md                         NEF Phase 0 探针使用说明
+  seed_1h_run_report.md                       BONES-SEED 全量数据 + 1 小时训练记录
   bones_seed_data_pipeline_plan.md          SEED 数据管线迁移方案
   bones_seed_pipeline_implementation.md     落地范围、验证情况与待办
   assets/pbr_baseline/        受版本控制的离屏渲染回归图像
@@ -149,6 +150,7 @@ python -m stylized_motion.run --mode benchmark --pipeline data \
 ```
 
 落地范围、已验证内容与待办见 [docs/bones_seed_pipeline_implementation.md](docs/bones_seed_pipeline_implementation.md)。
+全量数据构建与 1 小时 NEF-FSQ 训练的实测数字见 [docs/seed_1h_run_report.md](docs/seed_1h_run_report.md)。
 
 ## Representation 训练
 
