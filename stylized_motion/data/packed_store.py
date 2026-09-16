@@ -50,6 +50,7 @@ DEFAULT_SHARD_BYTES = 256 * 1024 * 1024
 SPLIT_IDS = {"train": 0, "val": 1, "test": 2}
 SPLIT_NAMES = ("train", "val", "test")
 
+#: Columns every store must carry.
 CLIP_TABLE_ARRAYS = {
     "clip_shard": np.int32,
     "clip_offset": np.int64,
@@ -63,6 +64,14 @@ CLIP_TABLE_ARRAYS = {
     "clip_action_id": np.int32,
     "clip_package_id": np.int32,
 }
+
+#: Columns written by newer builds.  A store without them stays loadable and
+#: reports the value as unknown (-1) instead of failing: label tables are
+#: metadata, not feature bytes.
+CLIP_TABLE_OPTIONAL_ARRAYS = {
+    "clip_performer_id": np.int32,
+}
+CLIP_UNKNOWN_LABEL_ID = -1
 
 
 def skeleton_hash(names: Sequence[str], parents: Sequence[int], joint_subset: str) -> str:
@@ -100,6 +109,7 @@ class ClipTableEntry:
     style_id: int = 0
     action_id: int = 0
     package_id: int = 0
+    performer_id: int = CLIP_UNKNOWN_LABEL_ID
     move_name: str = ""
     relative_path: str = ""
     position_sum: np.ndarray | None = None
@@ -176,6 +186,7 @@ class PackedFeatureStoreWriter:
         style_id: int = 0,
         action_id: int = 0,
         package_id: int = 0,
+        performer_id: int = CLIP_UNKNOWN_LABEL_ID,
         move_name: str = "",
         relative_path: str = "",
         position_sum: np.ndarray | None = None,
@@ -215,6 +226,7 @@ class PackedFeatureStoreWriter:
             style_id=int(style_id),
             action_id=int(action_id),
             package_id=int(package_id),
+            performer_id=int(performer_id),
             move_name=str(move_name),
             relative_path=str(relative_path),
             position_sum=position_value,
@@ -308,9 +320,14 @@ class PackedFeatureStore:
     motion_dim: int
     feature_schema_hash: str
     skeleton_hash: str
+    #: Optional build metadata: -1 marks an unknown performer (see
+    #: ``CLIP_TABLE_OPTIONAL_ARRAYS``), so stores built before this column
+    #: existed keep loading and report an empty performer.
+    clip_performer_id: np.ndarray | None = None
     source_style_names: tuple[str, ...] = ()
     source_action_names: tuple[str, ...] = ()
     source_package_names: tuple[str, ...] = ()
+    source_performer_names: tuple[str, ...] = ()
     root_files: list[Path] = field(default_factory=list)
     max_open_shards: int = 16
     normalization: FeatureNormalization | None = None
@@ -460,6 +477,11 @@ class PackedFeatureStore:
 
     def clip_label(self, clip_idx: int) -> dict[str, Any]:
         clip_idx = int(clip_idx)
+        performer = ""
+        if self.clip_performer_id is not None and self.source_performer_names:
+            performer_id = int(self.clip_performer_id[clip_idx])
+            if 0 <= performer_id < len(self.source_performer_names):
+                performer = str(self.source_performer_names[performer_id])
         return {
             "clip_id": clip_idx,
             "source_group": int(self.clip_source_group[clip_idx]),
@@ -476,6 +498,7 @@ class PackedFeatureStore:
             "package": self.source_package_names[int(self.clip_package_id[clip_idx])]
             if self.source_package_names
             else "",
+            "performer": performer,
         }
 
     # -- split-scoped views -------------------------------------------------
@@ -545,6 +568,12 @@ def _load_clip_table(database: Path) -> dict[str, np.ndarray]:
         arrays["clip_position_sum"] = np.load(position_path, mmap_mode="r")
     else:
         arrays["clip_position_sum"] = np.zeros((len(arrays["clip_shard"]), 0, 3), dtype=np.float64)
+    for key, dtype in CLIP_TABLE_OPTIONAL_ARRAYS.items():
+        optional_path = table_dir / f"{key}.npy"
+        if optional_path.exists():
+            arrays[key] = np.load(optional_path, mmap_mode="r")
+        else:
+            arrays[key] = np.full(len(arrays["clip_shard"]), CLIP_UNKNOWN_LABEL_ID, dtype=dtype)
     return arrays
 
 
@@ -564,6 +593,13 @@ def write_clip_table(staging: Path, entries: Sequence[ClipTableEntry], *, num_jo
         "clip_action_id": np.asarray([entry.action_id for entry in entries], dtype=np.int32),
         "clip_package_id": np.asarray([entry.package_id for entry in entries], dtype=np.int32),
     }
+    performer_ids = np.asarray(
+        [entry.performer_id for entry in entries], dtype=CLIP_TABLE_OPTIONAL_ARRAYS["clip_performer_id"]
+    )
+    if bool((performer_ids >= 0).any()):
+        # Only write the column when a build actually resolved performers, so an
+        # older store layout is not silently relabelled as "all unknown".
+        arrays["clip_performer_id"] = performer_ids
     for key, values in arrays.items():
         np.save(table_dir / f"{key}.npy", values)
     position = np.zeros((len(entries), int(num_joints), 3), dtype=np.float64)
@@ -704,6 +740,8 @@ def open_packed_feature_store(
         source_style_names=tuple(str(value) for value in manifest.get("style_names", [])),
         source_action_names=tuple(str(value) for value in manifest.get("action_names", [])),
         source_package_names=tuple(str(value) for value in manifest.get("package_names", [])),
+        clip_performer_id=table.get("clip_performer_id"),
+        source_performer_names=tuple(str(value) for value in manifest.get("performer_names", [])),
         root_files=root_files,
         max_open_shards=int(max_open_shards),
         normalization=normalization,

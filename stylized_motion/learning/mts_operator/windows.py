@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from stylized_motion.learning.nef_probe import model_space_window, read_probe_window
+from stylized_motion.learning.nef_data import model_space_window, read_sampler_window
 
 from .layout_adapter import LayoutAdapter
 
@@ -59,7 +59,7 @@ def read_window_tokens(
             f"Feature-store windows must be requested with target_frames={frames}, "
             f"got {request.target_frames}"
         )
-    window = read_probe_window(store, request, history=int(history), shards=shards)
+    window = read_sampler_window(store, request, history=int(history), shards=shards)
     motion = model_space_window(window, store, feature_stats)
     device = next(tokenizer.parameters()).device
     with torch.no_grad():

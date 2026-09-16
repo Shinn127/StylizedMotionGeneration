@@ -19,7 +19,7 @@ import torch
 
 from stylized_motion.anim import quat
 from stylized_motion.anim.features import denormalize_motion_features
-from stylized_motion.data import open_feature_store
+from stylized_motion.data import open_any_feature_store
 from stylized_motion.data.sampling import FixedWindowSampler
 from stylized_motion.learning.losses import (
     _masked_weighted_mean,
@@ -33,6 +33,11 @@ from stylized_motion.learning.nef_layout import (
     NEF_STREAM_NAMES,
     NEFLayout,
     nef_edit_streams,
+)
+from stylized_motion.learning.nef_data import (
+    read_clip_window,
+    read_sampler_window,
+    store_length,
 )
 from stylized_motion.learning.representation import NEF_FSQ_FAMILY, load_representation_checkpoint
 from stylized_motion.learning.runner import choose_device
@@ -150,31 +155,27 @@ def _mean_of(values: Mapping[str, list[float]]) -> dict[str, float]:
 
 
 def read_window(store, range_idx: int, relative_start: int, length: int, history: int):
-    """Reads [history + length] stored feature frames with left padding."""
-    if range_idx < 0 or range_idx >= len(store.range_names):
-        raise ValueError(f"Range index {range_idx} must be in [0, {len(store.range_names) - 1}]")
+    """Reads ``[history + length]`` feature frames with left padding.
+
+    ``range_idx`` is a v3 range row or a v4 clip row, and ``relative_start`` is
+    relative to that row's start.  Both store generations are served by the same
+    shared reader (``nef_data.read_clip_window``).
+    """
+    total = store_length(store)
+    if range_idx < 0 or range_idx >= total:
+        raise ValueError(f"Range index {range_idx} must be in [0, {total - 1}]")
     if relative_start < 0 or length <= 0:
         raise ValueError("Range-relative start must be non-negative and length positive")
-    range_start = int(store.range_starts[range_idx])
-    range_stop = int(store.range_stops[range_idx])
-    absolute_start = range_start + relative_start
-    absolute_stop = absolute_start + length
-    if absolute_stop > range_stop:
-        raise ValueError(
-            f"Requested range-relative [{relative_start}, {relative_start + length}) "
-            f"exceeds range {range_idx} length {range_stop - range_start}"
-        )
-    shard_idx = int(store.range_shard_indices[range_idx])
-    motion = np.load(store.motion_files[shard_idx], mmap_mode="r", allow_pickle=False)
-    wanted_start = absolute_start - history
-    read_start = max(range_start, wanted_start)
-    window = np.asarray(motion[read_start:absolute_stop], dtype=np.float32).copy()
-    left_pad = read_start - wanted_start
-    if left_pad:
-        window = np.concatenate((np.repeat(window[:1], left_pad, axis=0), window), axis=0)
-    planned = history + length
-    if window.shape != (planned, store.motion_dim):
-        raise RuntimeError(f"Expected window {(planned, store.motion_dim)}, got {window.shape}")
+    from stylized_motion.learning.nef_data import split_clip_geometry
+
+    _shard, offset, _clip_length = split_clip_geometry(store, int(range_idx))
+    window, shard_idx = read_clip_window(
+        store,
+        int(range_idx),
+        offset + int(relative_start),
+        int(length),
+        history=int(history),
+    )
     return window, shard_idx
 
 
@@ -270,7 +271,7 @@ def validate_checkpoint_store(checkpoint, model, store) -> None:
 
 
 def run_report(args: argparse.Namespace) -> dict[str, object]:
-    store = open_feature_store(args.feature_database)
+    store = open_any_feature_store(args.feature_database)
     try:
         checkpoint, model = load_representation_checkpoint(args.checkpoint, torch.device("cpu"))
         _validate_nef_model(model)
@@ -301,7 +302,7 @@ def run_report(args: argparse.Namespace) -> dict[str, object]:
         head_sums: dict[str, list[float]] = {}
         with torch.inference_mode():
             for window in windows:
-                raw = np.asarray(store.read_motion(window), dtype=np.float32)
+                raw = np.asarray(read_sampler_window(store, window), dtype=np.float32)
                 motion = torch.from_numpy(renormalize(denormalize_motion_features(raw, store.stats), feature_stats))
                 motion = motion.to(device)[None]
                 output = model(motion, collect_metrics=False)
@@ -382,7 +383,7 @@ def run_report(args: argparse.Namespace) -> dict[str, object]:
 
 
 def run_transfer(args: argparse.Namespace) -> dict[str, object]:
-    store = open_feature_store(args.feature_database)
+    store = open_any_feature_store(args.feature_database)
     try:
         checkpoint, model = load_representation_checkpoint(args.checkpoint, torch.device("cpu"))
         _validate_nef_model(model)

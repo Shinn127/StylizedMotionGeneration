@@ -104,6 +104,12 @@ python scripts/generate_mts_operator.py --checkpoint outputs/mts_operator/birth_
   区域控制由 operator 的 hard mask 提供。
 - **`windows.py` 的 token store 路径**只覆盖 v3 `TokenStore.read_indices`；
   v4 packed token store 需要各自的读取分支（当前走 feature store 在线编码）。
+- **SEED 的 style 标签很粗**：8 个 `content_uniform_style`，其中 `neutral` 占 92%，5 个 style 只有单一
+  content 标签——`audit_style_pairs.py` 会把这两点写进 `warnings`。做 SEED 上的算子实验前需要先决定
+  风格来源（class balance、`content_all_rigplay_styles`，或换用 100STYLE）。
+- **当前 SEED store 没有 performer 列**（`performer_analysis: unavailable_no_actor_table`）：
+  zero-shot style 无法排除演员混淆。构建侧已支持（`take_actor` → `clip_performer_id` +
+  manifest `performer_names`），重跑 `packed-feature-store --overwrite` 即可补上。
 - **`evaluate_mts_operator.py` 的 representation × method 全矩阵**未展开：脚本按 checkpoint 评估
   单个方法，矩阵由多次调用 + 外部汇总构成（方案 §6.5 的对照配置已就位，缺的是算力与数据）。
 

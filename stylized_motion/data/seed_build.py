@@ -41,6 +41,7 @@ from stylized_motion.anim import bvh
 from stylized_motion.anim.features import build_motion_feature_components, joint_feature_dim
 from stylized_motion.data.normalization import compute_normalization
 from stylized_motion.data.packed_store import (
+    CLIP_UNKNOWN_LABEL_ID,
     ClipTableEntry,
     PackedFeatureStoreWriter,
     feature_schema_hash,
@@ -507,10 +508,13 @@ class PackedClipPlan:
     style_id: int
     action_id: int
     package_id: int
+    performer_id: int
     position_sum: np.ndarray
 
 
-def _label_ids(catalog: SeedCatalog) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+def _label_ids(
+    catalog: SeedCatalog,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int]]:
     def build(field: str) -> dict[str, int]:
         values: list[str] = []
         for clip in catalog.clips:
@@ -519,7 +523,16 @@ def _label_ids(catalog: SeedCatalog) -> tuple[dict[str, int], dict[str, int], di
                 values.append(raw)
         return {name: index for index, name in enumerate(sorted(values))}
 
-    return build("content_uniform_style"), build("package"), build("category")
+    # Actor labels come from the catalogue's take metadata, not from the CSV
+    # label block: they are what a performer holdout needs, and the store cannot
+    # recover them later without re-reading the catalogue.
+    actors = sorted({str(clip.take_actor or clip.actor_uid) for clip in catalog.clips if (clip.take_actor or clip.actor_uid)})
+    return (
+        build("content_uniform_style"),
+        build("package"),
+        build("category"),
+        {name: index for index, name in enumerate(actors)},
+    )
 
 
 def plan_packed_clips(
@@ -536,7 +549,7 @@ def plan_packed_clips(
     the *same* source group, marked with the generated-mirror variant, so the
     sampler keeps treating the group as one source.
     """
-    style_ids, package_ids, category_ids = _label_ids(catalog)
+    style_ids, package_ids, category_ids, performer_ids = _label_ids(catalog)
     index: dict[tuple[int, bool], UnitResult] = {}
     for result in results.values():
         index[(int(result.clip_id), bool(result.extra.get("mirror")))] = result
@@ -576,6 +589,9 @@ def plan_packed_clips(
                     style_id=style_ids.get(clip.labels.get("content_uniform_style", "") or "__unknown__", 0),
                     action_id=category_ids.get(clip.labels.get("category", "") or "__unknown__", 0),
                     package_id=package_ids.get(clip.labels.get("package", "") or "__unknown__", 0),
+                    performer_id=performer_ids.get(
+                        str(clip.take_actor or clip.actor_uid), CLIP_UNKNOWN_LABEL_ID
+                    ),
                     position_sum=np.asarray(sidecar["position_sum"], dtype=np.float64),
                 )
             )
@@ -695,6 +711,7 @@ def pack_clips(
                     style_id=plan.style_id,
                     action_id=plan.action_id,
                     package_id=plan.package_id,
+                    performer_id=plan.performer_id,
                     move_name=plan.move_name,
                     relative_path=plan.relative_path,
                     position_sum=plan.position_sum,
@@ -709,6 +726,7 @@ def pack_clips(
                 style_id=plan.style_id,
                 action_id=plan.action_id,
                 package_id=plan.package_id,
+                performer_id=plan.performer_id,
                 move_name=plan.move_name,
                 relative_path=plan.relative_path,
                 position_sum=plan.position_sum,
@@ -959,10 +977,11 @@ def build_packed_feature_store(
         purge_units=bool(config.purge_units),
     )
     write_clip_table(staging, entries, num_joints=len(names))
-    style_ids, package_ids, category_ids = _label_ids(catalog)
+    style_ids, package_ids, category_ids, performer_ids = _label_ids(catalog)
     styles = [name for name, _index in sorted(style_ids.items(), key=lambda item: item[1])]
     packages = [name for name, _index in sorted(package_ids.items(), key=lambda item: item[1])]
     categories = [name for name, _index in sorted(category_ids.items(), key=lambda item: item[1])]
+    performers = [name for name, _index in sorted(performer_ids.items(), key=lambda item: item[1])]
     shard_files = sorted(path.relative_to(staging).as_posix() for path in (staging / "motion").glob("shard_*.npy"))
     if len(shard_files) != int(pack_report["shards"]):
         raise SeedBuildError(
@@ -985,6 +1004,7 @@ def build_packed_feature_store(
         "style_names": styles,
         "action_names": categories,
         "package_names": packages,
+        "performer_names": performers,
         "dataset": catalog.manifest.get("dataset", ""),
         "metadata_csv": catalog.manifest.get("metadata_csv", ""),
         # SEED's labels do not mean what the 100STYLE style/action fields meant,
@@ -993,6 +1013,7 @@ def build_packed_feature_store(
             "style": "content_uniform_style",
             "action": "category",
             "package": "package",
+            "performer": "take_actor (actor_uid fallback); empty when the catalogue has neither",
             "source_group": "take group: take_date + take_actor + take_org_name + canonical move name",
             "variant": "0=original, 1=official mirror, 2=generated mirror",
         },

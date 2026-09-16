@@ -139,14 +139,18 @@ def split_styles_by_performer(
 
     A style whose performer also appears in the training styles is not a
     zero-shot style: the model could recognise the performer instead of the
-    style.  Those styles therefore fill the validation split first.
+    style.  When the records carry no performer labels at all (some stores have
+    no actor table) the split degrades to a style-only split and
+    :func:`build_pair_audit` reports that the performer analysis was not
+    possible — an honest "unknown" beats a fabricated overlap.
     """
     if not 0.0 <= val_fraction < 1.0 or not 0.0 <= unseen_fraction < 1.0:
         raise ValueError("val_fraction and unseen_fraction must be in [0, 1)")
     performers_of: dict[str, set[str]] = defaultdict(set)
     for record in records:
-        performers_of[record.style].add(record.performer)
-    styles = sorted(performers_of)
+        if record.performer:
+            performers_of[record.style].add(record.performer)
+    styles = sorted({record.style for record in records})
     if len(styles) < 3:
         raise ValueError(f"The audit needs at least three styles, found {len(styles)}")
     rng = np.random.default_rng(seed)
@@ -158,7 +162,11 @@ def split_styles_by_performer(
     # Validation prefers overlapping performers; the rest becomes training.
     overlapping = [style for style in remaining if performers_of[style] & unseen_performers]
     val_count = int(round(val_fraction * len(styles)))
-    val = overlapping[:val_count]
+    if overlapping:
+        val = overlapping[:val_count]
+    else:
+        # No usable performer information: hold out whole styles directly.
+        val = remaining[:val_count]
     train = [style for style in remaining if style not in val]
     if not train:
         raise ValueError("No styles left for training; lower val_fraction/unseen_fraction")
@@ -187,18 +195,51 @@ def build_pair_audit(
     for record in records:
         clips_per_style[record.style] += 1
         contents_per_style[record.style].add(record.content)
-        performers_per_style[record.style].add(record.performer)
+        if record.performer:
+            # An empty label means "unknown"; treating it as a performer would
+            # make the overlap analysis look measured when it is not.
+            performers_per_style[record.style].add(record.performer)
         frames_per_style[record.style] += int(record.frames)
 
+    performers_known = any(performers_per_style.get(style) for style in performers_per_style)
+    performer_analysis = "overlap_reported" if performers_known else "unavailable_no_actor_table"
     train_performers = {
         performer
         for style in split.train_styles
         for performer in performers_per_style.get(style, set())
     }
-    performer_overlap = {
-        style: sorted(performers_per_style.get(style, set()) & train_performers)
-        for style in split.test_unseen_styles
-    }
+    performer_overlap = (
+        {
+            style: sorted(performers_per_style.get(style, set()) & train_performers)
+            for style in split.test_unseen_styles
+        }
+        if performers_known
+        else {}
+    )
+    warnings: list[str] = []
+    if not performers_known:
+        warnings.append(
+            "The store carries no actor table, so zero-shot styles cannot be checked "
+            "for performer overlap; the style split is style-only."
+        )
+    total_clips = sum(clips_per_style.values())
+    dominant_style, dominant_clips = clips_per_style.most_common(1)[0]
+    dominant_share = dominant_clips / max(total_clips, 1)
+    if dominant_share >= 0.5:
+        warnings.append(
+            f"Style {dominant_style!r} holds {dominant_share:.0%} of the clips; a single "
+            "majority style dominates any style-conditional objective."
+        )
+    single_content_styles = sorted(
+        style for style, contents in contents_per_style.items() if len(contents) <= 1
+    )
+    if single_content_styles:
+        warnings.append(
+            f"{len(single_content_styles)} of {len(contents_per_style)} styles have a single "
+            f"content label, so same-style/different-content evidence is thin: {single_content_styles[:5]}"
+        )
+    if not split.val_styles:
+        warnings.append("No validation styles were held out; model selection has no style split.")
 
     sampler = StylePairSampler(records, style_split=split, seed=seed)
     leakage = {"same_clip": 0, "same_take": 0, "pairs": 0, "verified": 0}
@@ -222,7 +263,16 @@ def build_pair_audit(
         "content_entropy": {
             style: float(_entropy(sorted(contents))) for style, contents in sorted(contents_per_style.items())
         },
+        "performer_analysis": performer_analysis,
         "performer_overlap": performer_overlap,
+        "style_balance": {
+            "dominant_style": dominant_style,
+            "dominant_share": float(dominant_share),
+            "style_entropy": float(
+                _entropy([style for style, count in clips_per_style.items() for _ in range(count)])
+            ),
+        },
+        "warnings": warnings,
         "same_clip_leakage": leakage["same_take"] + leakage["same_clip"],
         "pair_leakage": leakage,
         "train_styles": list(split.train_styles),
@@ -443,7 +493,7 @@ def clip_records_from_store(store: Any) -> list[ClipRecord]:
             )
             style = str(label.get("style") or "")
             content = str(label.get("action") or label.get("package") or "")
-            performer = _performer_from_group(int(label.get("source_group", -1)), store)
+            performer = _performer_from_store(store, clip_idx, int(label.get("source_group", -1)))
             records.append(
                 ClipRecord(
                     clip_id=int(label["clip_id"]),
@@ -488,12 +538,30 @@ def clip_records_from_store(store: Any) -> list[ClipRecord]:
     return records
 
 
-def _performer_from_group(group: int, store: Any) -> str:
-    """SEED-style group labels carry performer/episode information when present."""
-    labels = getattr(store, "source_group_names", None)
-    if labels and 0 <= group < len(labels):
-        return str(labels[group])
-    return f"group_{group}" if group >= 0 else ""
+def _performer_from_store(store: Any, row: int, group: int) -> str:
+    """Actor label when the store exposes one, otherwise empty ("unknown").
+
+    The packed store carries ``source_performer_names`` plus a per-clip id
+    (``clip_performer_id``, written from the catalogue's take actor).  Older
+    stores and datasets without actor metadata return "" and the audit reports
+    the performer analysis as unavailable: inventing a performer from a group id
+    would make the overlap analysis look measured while it only reported group
+    identity.
+    """
+    names = getattr(store, "source_performer_names", None)
+    ids = getattr(store, "clip_performer_id", None)
+    if names and ids is not None:
+        index = int(ids[int(row)])
+        if 0 <= index < len(names):
+            return str(names[index])
+    for attribute in ("source_actor_names", "actor_names", "source_group_names"):
+        labels = getattr(store, attribute, None)
+        if not labels:
+            continue
+        index = int(group) if attribute == "source_group_names" else int(row)
+        if 0 <= index < len(labels):
+            return str(labels[index])
+    return ""
 
 
 __all__ = [

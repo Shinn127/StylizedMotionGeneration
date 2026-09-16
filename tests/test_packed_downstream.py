@@ -100,7 +100,8 @@ class _RecurrentEncoder:
 
 
 def _write_store(tmp_path: Path, *, clip_lengths: list[int], splits: list[int], groups: list[int],
-                 motions: np.ndarray | None = None, shard_bytes: int = 64 * 1024) -> Path:
+                 motions: np.ndarray | None = None, shard_bytes: int = 64 * 1024,
+                 performers: list[int] | None = None) -> Path:
     staging = tmp_path / "store"
     staging.mkdir(parents=True, exist_ok=True)
     writer = PackedFeatureStoreWriter(
@@ -123,6 +124,7 @@ def _write_store(tmp_path: Path, *, clip_lengths: list[int], splits: list[int], 
             writer.append_clip(
                 values, source_group=groups[row], variant=0, split=splits[row], mirror=False,
                 source_id=groups[row], move_name=f"clip_{row}",
+                performer_id=-1 if performers is None else int(performers[row]),
                 position_sum=values[:, :3].reshape(length, 3)[:3].astype(np.float64),
             )
         )
@@ -153,6 +155,7 @@ def _write_store(tmp_path: Path, *, clip_lengths: list[int], splits: list[int], 
         "total_frames": int(sum(entry.length for entry in entries)),
         "clip_names": [f"clip_{row}" for row in range(len(entries))],
         "style_names": ["s0"],
+        "performer_names": [] if performers is None else [f"actor_{index}" for index in sorted(set(performers))],
         "action_names": ["a0"],
         "package_names": ["p0"],
         "feature_schema": {
@@ -974,3 +977,27 @@ def test_runner_rejects_invalid_budget_values(tmp_path: Path):
             device=torch.device("cpu"),
             epochs=1,
         )
+
+def test_packed_store_carries_optional_performer_labels(tmp_path: Path):
+    """A build that resolved performers records them; an older build stays loadable."""
+    without = _write_store(tmp_path / "plain", clip_lengths=[80, 90], splits=[0, 1], groups=[0, 1])
+    store = open_packed_feature_store(without)
+    try:
+        assert store.clip_performer_id is None or bool((store.clip_performer_id < 0).all())
+        assert store.clip_label(0)["performer"] == ""
+    finally:
+        store.close()
+
+    labelled = _write_store(
+        tmp_path / "labelled", clip_lengths=[80, 90, 100], splits=[0, 0, 1], groups=[0, 1, 2],
+        performers=[0, 2, 1],
+    )
+    store = open_packed_feature_store(labelled)
+    try:
+        assert store.source_performer_names == ("actor_0", "actor_1", "actor_2")
+        assert [store.clip_label(row)["performer"] for row in range(3)] == [
+            "actor_0", "actor_2", "actor_1"
+        ]
+        assert [int(value) for value in store.clip_performer_id] == [0, 2, 1]
+    finally:
+        store.close()

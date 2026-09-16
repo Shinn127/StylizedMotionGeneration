@@ -385,15 +385,6 @@ class _Measurer:
         return list(layout.stream_joints(stream))
 
 
-def module_device(model: torch.nn.Module) -> torch.device:
-    """Device of a module that may hold no parameters (buffers only)."""
-    for tensor in model.parameters():
-        return tensor.device
-    for tensor in model.buffers():
-        return tensor.device
-    return torch.device("cpu")
-
-
 def _masked_mean_vector(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Mean of ``values`` [B, T, F] over the frames selected by ``mask`` [B, T]."""
     weights = mask.to(values.device, values.dtype).unsqueeze(-1)
@@ -875,6 +866,69 @@ def locality_report(
             (change[..., -2:] > 0).any(dim=-1).float().mean()
         )
     return report
+
+
+def json_dumps(report: Mapping[str, Any]) -> str:
+    return json.dumps(report, indent=2, sort_keys=False, default=str)
+
+
+# ---------------------------------------------------------------------------
+# store access: the shared, version-agnostic readers live in nef_data
+
+
+def is_packed_store(store: Any) -> bool:
+    """True for the schema-v4 packed reader, False for the v3 row store."""
+    from stylized_motion.learning.nef_data import is_packed_store as _is_packed
+
+    return _is_packed(store)
+
+
+def split_clip_geometry(store: Any, clip_idx: int) -> tuple[int, int, int]:
+    from stylized_motion.learning.nef_data import split_clip_geometry as _geometry
+
+    return _geometry(store, clip_idx)
+
+
+def read_probe_window(
+    store: Any,
+    request: Any,
+    *,
+    history: int,
+    shards: dict[int, np.ndarray] | None = None,
+) -> np.ndarray:
+    """Reads ``[history + target_frames]`` frames of one sampler request.
+
+    Delegates to the shared reader so the probes, the NEF report and the training
+    loader cannot drift apart.
+    """
+    from stylized_motion.learning.nef_data import read_clip_window
+
+    return read_clip_window(
+        store,
+        int(request.variant_idx),
+        int(request.target_start),
+        int(request.target_frames),
+        history=int(history),
+        shards=shards,
+    )[0]
+
+
+def model_space_window(
+    window: np.ndarray,
+    store: Any,
+    feature_stats: Mapping[str, object],
+) -> torch.Tensor:
+    """Re-normalizes a raw store window into the checkpoint's feature space."""
+    from stylized_motion.learning.nef_data import model_space_window as _model_space
+
+    return _model_space(window, store, feature_stats)
+
+
+def module_device(model: torch.nn.Module) -> torch.device:
+    """Device of a module that may hold no parameters (buffers only)."""
+    from stylized_motion.learning.nef_data import module_device as _device
+
+    return _device(model)
 
 
 def json_dumps(report: Mapping[str, Any]) -> str:

@@ -165,3 +165,7 @@
 - **统计只来自 train**：`train-stats` 只扫 train 区间，`val`/`test` 帧不参与；换 split 或统计不重写特征字节。
 - **可恢复**：unit 命中复用需签名 + 输入指纹 + 输出 checksum 三者同时匹配；训练续跑以「实际训过的样本数」为准（worker 预取会让采样器计数超前，不能用来续跑）。
 - **可追溯**：四组 hash 分开保存，token/trajectory store 各自绑定它们，checkpoint 也记录 `normalization_on` 与 `best_metric_source`。
+- **performer 列可选**：`clip_performer_id` + manifest 的 `performer_names` 来自 catalogue 的 `take_actor`（缺失时回退 `actor_uid`）。
+  没有这列出厂的老 store 仍可打开，`clip_label()` 的 `performer` 返回空串——风格审计据此报告
+  “演员表不可用”，而不是把 group id 当成演员。（当前 `data/processed/seed_soma_pruned_v4` 就是这种老表；
+  重跑一次 `packed-feature-store --overwrite` 即可补上，unit 缓存会复用。）
