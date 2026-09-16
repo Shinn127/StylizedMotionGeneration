@@ -1,0 +1,70 @@
+# MTS base transport (Phase 2): style-free masked content generation on NEF tokens.
+#
+# The tokenizer is frozen and only ever read: this model is p0(Z | C, H), the
+# base distribution the style operator will modify.  Stage 1 (here) conditions on
+# an action id; text conditioning is deliberately not part of the claim.
+tokenizer:
+  representation: nef-fsq
+  checkpoint: outputs/nef_fsq_40x9/best.pt
+  freeze: true
+
+data:
+  fsq_window_index: data/processed/100style_pruned_90/fsq_window_index
+  required_data_schema_version: 3
+  # Set to a token store to skip on-the-fly encoding:
+  #   python -m stylized_motion.run --mode preprocess --pipeline token-database ...
+  token_store:
+
+transport:
+  dim: 256
+  depth: 8
+  heads: 8
+  dropout: 0.1
+  # local_relational = the skeleton stream graph; none = independent streams.
+  graph_mode: local_relational
+  graph_depth: 2
+  temporal_mode: bidirectional
+  # content conditioning: an action id (content_classes) or features (content_dim)
+  content_dim:
+  content_classes:
+
+masking:
+  random_coordinate: 0.20
+  stream: 0.25
+  temporal_span: 0.20
+  spatiotemporal_block: 0.20
+  full_generation: 0.15
+  coordinate_ratio: 0.30
+  stream_ratio: 0.30
+  span_ratio: 0.50
+  block_frames: 16
+  block_coordinates: 8
+
+sampling:
+  strategy: clip_uniform
+  target_frames: 64
+  samples_per_epoch: 100000
+  seed: 3407
+  mirror_probability: 0.5
+
+training:
+  epochs: 100
+  lr: 0.0002
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  precision: fp32
+  seed: 3407
+  log_every_steps: 50
+  steps_per_epoch:
+  max_steps:
+  output_dir: outputs/mts_transport/seed3407
+
+loader:
+  batch_size: 256
+  num_workers: 4
+  pin_memory: auto
+  persistent_workers: true
+  prefetch_factor: 2
+  drop_last_train: true
+  max_open_shards: 32
+  prefetch_memory_limit_mb: 512

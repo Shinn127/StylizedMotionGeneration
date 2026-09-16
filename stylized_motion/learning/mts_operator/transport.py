@@ -145,6 +145,8 @@ class MotionTransportTransformer(nn.Module):
         self.dim = int(dim)
         self.depth = int(depth)
         self.heads = int(heads)
+        self.dropout = float(dropout)
+        self.feedforward_multiplier = int(feedforward_multiplier)
         self.graph_mode = str(graph_mode)
         self.temporal_mode = str(temporal_mode)
         if self.dim <= 0 or self.depth <= 0 or self.heads <= 0:
@@ -160,8 +162,8 @@ class MotionTransportTransformer(nn.Module):
         layer = nn.TransformerEncoderLayer(
             d_model=self.dim,
             nhead=self.heads,
-            dim_feedforward=self.dim * int(feedforward_multiplier),
-            dropout=float(dropout),
+            dim_feedforward=self.dim * self.feedforward_multiplier,
+            dropout=self.dropout,
             activation="gelu",
             batch_first=True,
             norm_first=True,
@@ -282,6 +284,8 @@ class MotionTransportTransformer(nn.Module):
             "dim": self.dim,
             "depth": self.depth,
             "heads": self.heads,
+            "dropout": self.dropout,
+            "feedforward_multiplier": self.feedforward_multiplier,
             "graph_mode": self.graph_mode,
             "graph_depth": len(self.graph.blocks),
             "temporal_mode": self.temporal_mode,
@@ -291,6 +295,85 @@ class MotionTransportTransformer(nn.Module):
             else self.conditioner.content_classes,
         }
 
+
+    @torch.no_grad()
+    def generate(
+        self,
+        *,
+        frames: int,
+        batch: int = 1,
+        visible_tokens: torch.Tensor | None = None,
+        visible_mask: torch.Tensor | None = None,
+        support: torch.Tensor | None = None,
+        steps: int = 8,
+        temperature: float = 1.0,
+        sampler: Any | None = None,
+        valid_mask: torch.Tensor | None = None,
+        content_condition: Any | None = None,
+        generator: torch.Generator | None = None,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        """Iteratively fills a masked support, leaving everything else alone.
+
+        ``support`` is a ``[T, 40]`` boolean mask; only those coordinates are ever
+        written, which is the plan's ``locked_edit`` behaviour: tokens outside the
+        support keep the values they were given and are never re-sampled.
+        ``sampler`` receives the probabilities and returns tokens; the default is
+        a temperature-scaled multinomial draw.
+        """
+        if int(steps) < 1:
+            raise ValueError("steps must be positive")
+        if float(temperature) <= 0.0:
+            raise ValueError("temperature must be positive")
+        device = device or next(self.parameters()).device
+        frames = int(frames)
+        if visible_tokens is None:
+            tokens = torch.zeros(
+                (batch, frames, self.spec.num_coordinates), dtype=torch.long, device=device
+            )
+            visible = torch.zeros(
+                (batch, frames, self.spec.num_coordinates), dtype=torch.bool, device=device
+            )
+        else:
+            tokens = self.spec.validate_tokens(visible_tokens).to(device)
+            if tokens.shape[:2] != (batch, frames):
+                raise ValueError(
+                    f"visible_tokens must be {(batch, frames, self.spec.num_coordinates)}, "
+                    f"got {tuple(tokens.shape)}"
+                )
+            visible = (
+                self.spec.validate_mask(
+                    visible_mask, name="visible_mask", batch=batch, frames=frames
+                ).to(device)
+                if visible_mask is not None
+                else torch.ones(
+                    (batch, frames, self.spec.num_coordinates), dtype=torch.bool, device=device
+                )
+            )
+        if support is not None:
+            support = support.to(device).bool()
+            if support.shape != (frames, self.spec.num_coordinates):
+                raise ValueError(
+                    f"support must be {(frames, self.spec.num_coordinates)}, got {tuple(support.shape)}"
+                )
+        else:
+            support = torch.ones(
+                (frames, self.spec.num_coordinates), dtype=torch.bool, device=device
+            )
+        self.eval()
+        for _ in range(int(steps)):
+            output = self(
+                tokens, visible, content_condition=content_condition, valid_mask=valid_mask
+            )
+            probs = (output.logits / float(temperature)).softmax(dim=-1)
+            if sampler is not None:
+                drawn = sampler(probs)
+            else:
+                flat = probs.reshape(-1, probs.shape[-1])
+                drawn = torch.multinomial(flat, 1, generator=generator).reshape(probs.shape[:-1])
+            tokens = torch.where(support.unsqueeze(0), drawn, tokens)
+            visible = visible | support.unsqueeze(0)
+        return tokens
 
 __all__ = [
     "GRAPH_MODES",
