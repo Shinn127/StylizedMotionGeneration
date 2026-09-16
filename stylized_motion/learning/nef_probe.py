@@ -141,14 +141,14 @@ def far_perturbations(
     values = indices[..., coordinate]
     result = []
     for _ in range(int(samples)):
+        # Draws happen on the generator's own device and then move, so a CPU
+        # generator works with CUDA tokens and vice versa.
         sign = torch.where(
-            torch.rand(values.shape, generator=generator, device=values.device) < 0.5, -1, 1
-        )
+            torch.rand(values.shape, generator=generator) < 0.5, -1, 1
+        ).to(values.device)
         magnitude = magnitudes[
-            torch.randint(
-                magnitudes.numel(), values.shape, generator=generator, device=values.device
-            )
-        ]
+            torch.randint(magnitudes.numel(), values.shape, generator=generator)
+        ].to(values.device)
         result.append(_apply_offsets(indices, coordinate, sign * magnitude, num_levels))
     return tuple(result)
 
@@ -266,11 +266,18 @@ class _Measurer:
         *,
         feature_indices: Mapping[str, torch.Tensor],
         kinematic: KinematicContext | None,
+        stream_joints: Mapping[str, Sequence[int]] | None = None,
+        parents: Sequence[int] | None = None,
     ) -> None:
         self.model = model
         self.feature_indices = feature_indices
-        self.kinematic = kinematic
         self.device = module_device(model)
+        # FK/root/contact metrics must run where the decode runs; keeping the
+        # context on CPU silently worked only because every earlier probe ran on
+        # CPU.
+        self.kinematic = None if kinematic is None else kinematic.to(self.device)
+        self._stream_joints_by_name = dict(stream_joints or {})
+        self._parents = tuple(int(value) for value in (parents or ()))
 
     def decode(self, tokens: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
@@ -336,23 +343,57 @@ class _Measurer:
                 decoded, self.kinematic
             )
             joint_change = (positions - base.positions).norm(dim=-1)  # [B, T, J]
-            joints = torch.as_tensor(
-                self._stream_joints(stream), dtype=torch.long, device=decoded.device
-            )
+            owned_joints = self._stream_joints(stream)
+            joints = torch.as_tensor(owned_joints, dtype=torch.long, device=decoded.device)
             joint_mask = torch.zeros(
                 joint_change.shape[-1], dtype=torch.bool, device=decoded.device
             )
             joint_mask[joints] = True
-            off_target_joints = joint_change[..., ~joint_mask]
-            metrics["fk_owned_mean"] = float(
-                _masked_weighted_mean(joint_change[..., joints], local_valid)
+            # Rotating a joint moves its children, not itself: a stream that owns
+            # one joint's rotation changes FK exactly on that joint's descendants.
+            # Leakage is therefore measured on joints that are neither owned nor
+            # descendants, otherwise every Edge stream would look like a 2 m leak.
+            descendants = kinematic_descendants(self._kinematic_parents(), owned_joints) - set(
+                owned_joints
             )
-            metrics["fk_offtarget_mean"] = float(
-                _masked_weighted_mean(off_target_joints, local_valid)
+            descendant_mask = torch.zeros_like(joint_mask)
+            if descendants:
+                descendant_mask[
+                    torch.as_tensor(sorted(descendants), dtype=torch.long, device=decoded.device)
+                ] = True
+            influenced = joint_mask | descendant_mask
+            off_target_joints = joint_change[..., ~influenced]
+            metrics["owns_joints"] = 1.0 if owned_joints else 0.0
+            metrics["fk_owned_mean"] = (
+                float(_masked_weighted_mean(joint_change[..., joint_mask], local_valid))
+                if bool(joint_mask.any())
+                else 0.0
             )
-            metrics["fk_offtarget_max"] = (
-                float(off_target_joints.max()) if off_target_joints.numel() else 0.0
+            metrics["fk_descendant_mean"] = (
+                float(_masked_weighted_mean(joint_change[..., descendant_mask], local_valid))
+                if bool(descendant_mask.any())
+                else 0.0
             )
+            if owned_joints:
+                metrics["fk_influence_mean"] = float(
+                    _masked_weighted_mean(joint_change[..., influenced], local_valid)
+                )
+                metrics["fk_offtarget_mean"] = float(
+                    _masked_weighted_mean(off_target_joints, local_valid)
+                )
+                metrics["fk_offtarget_max"] = (
+                    float(off_target_joints.max()) if off_target_joints.numel() else 0.0
+                )
+            else:
+                # The global stream owns the root orientation/velocity and the
+                # contacts, so an edit there moves the whole body by construction:
+                # "off-target leakage" is undefined, and only the influence
+                # magnitude is meaningful.
+                metrics["fk_influence_mean"] = float(
+                    _masked_weighted_mean(joint_change, local_valid)
+                )
+                metrics["fk_offtarget_mean"] = 0.0
+                metrics["fk_offtarget_max"] = 0.0
             metrics["root_pos_change"] = float(
                 _masked_weighted_mean(
                     (root_positions[:, 1:] - base.root_positions[:, 1:]).abs(),
@@ -379,10 +420,24 @@ class _Measurer:
         return metrics, direction_vector
 
     def _stream_joints(self, stream: str) -> list[int]:
+        if self._stream_joints_by_name:
+            if stream not in self._stream_joints_by_name:
+                raise ValueError(f"Unknown stream {stream!r} in the supplied ownership table")
+            return list(self._stream_joints_by_name[stream])
         layout = getattr(self.model, "layout", None)
         if layout is None:
             raise ValueError("Kinematic probes require an NEF layout")
         return list(layout.stream_joints(stream))
+
+    def _kinematic_parents(self) -> tuple[int, ...]:
+        if self._parents:
+            return self._parents
+        if self.kinematic is not None:
+            return tuple(int(value) for value in self.kinematic.parents)
+        layout = getattr(self.model, "layout", None)
+        if layout is None:
+            raise ValueError("Kinematic probes require an NEF layout")
+        return tuple(int(value) for value in layout.parents)
 
 
 def _masked_mean_vector(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -452,7 +507,11 @@ class LevelGeometryProbe:
             raise ValueError("decode_rows must be positive")
         self.decode_rows = int(decode_rows)
         self._measurer = _Measurer(
-            module, feature_indices=self.feature_indices, kinematic=kinematic
+            module,
+            feature_indices=self.feature_indices,
+            kinematic=kinematic,
+            stream_joints={stream: layout.stream_joints(stream) for stream in layout.coordinate_order},
+            parents=layout.parents,
         )
         self.device = self._measurer.device
 
@@ -505,6 +564,8 @@ class LevelGeometryProbe:
         valid_counts: dict[tuple[int, str], list[int]] = {}
         metadata = self.layout.coordinate_metadata()
 
+        if generator is None:
+            generator = torch.Generator(device=self.device).manual_seed(0)
         chunk_size = max(1, self.decode_rows // max(batch, 1))
         for start in range(0, len(plan), chunk_size):
             chunk = plan[start : start + chunk_size]
@@ -748,6 +809,8 @@ def locality_report(
     """
     module = getattr(model, "module", model)
     device = module_device(module)
+    if kinematic is not None:
+        kinematic = kinematic.to(device)
     target_indices = target_indices.detach().to(device).long()
     donor_indices = donor_indices.detach().to(device).long()
     if target_indices.shape != donor_indices.shape or target_indices.ndim != 3:

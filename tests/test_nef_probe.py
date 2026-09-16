@@ -167,13 +167,23 @@ def test_level_probe_reports_kinematics_and_rejects_bad_inputs():
     for record in report["per_coordinate"]:
         for kind in ("adjacent", "far"):
             assert "fk_owned_mean" in record[kind]
+            assert "fk_influence_mean" in record[kind]
+            assert "owns_joints" in record[kind]
             assert "contact_flip_rate" in record[kind]
             assert record[kind]["root_pos_change"] >= 0.0
-    # A local stream never moves joints it does not own, exactly.
+    # A local stream never moves joints it neither owns nor descends from.
     arm = report["per_coordinate"][1]
     assert arm["stream"] == "left_arm_node"
+    assert arm["adjacent"]["owns_joints"] == 1.0
     assert arm["adjacent"]["fk_offtarget_max"] == pytest.approx(0.0, abs=0.0)
     assert arm["adjacent"]["fk_owned_mean"] > 0.0
+    # The global stream owns no bones: a root/contact edit moves the whole body,
+    # so its influence is reported over every joint and no leakage is claimed.
+    global_record = report["per_coordinate"][0]
+    assert global_record["stream"] == "global"
+    assert global_record["adjacent"]["owns_joints"] == 0.0
+    assert global_record["adjacent"]["fk_influence_mean"] > 0.0
+    assert global_record["adjacent"]["fk_offtarget_max"] == 0.0
     with pytest.raises(ValueError, match="outside the token width"):
         probe.run(indices, coordinates=[40])
     with pytest.raises(ValueError, match="Expected tokens"):
