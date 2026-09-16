@@ -178,6 +178,31 @@ class LayoutAdapter:
         )
         return values, types
 
+    def message_edges(
+        self, *, device: torch.device | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple[str, ...]]:
+        """Bidirectional message-passing edges.
+
+        Returns ``(source, target, type_ids, direction_ids, types)`` where the
+        skeleton relation is kept per edge and ``direction_ids`` distinguishes
+        the recorded orientation (0, "along the chain") from the reverse (1).
+        Coordination is symmetric — an arm token constrains the shoulder edge
+        and vice versa — so messages must travel both ways.
+        """
+        source, target = self.edge_index(device=device)
+        type_ids, types = self.edge_type_ids(device=device)
+        both_source = torch.cat((source, target), dim=0)
+        both_target = torch.cat((target, source), dim=0)
+        both_types = torch.cat((type_ids, type_ids), dim=0)
+        direction = torch.cat(
+            (
+                torch.zeros_like(type_ids),
+                torch.ones_like(type_ids),
+            ),
+            dim=0,
+        )
+        return both_source, both_target, both_types, direction, types
+
     def adjacency(
         self, *, include_self: bool = True, device: torch.device | None = None
     ) -> torch.Tensor:
