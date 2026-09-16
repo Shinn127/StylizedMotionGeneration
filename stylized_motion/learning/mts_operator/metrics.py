@@ -25,8 +25,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from .contract import TokenSpec, masked_cross_entropy
-from .layout_adapter import LayoutAdapter
+from .contract import masked_cross_entropy
 from .model import MtsStyleOperator, OperatorBatch
 from stylized_motion.learning.losses import (
     integrate_root_trajectory,
@@ -371,9 +370,7 @@ def _with_strength(batch: OperatorBatch, strength: Any) -> OperatorBatch:
 def _row(batch: OperatorBatch, row: int) -> OperatorBatch:
     payload = {}
     for name, value in batch.__dict__.items():
-        if isinstance(value, torch.Tensor) and value.ndim > 1 and value.shape[0] == batch.target_tokens.shape[0]:
-            payload[name] = value[row : row + 1]
-        elif isinstance(value, torch.Tensor) and value.ndim == 1 and value.shape[0] == batch.target_tokens.shape[0]:
+        if isinstance(value, torch.Tensor) and value.ndim > 1 and value.shape[0] == batch.target_tokens.shape[0] or isinstance(value, torch.Tensor) and value.ndim == 1 and value.shape[0] == batch.target_tokens.shape[0]:
             payload[name] = value[row : row + 1]
         else:
             payload[name] = value

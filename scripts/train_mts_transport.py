@@ -34,7 +34,6 @@ if str(REPO_ROOT) not in sys.path:
 from stylized_motion.data import build_data_loaders, open_any_feature_store, open_token_store  # noqa: E402
 from stylized_motion.learning.mts_operator import LayoutAdapter  # noqa: E402
 from stylized_motion.learning.mts_operator.checkpoint import (  # noqa: E402
-    checkpoint_token_spec,
     load_mts_checkpoint,
     mts_checkpoint_payload,
     save_mts_checkpoint,
@@ -49,7 +48,6 @@ from stylized_motion.learning.representation import (  # noqa: E402
 from stylized_motion.learning.runner import (  # noqa: E402
     apply_batch_normalization,
     choose_device,
-    load_experiment_config,
     move_batch_to_device,
     set_seed,
 )

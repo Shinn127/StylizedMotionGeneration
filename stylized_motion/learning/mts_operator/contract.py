@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -68,7 +68,7 @@ class TokenSpec:
         *,
         family: str = "nef_fsq",
         representation_id: str = "",
-    ) -> "TokenSpec":
+    ) -> TokenSpec:
         if not hasattr(layout, "layout_hash"):
             raise TypeError("TokenSpec.from_layout requires a layout with a layout_hash()")
         return cls(

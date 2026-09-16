@@ -41,7 +41,7 @@ class MaskConfig:
     block_coordinates: int = 8
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, object] | None) -> "MaskConfig":
+    def from_mapping(cls, value: Mapping[str, object] | None) -> MaskConfig:
         """Accepts both ``{"mixture": {...}}`` and the plan's flat kind keys."""
         if not value:
             return cls()

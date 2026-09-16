@@ -21,7 +21,6 @@ from stylized_motion.learning.mts_operator.metrics import (
 from stylized_motion.learning.mts_operator.model import MtsStyleOperator, OperatorBatch
 from stylized_motion.learning.mts_operator.operators import (
     AdditiveLogitField,
-    BirthDeathCTMCOperator,
 )
 from stylized_motion.learning.mts_operator.style_encoder import StyleIDEncoder
 from stylized_motion.learning.mts_operator.transport import MotionTransportTransformer

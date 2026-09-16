@@ -23,9 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import defaultdict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 

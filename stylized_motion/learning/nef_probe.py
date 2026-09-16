@@ -37,7 +37,6 @@ from stylized_motion.learning.losses import (
 from stylized_motion.learning.nef_eval import (
     DECODER_INFLUENCE_FRAMES,
     contacts_from_toe_motion,
-    rotation_angle_error,
 )
 from stylized_motion.learning.nef_layout import NEFLayout
 
@@ -177,7 +176,7 @@ class KinematicContext:
         *,
         dt: float = 1.0 / 60.0,
         contact_threshold: float = 0.15,
-    ) -> "KinematicContext":
+    ) -> KinematicContext:
         return cls(
             feature_offset=torch.as_tensor(
                 np.asarray(feature_stats["offset"], dtype=np.float32)
@@ -199,7 +198,7 @@ class KinematicContext:
         except ValueError:
             return None
 
-    def to(self, device: torch.device) -> "KinematicContext":
+    def to(self, device: torch.device) -> KinematicContext:
         return KinematicContext(
             feature_offset=self.feature_offset.to(device),
             feature_scale=self.feature_scale.to(device),

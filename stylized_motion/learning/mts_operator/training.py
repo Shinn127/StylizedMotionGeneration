@@ -10,7 +10,6 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -37,7 +36,7 @@ class TrainerConfig:
     output_dir: str | None = None
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, object] | None) -> "TrainerConfig":
+    def from_mapping(cls, value: Mapping[str, object] | None) -> TrainerConfig:
         payload = dict(value or {})
         known = {field_name for field_name in cls().__dataclass_fields__}
         unknown = sorted(set(payload) - known)
@@ -233,7 +232,7 @@ class TransportTrainer:
         *,
         epochs: int | None = None,
         val_batches: Callable[[int], Iterable[Any]] | None = None,
-        on_epoch_end: Callable[[int, Mapping[str, float], "TransportTrainer"], None] | None = None,
+        on_epoch_end: Callable[[int, Mapping[str, float], TransportTrainer], None] | None = None,
         log: Callable[[str], None] | None = print,
     ) -> dict[str, Any]:
         epochs = int(epochs or self.config.epochs)
@@ -388,7 +387,7 @@ class OperatorTrainer:
         *,
         epochs: int | None = None,
         val_batches: Callable[[int], Iterable[Any]] | None = None,
-        on_epoch_end: Callable[[int, Mapping[str, float], "OperatorTrainer"], None] | None = None,
+        on_epoch_end: Callable[[int, Mapping[str, float], OperatorTrainer], None] | None = None,
         log: Callable[[str], None] | None = print,
     ) -> dict[str, Any]:
         epochs = int(epochs or self.config.epochs)

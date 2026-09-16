@@ -12,7 +12,6 @@ import pytest
 import torch
 
 from stylized_motion.learning.mts_operator import LayoutAdapter
-from stylized_motion.learning.mts_operator.contract import TokenSpec
 from stylized_motion.learning.mts_operator.masking import MaskGenerator
 from stylized_motion.learning.mts_operator.model import MtsStyleOperator, OperatorBatch
 from stylized_motion.learning.mts_operator.operators import (

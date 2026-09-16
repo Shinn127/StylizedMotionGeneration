@@ -28,7 +28,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from .contract import TokenSpec, TransportOutput
+from .contract import TransportOutput
 from .embeddings import StreamTokenEmbedding
 from .graph import StreamGraphNetwork
 from .layout_adapter import LayoutAdapter
