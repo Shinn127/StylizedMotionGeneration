@@ -40,6 +40,7 @@ def inputs_for(
     strength: torch.Tensor | float = 1.0,
     hard_mask: torch.Tensor | None = None,
     visible_mask: torch.Tensor | None = None,
+    edit_mask: torch.Tensor | None = None,
     style_dim: int = 16,
     seed: int = 1,
 ) -> OperatorInputs:
@@ -50,6 +51,7 @@ def inputs_for(
         strength=strength,
         hard_mask=hard_mask,
         visible_mask=visible_mask,
+        edit_mask=edit_mask,
     )
 
 
@@ -100,18 +102,33 @@ def test_logit_field_is_identity_at_zero_and_local_to_its_support():
         styled.probabilities[:, :, 8:], base_probs[:, :, 8:], rtol=0.0, atol=0.0
     )
     assert styled.logits is not None
-    # Visibility can only hide an editable position.
-    half_visible = torch.zeros(FRAMES, COORDINATES, dtype=torch.bool)
-    half_visible[:, :4] = True
-    narrower = operator(inputs_for(logits, strength=1.0, hard_mask=support, visible_mask=half_visible))
+    # The edit set can only narrow the region.
+    half = torch.zeros(FRAMES, COORDINATES, dtype=torch.bool)
+    half[:, :4] = True
+    narrower = operator(inputs_for(logits, strength=1.0, hard_mask=support, edit_mask=half))
     torch.testing.assert_close(
         narrower.probabilities[:, :, 4:], base_probs[:, :, 4:], rtol=0.0, atol=0.0
     )
+    assert float((narrower.probabilities[:, :, :4] - base_probs[:, :, :4]).abs().max().detach()) > 0.0
     # ... and cannot escape the hard mask.
     escaping = operator(
-        inputs_for(logits, strength=1.0, hard_mask=torch.zeros(FRAMES, COORDINATES, dtype=torch.bool), visible_mask=full_mask())
+        inputs_for(
+            logits,
+            strength=1.0,
+            hard_mask=torch.zeros(FRAMES, COORDINATES, dtype=torch.bool),
+            edit_mask=full_mask(),
+        )
     )
     torch.testing.assert_close(escaping.probabilities, base_probs, rtol=0.0, atol=0.0)
+    # An observed token is evidence, not an edit target: with a visible mask the
+    # complement is edited and the observed positions stay exactly at their base.
+    observed = torch.zeros(FRAMES, COORDINATES, dtype=torch.bool)
+    observed[:, :32] = True
+    complement = operator(inputs_for(logits, strength=1.0, visible_mask=observed))
+    torch.testing.assert_close(
+        complement.probabilities[:, :, :32], base_probs[:, :, :32], rtol=0.0, atol=0.0
+    )
+    assert float((complement.probabilities[:, :, 32:] - base_probs[:, :, 32:]).abs().max().detach()) > 0.0
 
 
 def test_logit_field_strength_scales_the_deviation():
@@ -265,6 +282,9 @@ def test_operator_output_rejects_invalid_distributions():
     with pytest.raises(ValueError, match="hard_mask must be"):
         OperatorInputs(base_logits=logits, style_embedding=torch.zeros(BATCH, 8),
                        hard_mask=torch.ones(3, 3, dtype=torch.bool))
+    with pytest.raises(ValueError, match="edit_mask must be"):
+        OperatorInputs(base_logits=logits, style_embedding=torch.zeros(BATCH, 8),
+                       edit_mask=torch.ones(3, 3, dtype=torch.bool))
     with pytest.raises(ValueError, match="valid_mask"):
         OperatorInputs(base_logits=logits, style_embedding=torch.zeros(BATCH, 8),
                        valid_mask=torch.ones(BATCH, FRAMES + 1, dtype=torch.bool))

@@ -1,0 +1,84 @@
+# MTS reference-conditioned style operator (Phase 4).
+#
+# The tokenizer and the base transport are frozen; only the style encoder and the
+# operator learn.  Operator selection is a CLI override (`--operator`), so the
+# same run configuration produces the logit / kernel / birth-death comparison.
+tokenizer:
+  representation: nef-fsq
+  checkpoint: outputs/nef_fsq_40x9/best.pt
+  freeze: true
+
+transport:
+  checkpoint: outputs/mts_transport/seed3407/best.pt
+  freeze: true
+
+style_encoder:
+  kind: reference            # reference | style_id
+  dim: 256
+  depth: 4
+  heads: 8
+  graph_depth: 1
+  temporal_mode: bidirectional
+  output_dim: 256
+  num_styles:                # required for kind=style_id
+
+operator:
+  name: birth_death          # logit_field | arbitrary_kernel | birth_death
+  hidden_dim: 256
+  coordinate_dim: 32
+  max_rate: 2.0
+  strength: 1.0
+
+data:
+  fsq_window_index: data/processed/100style_pruned_90/fsq_window_index
+  required_data_schema_version: 3
+  token_store:
+  frames: 64
+  pairs:
+    mode: same_style
+    stage: train
+    reference_frames: 64
+  style_split:
+    val_fraction: 0.2
+    unseen_fraction: 0.2
+
+masking:
+  random_coordinate: 0.10
+  stream: 0.15
+  temporal_span: 0.20
+  spatiotemporal_block: 0.25
+  full_generation: 0.30
+  coordinate_ratio: 0.30
+  stream_ratio: 0.30
+  span_ratio: 0.50
+  block_frames: 16
+  block_coordinates: 8
+
+training:
+  epochs: 100
+  lr: 0.0002
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  precision: fp32
+  seed: 3407
+  log_every_steps: 50
+  steps_per_epoch:
+  max_steps:
+  output_dir: outputs/mts_operator/birth_death/seed3407
+  content_weight: 0.0
+  strength_range: [0.5, 1.5]  # sampled per batch so one operator serves a sweep
+
+sampling:
+  strategy: clip_uniform
+  target_frames: 64
+  samples_per_epoch: 100000
+  seed: 3407
+  mirror_probability: 0.5
+
+loader:
+  batch_size: 32
+  num_workers: 0
+  pin_memory: auto
+  drop_last_train: true
+  max_open_shards: 32
+  prefetch_memory_limit_mb: 512

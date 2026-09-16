@@ -45,7 +45,11 @@ class OperatorInputs:
     style_embedding: torch.Tensor  # [B, Ds]
     strength: torch.Tensor | float = 1.0
     hard_mask: torch.Tensor | None = None  # [T, 40] or [B, T, 40] bool
-    visible_mask: torch.Tensor | None = None  # [B, T, 40] bool
+    #: Positions the operator may edit (the plan's ``visibility``).  When it is
+    #: omitted, the complement of ``visible_mask`` is used: a token the transport
+    #: was given is evidence, not an edit target.
+    edit_mask: torch.Tensor | None = None  # [B, T, 40] bool
+    visible_mask: torch.Tensor | None = None  # [B, T, 40] bool, observed tokens
     stream_hidden: torch.Tensor | None = None  # [B, T, 13, D]
     valid_mask: torch.Tensor | None = None  # [B, T] bool
     coordinate_stream_ids: torch.Tensor | None = None  # [40]
@@ -61,7 +65,11 @@ class OperatorInputs:
             )
         if self.style_embedding.shape[0] != self.base_logits.shape[0]:
             raise ValueError("style_embedding batch must match base_logits")
-        for name, mask in (("hard_mask", self.hard_mask), ("visible_mask", self.visible_mask)):
+        for name, mask in (
+            ("hard_mask", self.hard_mask),
+            ("visible_mask", self.visible_mask),
+            ("edit_mask", self.edit_mask),
+        ):
             if mask is None:
                 continue
             if mask.dtype != torch.bool:
@@ -162,30 +170,35 @@ class StyleOperator(nn.Module):
             raise ValueError("strength must be non-negative")
         return inputs.base_logits.new_full((inputs.batch, 1, 1), scalar)
 
-    def support(self, inputs: OperatorInputs) -> torch.Tensor:
-        """``[B, T, 40]`` float support: strength x hard mask x visibility."""
-        strength = self._strength_tensor(inputs)
-        support = torch.ones(
+    def editability(self, inputs: OperatorInputs) -> torch.Tensor:
+        """``[B, T, 40]`` bool: positions the operator is allowed to edit.
+
+        ``edit_mask`` states it outright; otherwise the complement of
+        ``visible_mask`` is used (the tokens the transport had to predict);
+        otherwise everything is editable.
+        """
+        if inputs.edit_mask is not None:
+            return inputs.edit_mask.to(inputs.base_logits.device).bool()
+        if inputs.visible_mask is not None:
+            return ~inputs.visible_mask.to(inputs.base_logits.device).bool()
+        return torch.ones(
             (inputs.batch, inputs.frames, inputs.coordinates),
-            dtype=inputs.base_logits.dtype,
+            dtype=torch.bool,
             device=inputs.base_logits.device,
         )
+
+    def support(self, inputs: OperatorInputs) -> torch.Tensor:
+        """``[B, T, 40]`` float support: strength x hard mask x editability."""
+        strength = self._strength_tensor(inputs)
+        allowed = self.editability(inputs)
+        support = allowed.to(inputs.base_logits.dtype)
         hard = inputs.hard_mask
         if hard is not None:
             hard_tensor = hard.to(inputs.base_logits.device).bool()
             if hard_tensor.ndim == 2:
                 hard_tensor = hard_tensor.unsqueeze(0)
+            # The hard region can only narrow the edit set, never widen it.
             support = support * hard_tensor.to(support.dtype)
-        visibility = inputs.visible_mask
-        if visibility is not None:
-            visible = visibility.to(inputs.base_logits.device).bool()
-            # Visibility may hide an editable position, never create one.
-            if hard is not None:
-                hard_tensor = hard.to(inputs.base_logits.device).bool()
-                if hard_tensor.ndim == 2:
-                    hard_tensor = hard_tensor.unsqueeze(0)
-                visible = visible & hard_tensor
-            support = support * visible.to(support.dtype)
         if inputs.valid_mask is not None:
             valid = inputs.valid_mask.to(inputs.base_logits.device).bool().unsqueeze(-1)
             support = support * valid.to(support.dtype)

@@ -289,4 +289,148 @@ class TransportTrainer:
         return {"history": history, "global_step": self.global_step}
 
 
-__all__ = ["TrainerConfig", "TransportMetrics", "TransportTrainer"]
+class OperatorTrainer:
+    """Optimizes the reference-conditioned operator objective (Phase 4).
+
+    The transport and (optionally) the style encoder are frozen upstream, so the
+    gradient that reaches the operator is the style signal plus the masked
+    target-token likelihood — nothing else.
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        *,
+        adapter: LayoutAdapter,
+        optimizer: torch.optim.Optimizer | None = None,
+        device: torch.device | str = "cpu",
+        config: TrainerConfig | None = None,
+        content_weight: float = 0.0,
+        writer: Any | None = None,
+    ) -> None:
+        self.model = model
+        self.adapter = adapter
+        self.device = torch.device(device)
+        self.model.to(self.device)
+        self.config = config or TrainerConfig()
+        self.content_weight = float(content_weight)
+        self.writer = writer
+        parameters = list(model.trainable_parameters())
+        if not parameters:
+            raise ValueError("The operator model exposes no trainable parameters")
+        self.optimizer = optimizer or torch.optim.AdamW(
+            parameters, lr=self.config.lr, weight_decay=self.config.weight_decay
+        )
+        self.global_step = 0
+        self.amp = self.config.precision == "amp" and self.device.type == "cuda"
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp)
+
+    def _to_device(self, batch: Any) -> Any:
+        from .model import OperatorBatch
+
+        if isinstance(batch, OperatorBatch):
+            payload = {}
+            for name in batch.__dataclass_fields__:
+                value = getattr(batch, name)
+                payload[name] = value.to(self.device) if isinstance(value, torch.Tensor) else value
+            return OperatorBatch(**payload)
+        return batch
+
+    def train_step(self, batch: Any) -> dict[str, float]:
+        batch = self._to_device(batch)
+        self.model.train()
+        if self.model.freeze_transport:
+            self.model.transport.eval()
+        self.optimizer.zero_grad(set_to_none=True)
+        loss, metrics = self.model.loss(batch, content_weight=self.content_weight)
+        if self.amp:
+            self.scaler.scale(loss).backward()
+            if self.config.grad_clip_norm > 0:
+                self.scaler.unscale_(self.optimizer)
+                nn.utils.clip_grad_norm_(list(self.model.trainable_parameters()), self.config.grad_clip_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            if self.config.grad_clip_norm > 0:
+                nn.utils.clip_grad_norm_(list(self.model.trainable_parameters()), self.config.grad_clip_norm)
+            self.optimizer.step()
+        self.global_step += 1
+        record = {"loss": float(loss.detach())}
+        record.update({name: float(value) for name, value in metrics.items() if torch.is_tensor(value)})
+        if self.writer is not None:
+            for name, value in record.items():
+                self.writer.add_scalar(f"operator/train/{name}", value, self.global_step)
+        return record
+
+    @torch.no_grad()
+    def evaluate(self, batches: Iterable[Any]) -> dict[str, float]:
+        self.model.eval()
+        totals: dict[str, float] = {}
+        count = 0
+        for batch in batches:
+            loss, metrics = self.model.loss(self._to_device(batch), content_weight=self.content_weight)
+            weight = float(metrics.get("supervision_fraction", 1.0))
+            totals["loss"] = totals.get("loss", 0.0) + float(loss.detach()) * weight
+            totals["nll"] = totals.get("nll", 0.0) + float(metrics["nll"]) * weight
+            count += 1
+        if count == 0:
+            return {"loss": float("nan"), "nll": float("nan"), "batches": 0}
+        return {
+            "loss": totals["loss"] / count,
+            "nll": totals["nll"] / count,
+            "batches": float(count),
+        }
+
+    def fit(
+        self,
+        train_batches: Callable[[int], Iterable[Any]],
+        *,
+        epochs: int | None = None,
+        val_batches: Callable[[int], Iterable[Any]] | None = None,
+        on_epoch_end: Callable[[int, Mapping[str, float], "OperatorTrainer"], None] | None = None,
+        log: Callable[[str], None] | None = print,
+    ) -> dict[str, Any]:
+        epochs = int(epochs or self.config.epochs)
+        history: list[dict[str, Any]] = []
+        for epoch in range(1, epochs + 1):
+            started = time.perf_counter()
+            totals: dict[str, float] = {}
+            steps = 0
+            for batch in train_batches(epoch):
+                if self.config.steps_per_epoch is not None and steps >= self.config.steps_per_epoch:
+                    break
+                if self.config.max_steps is not None and self.global_step >= self.config.max_steps:
+                    break
+                record = self.train_step(batch)
+                steps += 1
+                for key, value in record.items():
+                    totals[key] = totals.get(key, 0.0) + float(value)
+                if log is not None and self.config.log_every_steps and self.global_step % self.config.log_every_steps == 0:
+                    log(f"step {self.global_step}: loss={record['loss']:.4f} nll={record.get('nll', float('nan')):.4f}")
+            epoch_metrics = {key: value / max(steps, 1) for key, value in totals.items()}
+            epoch_metrics["steps"] = float(steps)
+            epoch_metrics["seconds"] = time.perf_counter() - started
+            if val_batches is not None:
+                epoch_metrics.update(
+                    {f"val_{key}": value for key, value in self.evaluate(val_batches(epoch)).items()}
+                )
+            history.append({"epoch": epoch, **epoch_metrics})
+            if log is not None:
+                log(
+                    f"epoch {epoch}/{epochs}: train_loss={epoch_metrics.get('loss', float('nan')):.4f} "
+                    f"val_nll={epoch_metrics.get('val_nll', float('nan')):.4f}"
+                )
+            if on_epoch_end is not None:
+                on_epoch_end(epoch, epoch_metrics, self)
+            if self.config.max_steps is not None and self.global_step >= self.config.max_steps:
+                break
+        return {"history": history, "global_step": self.global_step}
+
+
+__all__ = [
+    "OperatorTrainer",
+    "TrainerConfig",
+    "TransportMetrics",
+    "TransportTrainer",
+]

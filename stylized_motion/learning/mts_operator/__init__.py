@@ -42,6 +42,7 @@ from .contract import (
 )
 from .layout_adapter import LayoutAdapter, layout_adapter
 from .masking import MaskBatch, MaskConfig, MaskGenerator, apply_hard_support
+from .model import MtsStyleOperator, OperatorBatch, OperatorResult
 from .operators import (
     OPERATOR_NAMES,
     AdditiveLogitField,
@@ -59,8 +60,10 @@ from .sampling import (
     region_support_mask,
     sample_tokens,
 )
-from .training import TrainerConfig, TransportMetrics, TransportTrainer
+from .training import OperatorTrainer, TrainerConfig, TransportMetrics, TransportTrainer
+from .style_encoder import GlobalStyleEncoder, StyleIDEncoder
 from .transport import GRAPH_MODES, TEMPORAL_MODES, ContentConditioner, MotionTransportTransformer
+from .windows import read_window_tokens, windows_by_clip
 
 __all__ = [
     "CHECKPOINT_KINDS",
@@ -75,13 +78,19 @@ __all__ = [
     "BirthDeathCTMCOperator",
     "CommonRandomNumbers",
     "ContentConditioner",
+    "GlobalStyleEncoder",
     "LayoutAdapter",
     "MaskBatch",
     "MaskConfig",
     "MaskGenerator",
     "MotionTransportTransformer",
+    "MtsStyleOperator",
+    "OperatorBatch",
     "OperatorInputs",
     "OperatorOutput",
+    "OperatorResult",
+    "OperatorTrainer",
+    "StyleIDEncoder",
     "StyleOperator",
     "TokenSpec",
     "TrainerConfig",
@@ -99,9 +108,11 @@ __all__ = [
     "mts_checkpoint_payload",
     "operator_metadata",
     "paired_comparison",
+    "read_window_tokens",
     "region_support_mask",
     "sample_tokens",
     "save_mts_checkpoint",
     "tokenizer_fingerprint",
     "validate_operator_metadata",
+    "windows_by_clip",
 ]
