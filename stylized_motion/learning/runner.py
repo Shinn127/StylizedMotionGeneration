@@ -20,7 +20,7 @@ import yaml
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from stylized_motion.data import FeatureStore, build_data_loaders, open_feature_store
+from stylized_motion.data import FeatureStore, build_data_loaders, open_any_feature_store
 from stylized_motion.learning.checkpoint import CheckpointManager
 from stylized_motion.learning.gradient_probe import compute_gradient_probe
 from stylized_motion.learning.losses import compute_motion_reconstruction_losses
@@ -100,6 +100,22 @@ def move_batch_to_device(batch: Batch, device: torch.device) -> dict[str, Any]:
     return moved
 
 
+def apply_batch_normalization(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    """Normalize a device batch with the statistics the dataset carried.
+
+    Datasets built with ``loader.normalize_on='none'`` hand over raw frames plus
+    the store's statistics; this applies ``(x - offset) / scale`` on the device
+    (plan §4.2's GPU-side comparison). Without the statistics the batch is
+    returned unchanged, so a pre-normalized v3 batch is never touched twice.
+    """
+    from stylized_motion.data.packed_store import normalize_batch_on_device
+
+    normalization = batch.get("normalization")
+    if not isinstance(normalization, Mapping) or "motion" not in batch:
+        return batch
+    return normalize_batch_on_device(batch, device)
+
+
 def _matches_requested_device(actual: torch.device, requested: torch.device) -> bool:
     """Treat an unindexed CUDA request as the current CUDA device."""
     return actual.type == requested.type and (requested.index is None or actual.index == requested.index)
@@ -122,8 +138,11 @@ def load_experiment_config(path: str | Path) -> dict[str, object]:
     if family not in REPRESENTATION_FAMILIES or not isinstance(variant, str):
         raise ValueError("representation.family/variant are invalid")
     data = value["data"]
-    if not isinstance(data, Mapping) or int(data.get("required_data_schema_version", 0)) != 3:
-        raise ValueError("representation workflows require data.required_data_schema_version=3")
+    if not isinstance(data, Mapping) or int(data.get("required_data_schema_version", 0)) not in {3, 4}:
+        raise ValueError(
+            "representation workflows require data.required_data_schema_version=3 (per-range store) "
+            "or 4 (packed store)"
+        )
     resolved = json.loads(json.dumps(value))
     model_config = representation.get("config")
     if isinstance(model_config, str):
@@ -404,12 +423,15 @@ class RepresentationRunner:
         scheduler: Any | None = None,
         writer: SummaryWriter | None = None,
         gradient_probe_path: Path | None = None,
+        full_val_loader: DataLoader | None = None,
+        resume_state: Mapping[str, Any] | None = None,
     ) -> None:
         self.representation = representation
         self.family = family
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
+        self.full_val_loader = full_val_loader
         self.loss_fn = loss_fn
         self.metric_suite = dict(metric_suite or {})
         self.checkpoint_manager = checkpoint_manager
@@ -436,17 +458,121 @@ class RepresentationRunner:
             self.gradient_probe_file = gradient_probe_path.open("a", encoding="utf-8")
         self.global_step = 0
         self.best_val: float | None = None
+        # Which validation split decides best.pt. When an unbounded validation
+        # loader exists the decision always comes from it, never from the
+        # bounded monitoring subset.
+        self.best_metric_source = "val_full" if full_val_loader is not None else "val_subset"
+        loader_config = self.config.get("loader", {})
+        # Recorded in every checkpoint: which side normalized the batches.
+        self.normalization_on = (
+            str(loader_config.get("normalize_on", "cpu")) if isinstance(loader_config, Mapping) else "cpu"
+        )
+        self.start_epoch = 1
+        self.resume_ordinal = 0
+        self.sampler_position: dict[str, int] | None = None
+        self.checkpoint_every_steps = int(training.get("checkpoint_every_steps", 0))
+        if self.checkpoint_every_steps < 0:
+            raise ValueError("training.checkpoint_every_steps must be non-negative")
+        if resume_state:
+            self._apply_resume_state(resume_state)
         evaluation = self.config.get("evaluation", {})
         if not isinstance(evaluation, Mapping):
             raise ValueError("evaluation config must be a mapping")
         self.metrics_interval = int(evaluation.get("metrics_interval", 100))
         if self.metrics_interval <= 0:
             raise ValueError("evaluation.metrics_interval must be positive")
+        # Training budget: a 100k-sample epoch over a 900k-window catalogue is
+        # still one pass over a sampled subset, so the budget is expressed in
+        # steps rather than "one epoch over everything".
+        self.steps_per_epoch = training.get("steps_per_epoch")
+        if self.steps_per_epoch is not None:
+            self.steps_per_epoch = int(self.steps_per_epoch)
+            if self.steps_per_epoch <= 0:
+                raise ValueError("training.steps_per_epoch must be positive")
+        self.max_steps = training.get("max_steps")
+        if self.max_steps is not None:
+            self.max_steps = int(self.max_steps)
+            if self.max_steps <= 0:
+                raise ValueError("training.max_steps must be positive")
+        self.eval_every_steps = int(evaluation.get("eval_every_steps", 0))
+        if self.eval_every_steps < 0:
+            raise ValueError("evaluation.eval_every_steps must be non-negative")
+        self.full_eval_every_epochs = int(evaluation.get("full_eval_every_epochs", 1))
+        if self.full_eval_every_epochs <= 0:
+            raise ValueError("evaluation.full_eval_every_epochs must be positive")
+        self.sampling_history: list[dict[str, Any]] = []
         if self.precision not in {"fp32", "amp"}:
             raise ValueError("training.precision must be fp32 or amp")
         if self.precision == "amp" and device.type != "cuda":
             raise ValueError("AMP is only enabled for CUDA in the canonical runner")
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.precision == "amp")
+
+    def _apply_resume_state(self, state: Mapping[str, Any]) -> None:
+        """Continue a previous run from its checkpoint.
+
+        A checkpoint whose sampler had not finished its epoch resumes *inside*
+        that epoch at the exact next ordinal; an epoch-boundary checkpoint
+        starts the following epoch. Optimizer/scheduler state is restored by the
+        composition root before the runner is built, so only the run position
+        and the best-metric bookkeeping are handled here.
+        """
+        self.global_step = int(state.get("global_step", 0))
+        checkpoint_epoch = int(state.get("epoch", 0))
+        sampler_state = state.get("sampler_state")
+        self.start_epoch = checkpoint_epoch + 1
+        self.resume_ordinal = 0
+        if isinstance(sampler_state, Mapping):
+            state_epoch = int(sampler_state.get("epoch", checkpoint_epoch))
+            next_ordinal = int(sampler_state.get("next_ordinal", 0))
+            complete = sampler_state.get("complete")
+            if complete is None:
+                # Older checkpoints only recorded the ordinal; infer completion.
+                epoch_samples = self._epoch_sample_count()
+                complete = epoch_samples is not None and next_ordinal >= epoch_samples
+            if state_epoch == checkpoint_epoch and not bool(complete):
+                # The epoch was interrupted partway; finish it.
+                self.start_epoch = max(1, checkpoint_epoch)
+                self.resume_ordinal = next_ordinal
+        best_val = state.get("best_val")
+        self.best_val = None if best_val is None else float(best_val)
+        source = state.get("best_metric_source")
+        if isinstance(source, str) and source:
+            self.best_metric_source = source
+
+    def _epoch_sample_count(self) -> int | None:
+        sampler = getattr(self.train_loader, "sampler", None)
+        if sampler is None:
+            return None
+        value = getattr(sampler, "epoch_samples", None)
+        return None if value is None else int(value)
+
+    def _restore_sampler_position(self, epoch: int, ordinal: int) -> None:
+        sampler = getattr(self.train_loader, "sampler", None) if self.train_loader is not None else None
+        if sampler is None:
+            if ordinal:
+                raise ValueError("Cannot resume mid-epoch without a train sampler")
+            return
+        setter = getattr(sampler, "set_epoch", None)
+        if setter is not None:
+            setter(int(epoch))
+        loader = getattr(sampler, "load_state_dict", None)
+        if loader is not None:
+            loader({"epoch": int(epoch), "next_ordinal": int(ordinal)})
+
+    def set_sampler_position(self, epoch: int, next_ordinal: int, *, complete: bool = False) -> None:
+        """Record how far the run actually got inside ``epoch``.
+
+        The trainer is the authority here, not the sampler: a DataLoader with
+        worker processes prefetches indices, so the sampler's own counter runs
+        ahead of the batches that were really trained on and cannot be used to
+        resume. ``complete`` states outright whether the epoch finished, instead
+        of leaving a reader to infer it from the ordinal.
+        """
+        self.sampler_position = {
+            "epoch": int(epoch),
+            "next_ordinal": int(next_ordinal),
+            "complete": bool(complete),
+        }
 
     def _write_gradient_probe(
         self,
@@ -500,10 +626,20 @@ class RepresentationRunner:
         else:
             yield
 
+    def _to_device(self, batch: Batch) -> dict[str, Any]:
+        """Move a batch to the device and place it in normalized space.
+
+        With ``loader.normalize_on='cpu'`` the dataset already normalized the
+        frames; with ``'none'`` the batch arrives raw and carries the store's
+        statistics, which are applied here on the device (plan §4.2).
+        """
+        moved = move_batch_to_device(batch, self.device)
+        return apply_batch_normalization(moved, self.device)
+
     def _forward(self, batch: Batch, *, collect_metrics: bool, compact_output: bool) -> dict[str, Any]:
         motion = batch["motion"]
         if not isinstance(motion, torch.Tensor) or not _matches_requested_device(motion.device, self.device):
-            raise ValueError("Runner expects a device batch produced by move_batch_to_device()")
+            raise ValueError("Runner expects a device batch produced by _to_device()")
         if motion.ndim != 3 or motion.shape[1] != 64:
             raise ValueError("Canonical representation runner requires motion with shape [B,64,motion_dim]")
         with self._autocast():
@@ -562,12 +698,26 @@ class RepresentationRunner:
             raise ValueError("Canonical 64-frame representation batches require all loss_mask values to be true")
         return int(loss_mask.numel())
 
-    def evaluate(self, split: str) -> dict[str, Any]:
+    def evaluate(self, split: str, *, full: bool = False) -> dict[str, Any]:
+        """Evaluate one split.
+
+        ``full=True`` walks the whole validation split; the default uses the
+        bounded monitoring subset when one is configured. The result records
+        which loader produced it so a metric can always be traced back to the
+        data it was measured on.
+        """
         if split not in {"val", "test"}:
             raise ValueError("evaluate split must be val or test")
-        loader = self.val_loader if split == "val" else self.test_loader
+        if full and split == "val":
+            loader = self.full_val_loader or self.val_loader
+        else:
+            loader = self.val_loader if split == "val" else self.test_loader
         if loader is None:
             raise ValueError(f"No loader configured for {split}")
+        evaluation_scope = (
+            "val_full" if (split == "val" and loader is (self.full_val_loader or self.val_loader) and full)
+            else ("val_subset" if split == "val" and self.full_val_loader is not None else split)
+        )
         self.representation.eval()
         accumulator = _DeviceMetricAccumulator(self.device)
         sample_count = 0
@@ -587,7 +737,7 @@ class RepresentationRunner:
                 batch = dict(batch)
                 batch["_all_frames_valid"] = True
                 batch["_valid_frames"] = valid_frames
-                device_batch = move_batch_to_device(batch, self.device)
+                device_batch = self._to_device(batch)
                 output = self._forward(
                     device_batch,
                     collect_metrics=True,
@@ -608,6 +758,8 @@ class RepresentationRunner:
         step_time = max(elapsed - data_wait, 0.0)
         return {
             "mode": split,
+            "scope": evaluation_scope,
+            "windows": int(len(loader.sampler)) if hasattr(loader, "sampler") else None,
             "metrics": metrics,
             "valid_frames": reduced_count,
             "samples": reduced_samples,
@@ -617,7 +769,7 @@ class RepresentationRunner:
             "samples_per_second": reduced_samples / max(elapsed, 1e-8),
         }
 
-    def train_epoch(self, epoch: int) -> dict[str, float]:
+    def train_epoch(self, epoch: int, *, resume_ordinal: int = 0) -> dict[str, float]:
         if self.train_loader is None or self.optimizer is None:
             raise ValueError("Training requires train_loader and optimizer")
         self.representation.train()
@@ -626,24 +778,38 @@ class RepresentationRunner:
         sample_count = 0
         data_wait = 0.0
         started = time.perf_counter()
-        sampler = getattr(self.train_loader, "sampler", None)
-        if sampler is not None and hasattr(sampler, "set_epoch"):
-            sampler.set_epoch(epoch)
+        # Position the sampler before the first batch is drawn, so a resumed run
+        # continues exactly where its checkpoint left off.
+        self._restore_sampler_position(epoch, int(resume_ordinal))
+        self.set_sampler_position(epoch, int(resume_ordinal))
+        samples_seen = int(resume_ordinal)
         iterator = iter(self.train_loader)
+        epoch_steps = 0
+        exit_reason = "exhausted"
         while True:
+            if self.steps_per_epoch is not None and epoch_steps >= self.steps_per_epoch:
+                exit_reason = "steps_per_epoch"
+                break
+            if self.max_steps is not None and self.global_step >= self.max_steps:
+                # The global budget stopped the run mid-epoch, so the epoch is
+                # *not* complete and its position must survive in the checkpoint.
+                exit_reason = "max_steps"
+                break
             wait_started = time.perf_counter()
             try:
                 batch = next(iterator)
             except StopIteration:
+                exit_reason = "exhausted"
                 break
             data_wait += time.perf_counter() - wait_started
+            epoch_steps += 1
             valid_frames = self._validate_cpu_batch(batch)
             batch = dict(batch)
             batch["_all_frames_valid"] = True
             batch["_valid_frames"] = valid_frames
             collect_metrics = self.global_step % self.metrics_interval == 0
             self.optimizer.zero_grad(set_to_none=True)
-            device_batch = move_batch_to_device(batch, self.device)
+            device_batch = self._to_device(batch)
             output = self._forward(
                 device_batch,
                 collect_metrics=collect_metrics,
@@ -686,13 +852,55 @@ class RepresentationRunner:
             accumulator.update(record, valid_frames)
             self.global_step += 1
             count += valid_frames
-            sample_count += int(device_batch["motion"].shape[0])
+            batch_samples = int(device_batch["motion"].shape[0])
+            sample_count += batch_samples
+            samples_seen += batch_samples
+            self.set_sampler_position(epoch, samples_seen)
             if self.writer is not None and collect_metrics:
                 self.writer.add_scalar(
                     "train/step_loss",
                     float(values["loss"].detach().cpu()),
                     self.global_step,
                 )
+            if (
+                self.checkpoint_every_steps > 0
+                and self.global_step % self.checkpoint_every_steps == 0
+                and _is_main_process()
+            ):
+                # A mid-epoch checkpoint carries the sampler position, so a
+                # crash between epoch boundaries does not lose the epoch.
+                self.checkpoint_manager.save(
+                    self.checkpoint_payload(epoch, {"loss": float(values["loss"].detach().cpu())}),
+                    "last.pt",
+                )
+            if (
+                self.eval_every_steps > 0
+                and self.val_loader is not None
+                and self.global_step % self.eval_every_steps == 0
+            ):
+                mid_val = self.evaluate("val")
+                self.representation.train()
+                if self.writer is not None and _is_main_process():
+                    for name, value in mid_val.get("metrics", {}).items():
+                        if name in LOSS_COMPONENTS:
+                            self.writer.add_scalar(f"midval/{name}", value, self.global_step)
+                if _is_main_process():
+                    loss_text = float(mid_val.get("metrics", {}).get("loss", float("nan")))
+                    print(
+                        f"Step {self.global_step} validation | val_loss={loss_text:.6f}",
+                        flush=True,
+                    )
+        if exit_reason in {"steps_per_epoch", "exhausted"}:
+            # The epoch is finished: an epoch-boundary checkpoint must resume at
+            # the start of the next epoch rather than inside this one.
+            sampler = getattr(self.train_loader, "sampler", None)
+            marker = getattr(sampler, "mark_epoch_complete", None)
+            if marker is not None:
+                marker(int(epoch))
+            epoch_samples = self._epoch_sample_count()
+            self.set_sampler_position(
+                epoch, samples_seen if epoch_samples is None else epoch_samples, complete=True
+            )
         if self.scheduler is not None:
             self.scheduler.step()
         result = accumulator.finalize()
@@ -700,11 +908,41 @@ class RepresentationRunner:
         elapsed = max(time.perf_counter() - started, 1e-8)
         result["valid_frames"] = reduced_count
         result["samples"] = reduced_samples
+        result["steps"] = int(epoch_steps)
         result["data_wait_seconds"] = data_wait
+        result["data_wait_fraction"] = data_wait / elapsed
+        result["epoch_complete"] = exit_reason in {"steps_per_epoch", "exhausted"}
+        result["exit_reason"] = exit_reason
         result["step_time_seconds"] = max(elapsed - data_wait, 0.0)
         result["target_frames_per_second"] = reduced_count / elapsed
         result["samples_per_second"] = reduced_samples / elapsed
+        coverage = self._sampling_coverage()
+        if coverage:
+            result.update({f"sampling_{key}": value for key, value in coverage.items()})
+            self.sampling_history.append({"epoch": int(epoch), **coverage})
         return result
+
+    def _sampling_coverage(self) -> dict[str, Any]:
+        """Sampling coverage of this epoch's train sampler, when it tracks one."""
+        if self.train_loader is None:
+            return {}
+        sampler = getattr(self.train_loader, "sampler", None)
+        summary = getattr(sampler, "coverage_summary", None)
+        if summary is None:
+            return {}
+        values = summary()
+        if not values:
+            return {}
+        if _is_main_process() and self.writer is not None:
+            for key in ("group_coverage", "interval_coverage", "normalized_entropy"):
+                if key in values:
+                    self.writer.add_scalar(
+                        f"sampling/{key}", float(values[key]), int(self.global_step)
+                    )
+        reset = getattr(sampler, "reset_coverage", None)
+        if reset is not None:
+            reset()
+        return dict(values)
 
     def checkpoint_payload(self, epoch: int, metrics: Mapping[str, Any]) -> dict[str, object]:
         protocol = self.protocol
@@ -723,7 +961,12 @@ class RepresentationRunner:
             "epoch": int(epoch),
             "global_step": int(self.global_step),
             "metrics": dict(metrics),
+            "best_val": None if self.best_val is None else float(self.best_val),
+            "best_metric_source": str(self.best_metric_source),
+            "normalization_on": str(self.normalization_on),
         }
+        if self.sampler_position is not None:
+            payload["sampler_state"] = dict(self.sampler_position)
         if self.optimizer is not None:
             payload["optimizer"] = self.optimizer.state_dict()
         if self.scheduler is not None and hasattr(self.scheduler, "state_dict"):
@@ -732,37 +975,82 @@ class RepresentationRunner:
 
     def fit(self) -> dict[str, Any]:
         history: list[dict[str, Any]] = []
-        for epoch in range(1, self.epochs + 1):
+        resume_ordinal = self.resume_ordinal
+        for epoch in range(self.start_epoch, self.epochs + 1):
+            if self.max_steps is not None and self.global_step >= self.max_steps:
+                if _is_main_process():
+                    print(
+                        f"Reached training.max_steps={self.max_steps} at step {self.global_step}; stopping",
+                        flush=True,
+                    )
+                break
             if _is_main_process():
-                print(f"Epoch {epoch}/{self.epochs} started", flush=True)
-            train = self.train_epoch(epoch)
-            val_result = self.evaluate("val") if self.val_loader is not None else {}
-            val = val_result.get("metrics", {})
-            record = {"epoch": epoch, "train": train, "val": val}
+                resume_note = f", resuming at sample {resume_ordinal}" if resume_ordinal else ""
+                print(
+                    f"Epoch {epoch}/{self.epochs} started"
+                    + (f" (budget {self.global_step}/{self.max_steps} steps)" if self.max_steps else "")
+                    + resume_note,
+                    flush=True,
+                )
+            train = self.train_epoch(epoch, resume_ordinal=resume_ordinal)
+            resume_ordinal = 0
+            # The bounded monitoring subset runs every epoch; the unbounded
+            # sweep runs on its own cadence and always at the end, because it is
+            # what decides the reported score.
+            monitor_result = self.evaluate("val") if self.val_loader is not None else {}
+            monitor = monitor_result.get("metrics", {})
+            is_last_epoch = epoch == self.epochs or (
+                self.max_steps is not None and self.global_step >= self.max_steps
+            )
+            run_full_validation = bool(
+                self.full_val_loader is not None
+                and (epoch % self.full_eval_every_epochs == 0 or is_last_epoch)
+            )
+            full_result = self.evaluate("val", full=True) if run_full_validation else {}
+            full = full_result.get("metrics", {})
+            record = {
+                "epoch": epoch,
+                "train": train,
+                "val": monitor,
+                "val_full": full,
+                "full_validation": run_full_validation,
+                "best_metric_source": self.best_metric_source,
+            }
             history.append(record)
-            val_loss = float(val.get("loss", train.get("loss", float("inf"))))
             if _is_main_process():
                 train_loss = float(train.get("loss", float("nan")))
                 train_recon = float(train.get("recon", float("nan")))
                 train_samples_per_second = float(train.get("samples_per_second", float("nan")))
-                val_loss_text = f"{float(val['loss']):.6f}" if "loss" in val else "n/a"
-                val_recon_text = f"{float(val['recon']):.6f}" if "recon" in val else "n/a"
-                val_samples_per_second = (
-                    f"{float(val_result.get('samples_per_second', float('nan'))):.2f}"
-                    if val_result
-                    else "n/a"
+                monitor_loss = (
+                    f"{float(monitor['loss']):.6f}" if "loss" in monitor else "n/a"
                 )
+                full_loss = f"{float(full['loss']):.6f}" if "loss" in full else "n/a"
                 print(
                     f"Epoch {epoch}/{self.epochs} complete | "
                     f"train_loss={train_loss:.6f} | train_recon={train_recon:.6f} | "
                     f"train_samples/s={train_samples_per_second:.2f} | "
-                    f"val_loss={val_loss_text} | val_recon={val_recon_text} | "
-                    f"val_samples/s={val_samples_per_second}",
+                    f"val_loss={monitor_loss} | val_full_loss={full_loss}",
                     flush=True,
                 )
-            is_best = self.best_val is None or val_loss < self.best_val
+            # best.pt follows the full sweep whenever one exists, and only
+            # epochs that actually ran it are eligible: a bounded monitoring
+            # sweep measured on a different window set must never decide which
+            # checkpoint is kept, and mixing the two scales would compare
+            # numbers that do not mean the same thing.
+            if self.full_val_loader is not None:
+                eligible = bool(full)
+                decision_metrics, decision_source = full, "val_full"
+            else:
+                eligible = bool(monitor)
+                decision_metrics, decision_source = monitor, "val_subset"
+            record["best_eligible"] = eligible
+            decision_loss = float(decision_metrics.get("loss", float("inf")))
+            is_best = bool(eligible) and (self.best_val is None or decision_loss < self.best_val)
             if is_best:
-                self.best_val = val_loss
+                self.best_val = decision_loss
+                self.best_metric_source = decision_source
+            record["best_metric_source"] = self.best_metric_source
+            record["best_val"] = self.best_val
             payload = self.checkpoint_payload(epoch, record)
             if _is_main_process():
                 self.checkpoint_manager.save(payload, "last.pt")
@@ -773,12 +1061,20 @@ class RepresentationRunner:
                 for name in LOSS_COMPONENTS:
                     if name in train:
                         self.writer.add_scalar(f"epoch/train_{name}", train[name], epoch)
-                if val:
-                    self.writer.add_scalar("epoch/val_loss", val.get("loss", 0.0), epoch)
-                    for name in LOSS_COMPONENTS:
-                        if name in val:
-                            self.writer.add_scalar(f"epoch/val_{name}", val[name], epoch)
-        return {"mode": "train", "global_step": self.global_step, "history": history}
+                if monitor:
+                    self.writer.add_scalar("epoch/val_loss", monitor.get("loss", 0.0), epoch)
+                if full:
+                    self.writer.add_scalar("epoch/val_full_loss", full.get("loss", 0.0), epoch)
+                for name in LOSS_COMPONENTS:
+                    if name in monitor:
+                        self.writer.add_scalar(f"epoch/val_{name}", monitor[name], epoch)
+        return {
+            "mode": "train",
+            "global_step": self.global_step,
+            "best_val": self.best_val,
+            "best_metric_source": self.best_metric_source,
+            "history": history,
+        }
 
     def run(self, mode: str, split: str | None = None) -> dict[str, Any]:
         if mode == "train":
@@ -823,6 +1119,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--representation", choices=["flat-fsq", "part-fsq", "residual-part-fsq", "latent-residual-fsq", "latent-residual-fsq-v2", "nef-fsq"], required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from <output_dir>/last.pt when it exists (train mode).",
+    )
     parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--split", choices=["train", "val", "test"], default=None)
@@ -856,7 +1157,13 @@ def main(argv: list[str] | None = None) -> None:
     feature_database = data.get("fsq_window_index", data.get("feature_database"))
     if feature_database is None:
         raise ValueError("data.fsq_window_index is required for FSQ training")
-    store = open_feature_store(feature_database)
+    store = open_any_feature_store(feature_database)
+    required_version = int(data.get("required_data_schema_version", 3))
+    store_version = int(store.manifest.get("data_schema_version", 0))
+    if store_version != required_version:
+        raise ValueError(
+            f"Config requires data schema v{required_version} but {feature_database} is v{store_version}"
+        )
     feature_schema = store.feature_schema()
     sampling = config.get("sampling", {})
     loader_config = config.get("loader", {})
@@ -873,8 +1180,27 @@ def main(argv: list[str] | None = None) -> None:
     loaders = assembled_loaders.loaders
     if args.workflow_mode in {"validate", "test"} and args.checkpoint is None:
         raise ValueError("--checkpoint is required for validate/test")
-    if args.checkpoint is not None:
-        checkpoint, representation = load_representation_checkpoint(args.checkpoint, device, feature_schema=feature_schema)
+    output = args.output or Path(training.get("output_dir", f"outputs/{family}_40x9"))
+    checkpoint_path = args.checkpoint
+    if args.workflow_mode == "train" and checkpoint_path is None and args.resume:
+        # "Re-run the same command to continue": pick the run's own last
+        # checkpoint up automatically. This has to happen before DDP wrapping
+        # and loss construction, both of which bind the module object.
+        candidate = output / "last.pt"
+        if candidate.exists():
+            checkpoint_path = candidate
+        elif _is_main_process():
+            print(f"--resume given but {candidate} does not exist; starting a fresh run", flush=True)
+    if checkpoint_path is not None:
+        checkpoint, representation = load_representation_checkpoint(
+            checkpoint_path, device, feature_schema=feature_schema
+        )
+        if _is_main_process() and args.workflow_mode == "train":
+            print(
+                f"Resuming from {checkpoint_path} (epoch {int(checkpoint.get('epoch', 0))}, "
+                f"step {int(checkpoint.get('global_step', 0))})",
+                flush=True,
+            )
     else:
         representation = build_representation(config, feature_store=store, feature_schema=feature_schema).to(device)
         checkpoint = None
@@ -900,8 +1226,18 @@ def main(argv: list[str] | None = None) -> None:
             optimizer.load_state_dict(checkpoint["optimizer"])
             if scheduler is not None and "scheduler" in checkpoint:
                 scheduler.load_state_dict(checkpoint["scheduler"])
-    output = args.output or Path(training.get("output_dir", f"outputs/{family}_40x9"))
     writer = SummaryWriter(output / "tensorboard") if args.workflow_mode == "train" and _is_main_process() else None
+    resume_state: dict[str, Any] | None = None
+    if args.workflow_mode == "train" and checkpoint is not None:
+        # Continuing a run means restoring the position, not just the weights:
+        # epoch, global step, sampler ordinal and the best-metric bookkeeping.
+        resume_state = {
+            "epoch": int(checkpoint.get("epoch", 0)),
+            "global_step": int(checkpoint.get("global_step", 0)),
+            "sampler_state": checkpoint.get("sampler_state"),
+            "best_val": checkpoint.get("best_val"),
+            "best_metric_source": checkpoint.get("best_metric_source"),
+        }
     runner = RepresentationRunner(
         representation,
         family=family,
@@ -922,6 +1258,8 @@ def main(argv: list[str] | None = None) -> None:
         scheduler=scheduler,
         writer=writer,
         gradient_probe_path=output / "gradient_probe.jsonl",
+        full_val_loader=assembled_loaders.full_val,
+        resume_state=resume_state,
     )
     try:
         result = runner.run(args.workflow_mode, split=args.split)

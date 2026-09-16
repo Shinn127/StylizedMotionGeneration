@@ -109,6 +109,22 @@ def _prune_skeleton(names, parents, positions, rotations, prune_ends_and_fingers
     )
 
 
+def _savgol_filter(values, window, order):
+    """Savitzky-Golay smoothing that degrades gracefully on short clips.
+
+    The historical fixed windows (31 and 61 frames) are what the Geno/100STYLE
+    databases were built with, so clips at least that long keep bit-identical
+    output. BONES-SEED contains far shorter takes than 100STYLE ever did, and
+    scipy rejects a window longer than the signal, so the window shrinks to the
+    largest usable odd length instead of failing the whole build.
+    """
+    frames = int(values.shape[0])
+    usable = min(int(window), frames if frames % 2 == 1 else frames - 1)
+    if usable < int(order) + 2:
+        return values
+    return signal.savgol_filter(values, usable, order, axis=0, mode="interp")
+
+
 def _compute_simulation_root(rotations, positions, names, parents):
     global_rotations, global_positions = quat.fk(rotations, positions, parents)
 
@@ -116,13 +132,13 @@ def _compute_simulation_root(rotations, positions, names, parents):
     sim_rotation_joint = names.index("Hips")
 
     sim_position = np.array([1.0, 0.0, 1.0]) * global_positions[:, sim_position_joint : sim_position_joint + 1]
-    sim_position = signal.savgol_filter(sim_position, 31, 3, axis=0, mode="interp")
+    sim_position = _savgol_filter(sim_position, 31, 3)
 
     sim_direction = np.array([1.0, 0.0, 1.0]) * quat.mul_vec(
         global_rotations[:, sim_rotation_joint : sim_rotation_joint + 1], np.array([0.0, 0.0, 1.0])
     )
     sim_direction = sim_direction / np.sqrt(np.sum(np.square(sim_direction), axis=-1))[..., np.newaxis]
-    sim_direction = signal.savgol_filter(sim_direction, 61, 3, axis=0, mode="interp")
+    sim_direction = _savgol_filter(sim_direction, 61, 3)
     sim_direction = sim_direction / np.sqrt(np.sum(np.square(sim_direction), axis=-1))[..., np.newaxis]
     sim_rotation = quat.normalize(quat.between(np.array([0, 0, 1]), sim_direction))
 
@@ -483,6 +499,15 @@ def _discover_source_clips(dataset_name: str, styles_arg: str | None, max_styles
         clips = style_clips()
     elif dataset_name == "combined":
         clips = [*lafan_clips("lafan/"), *style_clips("100style/")]
+    elif dataset_name == "seed":
+        # BONES-SEED must not use this path: it unconditionally materialises an
+        # original/mirror pair per file, which would duplicate the ~71k official
+        # mirrors that already exist on disk. SEED goes through the catalogue
+        # and the schema-v4 packed store instead.
+        raise ValueError(
+            "The SEED dataset is served by the catalogue + packed-store pipeline: "
+            "run 'seed-catalog' then 'packed-feature-store' instead of this command"
+        )
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}")
     if not clips:
@@ -1551,9 +1576,15 @@ def validate_data(
     feature_database: str | Path | None = None,
     token_database: str | Path | None = None,
     trajectory_database: str | Path | None = None,
+    packed_store: str | Path | None = None,
     full: bool = False,
 ) -> dict[str, object]:
     """Run runtime validation, and optional value/checksum validation."""
+    if packed_store is not None:
+        from stylized_motion.data.seed_build import verify_packed_store
+
+        report = verify_packed_store(Path(packed_store), level="full" if full else "quick")
+        return {"packed": True, "full": bool(full), "report": report}
     feature_store = open_feature_store(feature_database) if feature_database is not None else None
     token_store = open_token_store(token_database) if token_database is not None else None
     trajectory_store = open_trajectory_store(trajectory_database, token_store=token_store) if trajectory_database is not None else None
@@ -1623,8 +1654,130 @@ def validate_data(
                 store.close()
 
 
+def build_seed_catalog_command(
+    seed_root: str | Path,
+    output: str | Path,
+    *,
+    mirror_policy: str = "official",
+    train_ratio: float = 0.8,
+    val_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+    split_seed: int = 3407,
+    stratify_key: str = "package",
+    actor_holdout: Iterable[str] = (),
+    actor_holdout_ratio: float = 0.0,
+    max_groups: int | None = None,
+    max_clips: int | None = None,
+    tier_groups: int | None = None,
+    metadata_csv: str | Path | None = None,
+    overwrite: bool = False,
+) -> Path:
+    """Discover the BONES-SEED catalogue and freeze its take-group split.
+
+    ``tier_groups`` builds a *representative* subset for the benchmark tiers:
+    whole take groups chosen to span packages, clip-length quantiles and
+    mirror coverage (plan §5). ``max_groups``/``max_clips`` remain available for
+    quick truncation, but only ever cut on group boundaries.
+    """
+    from stylized_motion.data.seed_catalog import (
+        SeedCatalog,
+        assign_group_splits,
+        catalog_frame_audit,
+        catalog_tier_report,
+        discover_catalog,
+        refresh_catalog_counts,
+        renumber_clips,
+        select_representative_groups,
+    )
+
+    clips, manifest = discover_catalog(
+        seed_root,
+        mirror_policy=mirror_policy,
+        metadata_csv=metadata_csv,
+        max_groups=max_groups,
+        max_clips=max_clips,
+    )
+    tier_report: dict[str, Any] | None = None
+    if tier_groups is not None:
+        keys = set(select_representative_groups(clips, int(tier_groups)))
+        clips = [clip for clip in clips if clip.group_key in keys]
+        if not clips:
+            raise ValueError(f"No clips remain for tier_groups={tier_groups}")
+        # Clip and group ids index the catalog's arrays, so a subset must
+        # renumber both and refresh the catalogue-wide counts before anything
+        # is persisted or packed.
+        renumber_clips(clips)
+        manifest = refresh_catalog_counts(manifest, clips)
+        manifest = {**manifest, "tier_groups": int(tier_groups), "truncated": True}
+        tier_report = catalog_tier_report(clips)
+    split = assign_group_splits(
+        clips,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+        seed=split_seed,
+        stratify_key=stratify_key,
+        actor_holdout=actor_holdout,
+        actor_holdout_ratio=actor_holdout_ratio,
+    )
+    manifest = {**manifest, **split, "frame_audit": catalog_frame_audit(clips)}
+    if tier_report is not None:
+        manifest["tier_report"] = tier_report
+    catalog = SeedCatalog(output, manifest, clips)
+    return catalog.save(overwrite=overwrite)
+
+
+def refresh_normalization(
+    store_path: str | Path,
+    *,
+    split: str = "train",
+    chunk_frames: int = 65536,
+    window_frames: int = 64,
+) -> dict[str, Any]:
+    """Recompute a store's normalization from its train split, in place.
+
+    Only two small artifacts change: ``normalization.npz``/``.json`` and the
+    ``normalization_hash`` in the manifest. Feature bytes, the clip table and
+    the split are untouched, which is the point of keeping statistics separate
+    from features.
+    """
+    from stylized_motion.data.normalization import compute_normalization
+    from stylized_motion.data.packed_store import open_packed_feature_store
+
+    path = Path(store_path)
+    if not (path / "manifest.json").exists():
+        raise FileNotFoundError(f"Missing packed store manifest: {path / 'manifest.json'}")
+    store = open_packed_feature_store(path, load_normalization=False)
+    try:
+        if str(split) != "train":
+            raise ValueError("Normalization must be computed from the train split")
+        normalization = compute_normalization(store, split=str(split), chunk_frames=chunk_frames)
+        manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+        if str(manifest.get("feature_schema_hash", "")) != store.feature_schema_hash:
+            raise ValueError("Packed store manifest feature_schema_hash does not match its schema")
+        if str(manifest.get("split_manifest_hash", "")) != store.split_manifest_hash:
+            raise ValueError("Packed store manifest split_manifest_hash does not match its clip table")
+        normalization.save(path)
+        manifest["normalization_hash"] = normalization.normalization_hash()
+        manifest["normalization_train_frames"] = int(normalization.train_frames)
+        temporary = path / f".manifest.json.tmp-{os.getpid()}"
+        temporary.write_text(
+            json.dumps(manifest, ensure_ascii=True, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
+        os.replace(temporary, path / "manifest.json")
+        return {
+            "store": str(path),
+            "normalization_hash": normalization.normalization_hash(),
+            "train_frames": int(normalization.train_frames),
+            "split": str(split),
+            "window_frames": int(window_frames),
+        }
+    finally:
+        store.close()
+
+
 def _build_cli_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build and validate schema-v3 motion data stores.")
+    parser = argparse.ArgumentParser(description="Build and validate canonical motion data stores.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     motion = subparsers.add_parser("motion-database")
     motion.add_argument("--dataset", choices=["lafan", "100style", "combined"], required=True)
@@ -1682,8 +1835,154 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     validate.add_argument("--feature-database", "--feature-store", dest="feature_database", type=Path, default=None)
     validate.add_argument("--token-database", type=Path, default=None)
     validate.add_argument("--trajectory-database", type=Path, default=None)
+    validate.add_argument("--packed-store", type=Path, default=None)
     validate.add_argument("--full", action="store_true")
+
+    seed_catalog = subparsers.add_parser("seed-catalog", help="Discover the BONES-SEED clip catalogue.")
+    seed_catalog.add_argument("--seed-root", type=Path, required=True)
+    seed_catalog.add_argument("--output", type=Path, required=True)
+    seed_catalog.add_argument("--mirror-policy", choices=["official", "generate", "none"], default="official")
+    seed_catalog.add_argument("--train-ratio", type=float, default=0.8)
+    seed_catalog.add_argument("--val-ratio", type=float, default=0.1)
+    seed_catalog.add_argument("--test-ratio", type=float, default=0.1)
+    seed_catalog.add_argument("--split-seed", type=int, default=3407)
+    seed_catalog.add_argument("--stratify-key", default="package")
+    seed_catalog.add_argument("--actor-holdout", default="", help="Comma-separated actor uids frozen into test.")
+    seed_catalog.add_argument("--actor-holdout-ratio", type=float, default=0.0)
+    seed_catalog.add_argument("--max-groups", type=int, default=None)
+    seed_catalog.add_argument("--max-clips", type=int, default=None)
+    seed_catalog.add_argument(
+        "--tier-groups",
+        type=int,
+        default=None,
+        help="Build a representative tier of N whole take groups (packages x length x mirror coverage).",
+    )
+    seed_catalog.add_argument("--metadata-csv", type=Path, default=None)
+    seed_catalog.add_argument("--overwrite", action="store_true")
+
+    inventory = subparsers.add_parser("seed-inventory", help="Probe SEED headers and pairing once.")
+    inventory.add_argument("--catalog", type=Path, required=True)
+    inventory.add_argument("--seed-root", type=Path, default=None)
+    inventory.add_argument("--output", type=Path, default=None)
+    inventory.add_argument("--workers", type=int, default=4)
+    inventory.add_argument("--overwrite", action="store_true")
+
+    packed = subparsers.add_parser("packed-feature-store", help="Build a schema-v4 packed feature store.")
+    packed.add_argument("--catalog", type=Path, required=True)
+    packed.add_argument("--output", type=Path, required=True)
+    packed.add_argument("--seed-root", type=Path, default=None)
+    packed.add_argument("--workers", type=int, default=4)
+    packed.add_argument("--shard-mib", type=int, default=256)
+    packed.add_argument("--unit-cache", type=Path, default=None)
+    packed.add_argument("--purge-units", action="store_true")
+    packed.add_argument("--no-prune-ends-and-fingers", action="store_true")
+    packed.add_argument("--verify", choices=["quick", "checksum", "full"], default="full")
+    packed.add_argument("--max-inflight", type=int, default=None)
+    packed.add_argument("--max-inflight-mib", type=int, default=None)
+    packed.add_argument("--limit-clips", type=int, default=None)
+    packed.add_argument("--overwrite", action="store_true")
+
+    stats = subparsers.add_parser("train-stats", help="Refresh a packed store's train normalization.")
+    stats.add_argument("--store", type=Path, required=True)
+    stats.add_argument("--split", default="train")
+    stats.add_argument("--chunk-frames", type=int, default=65536)
+
+    packed_tokens = subparsers.add_parser(
+        "packed-token-store", help="Encode a packed feature store clip by clip."
+    )
+    packed_tokens.add_argument("--feature-store", "--feature-database", dest="feature_store", type=Path, required=True)
+    packed_tokens.add_argument("--output", type=Path, required=True)
+    packed_tokens.add_argument("--checkpoint", type=Path, required=True)
+    packed_tokens.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
+    packed_tokens.add_argument("--chunk-size", type=int, default=1024)
+    packed_tokens.add_argument("--unit-cache", type=Path, default=None)
+    packed_tokens.add_argument("--shard-mib", type=int, default=128)
+    packed_tokens.add_argument("--save-codes", action="store_true")
+    packed_tokens.add_argument("--limit-clips", type=int, default=None)
+    packed_tokens.add_argument("--overwrite", action="store_true")
+
+    packed_traj = subparsers.add_parser(
+        "packed-trajectory-store", help="Stream clip-local trajectory controls."
+    )
+    packed_traj.add_argument("--feature-store", "--feature-database", dest="feature_store", type=Path, required=True)
+    packed_traj.add_argument("--output", type=Path, required=True)
+    packed_traj.add_argument("--future-frames", default="20,40,60")
+    packed_traj.add_argument("--checkpoint", type=Path, default=None)
+    packed_traj.add_argument("--overwrite", action="store_true")
     return parser
+
+
+def _catalog_seed_root(catalog: Any, override: str | Path | None) -> Path:
+    """Resolve the SEED raw root for a catalogue.
+
+    The catalogue records its own root; the metadata-CSV fallback only serves
+    catalogues written before that field existed, and is derived from the CSV's
+    location rather than from any assumption about the current directory.
+    """
+    if override is not None:
+        return Path(override)
+    recorded = catalog.manifest.get("seed_root")
+    if recorded:
+        return Path(str(recorded))
+    metadata_csv = Path(str(catalog.manifest["metadata_csv"]))
+    return metadata_csv.parents[1] if metadata_csv.parent.name == "metadata" else metadata_csv.parent
+
+
+def run_packed_token_store(args: argparse.Namespace) -> None:
+    """Composition-root entry point that injects the checkpoint's encoder."""
+    from stylized_motion.data.feature_data import sha256_file
+    from stylized_motion.data.packed_token import build_packed_token_store
+    from stylized_motion.learning.representation import load_representation_checkpoint
+    from stylized_motion.learning.runner import choose_device
+
+    from stylized_motion.data.packed_store import open_any_feature_store
+
+    device = choose_device(args.device)
+    # The normalization artifact is required: the encoder consumes
+    # store-normalized frames, and the adapter below re-bases them.
+    feature_store = open_any_feature_store(args.feature_store)
+    try:
+        checkpoint, encoder = load_representation_checkpoint(
+            args.checkpoint,
+            device,
+            feature_schema=feature_store.feature_schema(),
+        )
+        # The encoder was trained against the checkpoint's normalization, while
+        # the builder hands it values normalized by the *store's* statistics.
+        # The adapter therefore undoes the store normalization and re-applies
+        # the checkpoint's, which is exactly what the v3 token path does.
+        checkpoint_stats = checkpoint.get("feature_stats")
+        if not isinstance(checkpoint_stats, dict):
+            raise ValueError("Representation checkpoint is missing feature_stats")
+        store_offset = feature_store.stats.offset.astype("float32")
+        store_scale = feature_store.stats.scale.astype("float32")
+        source_offset = torch.from_numpy(store_offset).to(device)
+        source_scale = torch.from_numpy(store_scale).to(device)
+        checkpoint_offset = torch.as_tensor(checkpoint_stats["offset"], dtype=torch.float32, device=device)
+        checkpoint_scale = torch.as_tensor(checkpoint_stats["scale"], dtype=torch.float32, device=device)
+
+        def input_adapter(values: torch.Tensor) -> torch.Tensor:
+            raw = values * source_scale.view(1, 1, -1) + source_offset.view(1, 1, -1)
+            return (raw - checkpoint_offset.view(1, 1, -1)) / checkpoint_scale.view(1, 1, -1)
+
+        report = build_packed_token_store(
+            args.feature_store,
+            args.output,
+            encoder=encoder,
+            checkpoint_sha256=sha256_file(args.checkpoint),
+            model_family_legacy=str(checkpoint.get("model_family", "")),
+            device=device,
+            chunk_size=int(args.chunk_size),
+            unit_dir=args.unit_cache,
+            shard_bytes=int(args.shard_mib) * 1024 * 1024,
+            save_codes=bool(args.save_codes),
+            limit_clips=args.limit_clips,
+            input_adapter=input_adapter,
+            overwrite=bool(args.overwrite),
+        )
+        print(json.dumps(report, indent=2, sort_keys=True))
+    finally:
+        feature_store.close()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1714,7 +2013,108 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "trajectory-database":
         build_trajectory_database(args.token_database, args.trajectory_input, args.output, overwrite=args.overwrite)
     elif args.command == "validate-data":
-        print(json.dumps(validate_data(feature_database=args.feature_database, token_database=args.token_database, trajectory_database=args.trajectory_database, full=args.full), indent=2))
+        print(json.dumps(validate_data(feature_database=args.feature_database, token_database=args.token_database, trajectory_database=args.trajectory_database, packed_store=args.packed_store, full=args.full), indent=2))
+    elif args.command == "seed-catalog":
+        holdout = [item.strip() for item in str(args.actor_holdout).split(",") if item.strip()]
+        path = build_seed_catalog_command(
+            args.seed_root,
+            args.output,
+            mirror_policy=args.mirror_policy,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+            split_seed=args.split_seed,
+            stratify_key=args.stratify_key,
+            actor_holdout=holdout,
+            actor_holdout_ratio=args.actor_holdout_ratio,
+            max_groups=args.max_groups,
+            max_clips=args.max_clips,
+            tier_groups=args.tier_groups,
+            metadata_csv=args.metadata_csv,
+            overwrite=args.overwrite,
+        )
+        from stylized_motion.data.seed_catalog import SeedCatalog
+
+        saved = SeedCatalog.load(path)
+        print(
+            json.dumps(
+                {
+                    "catalog": str(path),
+                    "clips": saved.num_clips,
+                    "split_coverage": saved.manifest.get("split_coverage", {}),
+                    "tier_report": saved.manifest.get("tier_report"),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    elif args.command == "seed-inventory":
+        from stylized_motion.data.seed_build import INVENTORY_FILENAME, inventory_catalog
+        from stylized_motion.data.seed_catalog import SeedCatalog
+
+        catalog = SeedCatalog.load(args.catalog)
+        seed_root = _catalog_seed_root(catalog, args.seed_root)
+        output = args.output or (Path(args.catalog) / INVENTORY_FILENAME)
+        summary = inventory_catalog(
+            catalog, seed_root, output, workers=args.workers, overwrite=args.overwrite
+        )
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    elif args.command == "packed-feature-store":
+        from stylized_motion.data.seed_build import SeedBuildConfig, build_packed_feature_store
+        from stylized_motion.data.seed_catalog import SeedCatalog
+
+        catalog = SeedCatalog.load(args.catalog)
+        seed_root = _catalog_seed_root(catalog, args.seed_root)
+        report = build_packed_feature_store(
+            catalog,
+            SeedBuildConfig(
+                root=Path(seed_root),
+                output=args.output,
+                mirror_policy=str(catalog.manifest.get("mirror_policy", "official")),
+                prune_ends_and_fingers=not args.no_prune_ends_and_fingers,
+                shard_bytes=int(args.shard_mib) * 1024 * 1024,
+                workers=int(args.workers),
+                max_inflight=args.max_inflight,
+                max_inflight_bytes=None
+                if args.max_inflight_mib is None
+                else int(args.max_inflight_mib) * 1024 * 1024,
+                unit_cache=args.unit_cache,
+                purge_units=bool(args.purge_units),
+                verify=str(args.verify),
+                limit_clips=args.limit_clips,
+            ),
+            overwrite=bool(args.overwrite),
+        )
+        print(json.dumps(report, indent=2, sort_keys=True))
+    elif args.command == "train-stats":
+        print(
+            json.dumps(
+                refresh_normalization(args.store, split=args.split, chunk_frames=args.chunk_frames),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    elif args.command == "packed-token-store":
+        raise RuntimeError(
+            "packed-token-store requires an injected encoder; call run.py or build_packed_token_store()"
+        )
+    elif args.command == "packed-trajectory-store":
+        from stylized_motion.data.packed_trajectory import build_packed_trajectory_store
+
+        frames = [int(value) for value in str(args.future_frames).split(",") if value.strip()]
+        print(
+            json.dumps(
+                build_packed_trajectory_store(
+                    args.feature_store,
+                    args.output,
+                    future_frames=frames,
+                    overwrite=bool(args.overwrite),
+                    checkpoint_sha256="",
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+        )
 
 
 __all__ = [
@@ -1722,9 +2122,11 @@ __all__ = [
     "build_feature_database",
     "build_fsq_window_index",
     "build_motion_database",
+    "build_seed_catalog_command",
     "build_token_database",
     "build_trajectory_database",
     "build_trajectory_inputs",
+    "refresh_normalization",
     "validate_data",
 ]
 

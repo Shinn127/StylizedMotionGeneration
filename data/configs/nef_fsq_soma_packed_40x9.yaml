@@ -1,0 +1,100 @@
+# NEF-FSQ on the pruned BONES-SEED SOMA skeleton, reading a schema-v4 packed store.
+#
+# This is the BONES-SEED counterpart of nef_fsq_soma_40x9.yaml: the data section
+# points at the packed store produced by 'seed-catalog' + 'packed-feature-store'
+# and the budget section keeps "one epoch" from silently meaning "one pass over
+# 900k windows".
+representation:
+  family: nef_fsq
+  variant: independent
+  config:
+    motion_dim: 248
+    stream_dim: 128
+    num_levels: 9
+    activation: relu
+    norm:
+    fsq_scale:
+    fsq_preserve_symmetry: false
+    fsq_noise_dropout: 0.0
+
+data:
+  # The store directory itself (it holds manifest.json, motion/, clips/ and
+  # normalization.*). The catalog, unit cache, token store and trajectory store
+  # live next to it, not inside it — publishing replaces the store atomically.
+  fsq_window_index: data/processed/seed_soma_pruned_v4
+  required_data_schema_version: 4
+
+sampling:
+  strategy: clip_uniform        # or frame_uniform to weight by valid start frames
+  target_frames: 64
+  # A global sample budget per epoch; the DDP ranks split it evenly.
+  samples_per_epoch: 100000
+  seed: 3407
+  mirror_probability: 0.5
+  # Equal per-rank step counts even when the budget is not divisible: 'drop'
+  # trims the tail, 'pad' wraps it.
+  tail: drop
+  # Bound the *monitoring* validation subset (cheap, runs every epoch). The test
+  # split is never limited, and best.pt is never decided by this subset: the
+  # unbounded sweep configured under evaluation.full_eval_every_epochs does that.
+  # Set to null to make validation unbounded everywhere.
+  eval_limit: 2048
+  track_coverage: true
+  # Optional ablation: mix in a balanced package/style distribution. Inverse
+  # frequency is capped against the natural distribution so a rare class with a
+  # dozen clips is not repeated endlessly.
+  # strategy: group_balanced
+  # balance_key: package
+  # balance_mix: 0.3
+  # balance_max_ratio: 4.0
+
+training:
+  epochs: 100
+  # Step budget: 100k samples at batch 512 is 195 steps per epoch.
+  steps_per_epoch: 195
+  max_steps: 60000
+  # 0 = checkpoint only at epoch boundaries. Set to N to also write last.pt
+  # every N steps; it carries the sampler position, so a crash mid-epoch can be
+  # resumed from the exact next sample.
+  checkpoint_every_steps: 0
+  lr: 0.0005
+  weight_decay: 0.0
+  precision: fp32
+  seed: 3407
+  deterministic: false
+  grad_clip_norm: 1.0
+  output_dir: outputs/nef_fsq_soma_packed_40x9
+  delta_weight: 3.0
+  root_pos_weight: 0.0
+  root_rot_weight: 0.0
+  joint_weight: 0.0
+  contact_weight: 0.0
+  foot_slide_weight: 0.0
+  foot_height_weight: 0.0
+  reuse_weight: 0.0
+  base_reuse_weight: 0.0
+  latent_energy_weight: 0.0
+  base_recon_weight: 0.0
+  edit_weight: 0.0
+  edit_preserve_weight: 0.0
+
+evaluation:
+  metrics_interval: 100
+  root_dt: 0.016666666666666666
+  # Mid-epoch monitoring on the bounded validation subset, and how often the
+  # unbounded validation sweep runs (it always runs on the final epoch).
+  eval_every_steps: 0
+  full_eval_every_epochs: 1
+
+loader:
+  batch_size: 512
+  num_workers: 4
+  prefetch_factor: 2
+  persistent_workers: true
+  drop_last_train: true
+  max_open_shards: 16
+  prefetch_memory_limit_mb: 512
+  # 'cpu' normalizes the assembled CPU batch from the store's versioned
+  # statistics; 'none' hands raw frames plus the statistics to the caller for a
+  # GPU-side normalization (compare with 'benchmark data' before switching).
+  normalize_on: cpu

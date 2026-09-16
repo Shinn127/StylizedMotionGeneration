@@ -1,0 +1,5 @@
+# NEF-FSQ training on the schema-v4 packed BONES-SEED SOMA store.
+--mode train
+--pipeline representation
+--representation nef-fsq
+--config data/configs/nef_fsq_soma_packed_40x9.yaml

@@ -32,6 +32,12 @@ COMMANDS: dict[tuple[str, str], str] = {
     ("preprocess", "trajectory-inputs"): "stylized_motion.data.preprocess",
     ("preprocess", "trajectory-database"): "stylized_motion.data.preprocess",
     ("preprocess", "validate-data"): "stylized_motion.data.preprocess",
+    ("preprocess", "seed-catalog"): "stylized_motion.data.preprocess",
+    ("preprocess", "seed-inventory"): "stylized_motion.data.preprocess",
+    ("preprocess", "packed-feature-store"): "stylized_motion.data.preprocess",
+    ("preprocess", "train-stats"): "stylized_motion.data.preprocess",
+    ("preprocess", "packed-token-store"): "stylized_motion.data.preprocess",
+    ("preprocess", "packed-trajectory-store"): "stylized_motion.data.preprocess",
     ("train", "representation"): "stylized_motion.learning.runner",
     ("validate", "representation"): "stylized_motion.learning.runner",
     ("test", "representation"): "stylized_motion.learning.runner",
@@ -44,6 +50,7 @@ COMMANDS: dict[tuple[str, str], str] = {
     ("visualize", "somaview"): "stylized_motion.anim.somaview",
     ("visualize", "realtime"): "stylized_motion.anim.realtime_fsq_controller",
     ("visualize", "plot"): "stylized_motion.anim.visualization",
+    ("benchmark", "data"): "stylized_motion.data.benchmark",
     ("preprocess", "soma-assets"): "stylized_motion.anim.soma_assets",
     ("preprocess", "quinn-assets"): "stylized_motion.anim.quinn_to_soma_assets",
 }
@@ -225,6 +232,10 @@ def main(argv: list[str] | None = None) -> None:
         ]
     if args.mode == "preprocess" and args.pipeline == "token-database":
         _run_token_database(forwarded_args[1:])
+    elif args.mode == "preprocess" and args.pipeline == "packed-token-store":
+        from stylized_motion.data.preprocess import _build_cli_parser, run_packed_token_store
+
+        run_packed_token_store(_build_cli_parser().parse_args(forwarded_args))
     else:
         _run_module(module_name, forwarded_args)
 

@@ -42,8 +42,12 @@ stylized_motion/
 tests/                        contract 与回归测试
 docs/
   latent_residual_part_fsq_v2_spec.md
+  bones_seed_data_pipeline_plan.md          SEED 数据管线迁移方案
+  bones_seed_pipeline_implementation.md     落地范围、验证情况与待办
   assets/pbr_baseline/        受版本控制的离屏渲染回归图像
 ```
+
+`stylized_motion/data/` 同时提供两代数据契约：v3（`feature_data.py`、`token_data.py`、`trajectory_data.py`，每来源一分片并预归一化）与 v4（`seed_catalog.py`、`seed_build.py`、`packed_store.py`、`packed_token.py`、`packed_trajectory.py`，物理分片与逻辑 clip 解耦、统计独立版本化）。`packed_store.open_any_feature_store` 按 manifest 的 `data_schema_version` 分派，v3 store 不会被就地改写。
 
 `data/raw/`、`data/processed/` 和 `outputs/` 都是本地数据或生成结果，不纳入版本控制。`data/processed/` 的 FeatureStore/TokenStore 及 `outputs/` 的 checkpoint 均可从原始数据、配置和训练命令重建。
 
@@ -92,6 +96,56 @@ python -m stylized_motion.run \
 ```
 
 `motion-database`、`feature-database`、`trajectory-inputs` 和 `trajectory-database` 仍可由 preprocess pipeline 调用，分别服务原始动作检查和 trajectory 条件输入；canonical FSQ representation 训练读取的是 `fsq-window-index`。
+
+### BONES-SEED（schema v4 packed store）
+
+一张图看清数据从原始 BVH 到训练的全部阶段：[docs/seed_pipeline_overview.md](docs/seed_pipeline_overview.md)。
+
+SEED 不走上面那条“每个来源生成 original/mirror 两个文件”的路径：官方已有约 7.1 万个镜像文件，重复生成会让特征量翻倍。SEED 使用目录化入口，特征只存一份未归一化版本，统计与 split 各自版本化：
+
+```text
+CSV metadata
+  -> seed-catalog           # clip 目录、帧契约、镜像策略、take-group split
+  -> seed-inventory         # header / fps / 骨架 / 帧数一次性核对
+  -> packed-feature-store   # ~256 MiB 未归一化分片 + clip 表 + 统计（可中断续跑）
+  -> packed-token-store     # 按逻辑 clip 编码（generator 需要）
+  -> packed-trajectory-store# clip-local 未来控制量 + validity mask
+```
+
+目录约定：**store 自身就是配置里写的那个目录**，catalog 与 unit 缓存放在它外面（publish 会整体替换 store 目录，缓存若在内部会被一并删除，构建会直接拒绝这种路径）：
+
+| 产物 | 路径 |
+| --- | --- |
+| 特征 store（`data.fsq_window_index`） | `data/processed/seed_soma_pruned_v4` |
+| catalog + inventory | `data/processed/seed_soma_pruned_v4_catalog` |
+| unit 缓存（可删，删后重跑） | `data/processed/seed_soma_pruned_v4_units` |
+| token store | `data/processed/seed_soma_pruned_v4_tokens` |
+| trajectory store | `data/processed/seed_soma_pruned_v4_trajectory` |
+
+```bash
+python -m stylized_motion.run --mode preprocess --pipeline seed-catalog \
+  --seed-root data/raw/seed --output data/processed/seed_soma_pruned_v4_catalog \
+  --mirror-policy official
+
+python -m stylized_motion.run --mode preprocess --pipeline packed-feature-store \
+  --catalog data/processed/seed_soma_pruned_v4_catalog \
+  --output data/processed/seed_soma_pruned_v4 \
+  --unit-cache data/processed/seed_soma_pruned_v4_units \
+  --workers 12 --shard-mib 256
+
+# split 或统计变化时，只重算统计，不重写特征字节
+python -m stylized_motion.run --mode preprocess --pipeline train-stats \
+  --store data/processed/seed_soma_pruned_v4
+```
+
+对应训练配置 `data/configs/nef_fsq_soma_packed_40x9.yaml`（`required_data_schema_version: 4`）。验证预算与评估节奏分开：`sampling.eval_limit` 限制的是**监控子集**，`evaluation.full_eval_every_epochs` 控制**全量验证**周期，`best.pt` 只依据全量验证（没有配置 `eval_limit` 时两者是同一个 loader）。训练预算由 `training.steps_per_epoch` / `max_steps` / `checkpoint_every_steps` 控制，`--checkpoint` 指向已有 checkpoint 即从该处续跑。分层 benchmark：
+
+```bash
+python -m stylized_motion.run --mode benchmark --pipeline data \
+  --store data/processed/seed_soma_pruned_v4 --layers sampler,loader,resident,end_to_end
+```
+
+落地范围、已验证内容与待办见 [docs/bones_seed_pipeline_implementation.md](docs/bones_seed_pipeline_implementation.md)。
 
 ## Representation 训练
 
