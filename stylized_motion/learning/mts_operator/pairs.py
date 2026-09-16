@@ -328,6 +328,11 @@ class StylePairSampler:
         candidates = self.candidates(target, mode=mode, stage=stage)
         if not candidates:
             return []
+        if generator is not None and not isinstance(generator, np.random.Generator):
+            raise TypeError(
+                "StylePairSampler needs a numpy.random.Generator, got "
+                f"{type(generator).__name__}"
+            )
         rng = generator or np.random.default_rng(self.seed)
         indices = rng.choice(len(candidates), size=min(int(count), len(candidates)), replace=False)
         return [StylePair(target=target, reference=candidates[int(index)], mode=mode) for index in indices]
@@ -341,7 +346,16 @@ class StylePairSampler:
         targets: Sequence[ClipRecord] | None = None,
         generator: np.random.Generator | None = None,
     ) -> list[StylePair]:
-        """Draws ``count`` pairs, preferring targets that have references."""
+        """Draws ``count`` pairs, preferring targets that have references.
+
+        ``generator`` is a ``numpy.random.Generator``; the pairing logic is index
+        arithmetic over clip records, not tensor sampling.
+        """
+        if generator is not None and not isinstance(generator, np.random.Generator):
+            raise TypeError(
+                "StylePairSampler needs a numpy.random.Generator, got "
+                f"{type(generator).__name__}"
+            )
         rng = generator or np.random.default_rng(self.seed)
         pool = list(targets) if targets is not None else [
             record for record in self.records if record.style in set(self.styles_for_stage(stage))

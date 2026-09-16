@@ -268,9 +268,29 @@ class StyleOperator(nn.Module):
     def forward(self, inputs: OperatorInputs) -> OperatorOutput:  # pragma: no cover - abstract
         raise NotImplementedError
 
+    def config(self) -> dict[str, Any]:
+        """Constructor arguments, so a checkpoint can rebuild this operator.
+
+        This is what a checkpoint replays; ``describe()`` adds the read-only
+        facts (level count, context width, structural flags) that are derived.
+        """
+        payload: dict[str, Any] = {
+            "hidden_dim": self.hidden_dim,
+            "coordinate_dim": int(self.coordinate_embedding.embedding_dim),
+            "style_dim": None
+            if self.style_projection is None
+            else int(self.style_projection.in_features),
+            "stream_dim": self.stream_dim,
+        }
+        for name in ("identity_mix", "max_rate", "uniformization_tolerance", "max_terms"):
+            if hasattr(self, name):
+                payload[name] = getattr(self, name)
+        return payload
+
     def describe(self) -> dict[str, Any]:
         return {
             "name": self.name,
+            "config": self.config(),
             "num_levels": self.num_levels,
             "hidden_dim": self.hidden_dim,
             "stream_dim": self.stream_dim,

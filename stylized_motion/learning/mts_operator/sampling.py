@@ -127,10 +127,12 @@ def paired_comparison(
         uniforms = torch.rand(
             base_probabilities.shape[:-1], generator=generator, device=base_probabilities.device
         )
-    base_tokens = inverse_cdf_sample(base_probabilities, uniforms)
-    styled_tokens = inverse_cdf_sample(styled_probabilities, uniforms)
+    base_tokens = inverse_cdf_sample(base_probabilities.detach(), uniforms)
+    styled_tokens = inverse_cdf_sample(styled_probabilities.detach(), uniforms)
     changed = base_tokens != styled_tokens
-    total_variation = 0.5 * (base_probabilities - styled_probabilities).abs().sum(dim=-1)
+    total_variation = (
+        0.5 * (base_probabilities.detach() - styled_probabilities.detach()).abs().sum(dim=-1)
+    )
     result: dict[str, Any] = {
         "changed_token_ratio": float(changed.float().mean()),
         "changed_token_count": int(changed.sum()),

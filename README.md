@@ -42,6 +42,9 @@ stylized_motion/
 tests/                        contract 与回归测试
 docs/
   latent_residual_part_fsq_v2_spec.md
+  MTS_FSQ_SIGGRAPH_Implementation_Plan_zh.md  MTS-FSQ 研究方案
+  mts_operator_landing.md                     MTS-FSQ 落地对照与未验证项
+  nef_phase0_probe.md                         NEF Phase 0 探针使用说明
   bones_seed_data_pipeline_plan.md          SEED 数据管线迁移方案
   bones_seed_pipeline_implementation.md     落地范围、验证情况与待办
   assets/pbr_baseline/        受版本控制的离屏渲染回归图像
@@ -195,6 +198,31 @@ python -m stylized_motion.run \
 ```
 
 训练输出默认为配置中的 `training.output_dir`，包含 `last.pt`、`best.pt` 和 `tensorboard/`。完整训练是耗时操作；开始前应确认数据路径、输出目录、seed 与 device。TensorBoard 日志记录通用重建/运动学损失；各 family 的专用 loss 会写入 checkpoint metrics 与控制台汇总。
+
+### MTS style operator（研究分支 `feat/mts-fsq-siggraph`）
+
+`stylized_motion/learning/mts_operator/` 是方案 §5 的算子包：token/掩码 contract（`contract.py`）、
+layout 只读索引（`layout_adapter.py`）、无 style 的 base transport（`embeddings.py`、`graph.py`、
+`masking.py`、`transport.py`）、三族风格算子（`operators.py`：logit field / arbitrary kernel /
+birth-death CTMC）、耦合采样（`sampling.py`）、style pair 审计（`pairs.py`）、参考风格编码
+（`style_encoder.py`）、顶层模型与训练循环（`model.py`、`training.py`）、指标（`metrics.py`）。
+
+```bash
+python scripts/probe_nef_geometry.py --checkpoint <nef.pt> --feature-database <store> --split test
+python scripts/audit_style_pairs.py --feature-database <store> --output outputs/mts_pairs/audit
+python scripts/train_mts_transport.py --config data/configs/mts_operator_transport.yaml \
+  --tokenizer-checkpoint <nef.pt> --output outputs/mts_transport/seed3407
+python scripts/train_mts_operator.py --config data/configs/mts_operator_style.yaml \
+  --tokenizer-checkpoint <nef.pt> --transport-checkpoint <transport.pt> --operator birth_death
+python scripts/evaluate_mts_operator.py --checkpoint <operator.pt> --tokenizer-checkpoint <nef.pt> \
+  --feature-database <store> --split test
+python scripts/generate_mts_operator.py --checkpoint <operator.pt> --tokenizer-checkpoint <nef.pt> \
+  --feature-database <store> --content-clip 0 --style-clip 3 --regions left_arm --locked-edit
+```
+
+落地范围、已用真实数据验证的读数、以及**尚未验证**的部分见
+[docs/mts_operator_landing.md](docs/mts_operator_landing.md)；Phase 0 两个探针怎么读见
+[docs/nef_phase0_probe.md](docs/nef_phase0_probe.md)。
 
 ## TokenStore 与 Generator
 

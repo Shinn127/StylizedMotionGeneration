@@ -252,6 +252,7 @@ class MtsStyleOperator(nn.Module):
         *,
         sampler: Any | None = None,
         generator: torch.Generator | None = None,
+        crn: Any | None = None,
         crn_shape: tuple[int, int, int] | None = None,
     ) -> torch.Tensor:
         """Samples the styled distribution inside the support, locking the rest.
@@ -262,7 +263,11 @@ class MtsStyleOperator(nn.Module):
         target = self.spec.validate_tokens(batch.target_tokens)
         result = self(batch)
         probabilities = result.probabilities.to(target.device)
-        drawn = sample_tokens(probabilities, generator=generator)
+        if crn is not None:
+            # Coupled draw: identical uniforms across conditions.
+            drawn = crn.sample(probabilities)
+        else:
+            drawn = sample_tokens(probabilities, generator=generator)
         if batch.hard_mask is not None:
             support = batch.hard_mask.to(target.device).bool()
             if support.ndim == 2:

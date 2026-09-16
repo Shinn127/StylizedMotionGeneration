@@ -66,7 +66,7 @@ from stylized_motion.learning.representation import (  # noqa: E402
 )
 from stylized_motion.learning.runner import choose_device, set_seed  # noqa: E402
 
-STYLE_ENCODER_KEYS = (
+REFERENCE_ENCODER_KEYS = (
     "dim",
     "depth",
     "heads",
@@ -75,16 +75,19 @@ STYLE_ENCODER_KEYS = (
     "temporal_mode",
     "output_dim",
     "pooling",
-    "num_styles",
 )
-OPERATOR_KEYS = (
-    "hidden_dim",
-    "coordinate_dim",
-    "max_dropout",
-    "max_rate",
-    "uniformization_tolerance",
-    "max_terms",
-    "identity_mix",
+STYLE_ID_ENCODER_KEYS = ("num_styles", "output_dim", "dim")
+# Options every family accepts, plus the kind-specific ones.  A config may
+# carry both (so `--operator` can switch families), but only the chosen family's
+# keys are passed on: a typo still fails because the *union* is validated.
+COMMON_OPERATOR_KEYS = ("hidden_dim", "coordinate_dim")
+OPERATOR_SPECIFIC_KEYS = {
+    "logit_field": (),
+    "arbitrary_kernel": ("identity_mix",),
+    "birth_death": ("max_rate", "uniformization_tolerance", "max_terms"),
+}
+OPERATOR_KEYS = COMMON_OPERATOR_KEYS + tuple(
+    key for keys in OPERATOR_SPECIFIC_KEYS.values() for key in keys
 )
 
 
@@ -278,14 +281,19 @@ def main(argv: list[str] | None = None) -> None:
     )
     transport.eval()
 
-    style_config = dict(config["style_encoder"])
+    # Unset YAML keys are dropped, and each kind only accepts its own options,
+    # so a config can carry both kinds' keys without confusing either one.
+    style_config = {key: value for key, value in dict(config["style_encoder"]).items() if value is not None}
     kind = str(style_config.pop("kind", "reference"))
-    unknown = sorted(set(style_config) - set(STYLE_ENCODER_KEYS))
+    allowed = REFERENCE_ENCODER_KEYS if kind == "reference" else STYLE_ID_ENCODER_KEYS
+    unknown = sorted(set(style_config) - set(allowed) - {"num_styles"} if kind == "reference" else set(style_config) - set(allowed))
     if unknown:
-        raise ValueError(f"Unknown style_encoder options {unknown}")
+        raise ValueError(f"Unknown style_encoder options {unknown} for kind {kind!r}")
     if kind == "reference":
         style_encoder = GlobalStyleEncoder(adapter, **style_config)
     elif kind == "style_id":
+        if "num_styles" not in style_config:
+            raise ValueError("style_encoder.kind=style_id requires num_styles")
         style_encoder = StyleIDEncoder(
             num_styles=int(style_config["num_styles"]),
             output_dim=int(style_config.get("output_dim") or style_config.get("dim") or 256),
@@ -294,16 +302,23 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(f"Unknown style_encoder.kind {kind!r}; expected reference or style_id")
 
     operator_config = dict(config["operator"])
-    operator_name = args.operator or str(operator_config.pop("name", "birth_death"))
+    # Pop before choosing: `args.operator or config.pop(...)` would skip the pop
+    # whenever the CLI flag is set, leaving `name` in the constructor kwargs.
+    configured_operator = str(operator_config.pop("name", "birth_death"))
+    operator_name = args.operator or configured_operator
     operator_config.pop("strength", None)
     unknown = sorted(set(operator_config) - set(OPERATOR_KEYS))
     if unknown:
         raise ValueError(f"Unknown operator options {unknown}")
+    accepted = set(COMMON_OPERATOR_KEYS) | set(OPERATOR_SPECIFIC_KEYS.get(operator_name, ()))
+    ignored = sorted(set(operator_config) - accepted)
+    if ignored:
+        print(f"ignoring options that {operator_name!r} does not accept: {ignored}", flush=True)
     operator = build_operator(
         operator_name,
         num_levels=adapter.num_levels,
         stream_dim=int(transport.dim),
-        **operator_config,
+        **{key: value for key, value in operator_config.items() if key in accepted},
     )
     model = MtsStyleOperator(
         adapter,
@@ -407,6 +422,9 @@ def main(argv: list[str] | None = None) -> None:
                 "operator": operator_name,
                 "style_encoder_kind": kind,
                 "content_weight": content_weight,
+                # Recorded so evaluation restores the exact frozen upstream.
+                "transport_checkpoint": str(transport_path),
+                "tokenizer_checkpoint": str(tokenizer_path),
             },
             epoch=epoch,
             global_step=active.global_step,
