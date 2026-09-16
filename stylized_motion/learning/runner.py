@@ -61,6 +61,45 @@ _WEIGHTED_MOTION_COMPONENTS = {
     "foot_slide": "foot_slide_weight",
     "foot_height": "foot_height_weight",
 }
+# The physical terms a staged objective is allowed to ramp in.  ``recon`` and
+# ``delta`` are the representation-defining objective and never ramp.
+_PHYSICAL_WEIGHT_KEYS = (
+    "root_pos_weight",
+    "root_rot_weight",
+    "joint_weight",
+    "contact_weight",
+    "foot_slide_weight",
+    "foot_height_weight",
+)
+
+
+def physical_schedule_scale(epoch: int, warmup_epochs: int, ramp_epochs: int) -> float:
+    """Weight scale of the physical terms at ``epoch`` (1-based).
+
+    Epochs ``1..warmup`` train the representation objective alone, the next
+    ``ramp`` epochs raise the physical terms linearly, and everything after
+    that runs at the configured weight.  A zero ramp is a step at the warmup
+    boundary, so ``warmup=0, ramp=0`` reproduces a flat objective.
+    """
+    warmup = int(warmup_epochs)
+    ramp = int(ramp_epochs)
+    if warmup < 0 or ramp < 0:
+        raise ValueError("physical warmup/ramp epochs must be non-negative")
+    epoch = int(epoch)
+    if epoch <= warmup:
+        return 0.0
+    if ramp == 0:
+        return 1.0
+    return float(min(1.0, (epoch - warmup) / ramp))
+
+
+def effective_loss_weights(context: Mapping[str, Any]) -> dict[str, float]:
+    """Configured loss weights with the staged physical scale applied."""
+    scale = float(context.get("physical_scale", 1.0))
+    weights = {key: float(context[key]) for key in _WEIGHTED_MOTION_COMPONENTS.values() if key}
+    for key in _PHYSICAL_WEIGHT_KEYS:
+        weights[key] = weights[key] * scale
+    return weights
 
 
 def choose_device(name: str = "auto") -> torch.device:
@@ -241,7 +280,20 @@ def build_loss_context(config: Mapping[str, object], store: FeatureStore, device
         "base_recon_weight": float(training.get("base_recon_weight", 0.1)),
         "edit_weight": float(training.get("edit_weight", 0.25)),
         "edit_preserve_weight": float(training.get("edit_preserve_weight", 1.0)),
+        # Staged objectives: ``physical_scale`` is set by the runner before each
+        # epoch, so a single loss closure serves both the warmup and the ramp.
+        "objective_variant": str(training.get("objective_variant", "recon_delta")),
+        "physical_scale": 1.0,
+        "physical_warmup_epochs": int(training.get("physical_warmup_epochs", 0)),
+        "physical_ramp_epochs": int(training.get("physical_ramp_epochs", 0)),
     }
+    if context["physical_warmup_epochs"] < 0 or context["physical_ramp_epochs"] < 0:
+        raise ValueError("training.physical_warmup_epochs/ramp_epochs must be non-negative")
+    if context["objective_variant"] not in {"recon_delta", "recon_delta_physical_warmup"}:
+        raise ValueError(
+            f"Unsupported training.objective_variant {context['objective_variant']!r}; "
+            "expected 'recon_delta' or 'recon_delta_physical_warmup'"
+        )
     if context["joint_weight"] > 0.0 and context["foot_indices"] is None:
         raise ValueError("joint/foot losses require LeftToeBase and RightToeBase in the feature schema")
     return context
@@ -261,22 +313,23 @@ def build_loss_fn(representation: RepresentationProtocol, context: Mapping[str, 
             raise ValueError("Canonical representation batches require loss_mask with shape [B,64]")
         if batch.get("_all_frames_valid") is not True and not bool(loss_mask.to(dtype=torch.bool).all()):
             raise ValueError("Canonical 64-frame representation batches require all loss_mask values to be true")
+        weights = effective_loss_weights(context)
         loss_values = compute_motion_reconstruction_losses(
             batch_motion=motion,
             output=dict(output),
             feature_weights=context["feature_weights"],
             feature_offset=context["feature_offset"],
             feature_scale=context["feature_scale"],
-            delta_weight=context["delta_weight"],
+            delta_weight=weights["delta_weight"],
             commit_weight=0.0,
-            root_pos_weight=context["root_pos_weight"],
-            root_rot_weight=context["root_rot_weight"],
+            root_pos_weight=weights["root_pos_weight"],
+            root_rot_weight=weights["root_rot_weight"],
             root_dt=context["root_dt"],
-            joint_weight=context["joint_weight"],
+            joint_weight=weights["joint_weight"],
             joint_weights=context["joint_weights"],
-            contact_weight=context["contact_weight"],
-            foot_slide_weight=context["foot_slide_weight"],
-            foot_height_weight=context["foot_height_weight"],
+            contact_weight=weights["contact_weight"],
+            foot_slide_weight=weights["foot_slide_weight"],
+            foot_height_weight=weights["foot_height_weight"],
             contact_temperature=context["contact_temperature"],
             ref_pos=context["ref_pos"],
             parents=context["parents"],
@@ -309,6 +362,7 @@ def _effective_loss_components(
     context: Mapping[str, Any],
 ) -> dict[str, torch.Tensor]:
     """Return scalar loss contributions exactly as included in ``values['loss']``."""
+    weights = effective_loss_weights(context)
     components: dict[str, torch.Tensor] = {}
     for name, weight_key in _WEIGHTED_MOTION_COMPONENTS.items():
         value = values.get(name)
@@ -317,7 +371,7 @@ def _effective_loss_components(
         if weight_key is None:
             components[name] = value
         else:
-            components[name] = value * float(context[weight_key])
+            components[name] = value * float(weights[weight_key])
     for name in ("base_recon", "part_edit_transfer", "part_edit_preserve"):
         value = values.get(name)
         if isinstance(value, torch.Tensor):
@@ -425,6 +479,7 @@ class RepresentationRunner:
         gradient_probe_path: Path | None = None,
         full_val_loader: DataLoader | None = None,
         resume_state: Mapping[str, Any] | None = None,
+        loss_context: dict[str, Any] | None = None,
     ) -> None:
         self.representation = representation
         self.family = family
@@ -501,6 +556,23 @@ class RepresentationRunner:
         if self.full_eval_every_epochs <= 0:
             raise ValueError("evaluation.full_eval_every_epochs must be positive")
         self.sampling_history: list[dict[str, Any]] = []
+        self.loss_context = loss_context
+        self.objective_variant = str(training.get("objective_variant", "recon_delta"))
+        self.physical_warmup_epochs = int(training.get("physical_warmup_epochs", 0))
+        self.physical_ramp_epochs = int(training.get("physical_ramp_epochs", 0))
+        if self.physical_warmup_epochs < 0 or self.physical_ramp_epochs < 0:
+            raise ValueError("training.physical_warmup_epochs/ramp_epochs must be non-negative")
+        if self.objective_variant not in {"recon_delta", "recon_delta_physical_warmup"}:
+            raise ValueError(
+                f"Unsupported training.objective_variant {self.objective_variant!r}"
+            )
+        if self.objective_variant == "recon_delta_physical_warmup" and self.loss_context is None:
+            raise ValueError("A staged objective requires the loss context to carry its schedule")
+        # A staged objective must already be at the right weight when a resumed
+        # or freshly-loaded checkpoint is evaluated, not only after the first
+        # training epoch.
+        self.apply_objective_schedule(self.start_epoch)
+        self.schedule_history: list[dict[str, Any]] = []
         if self.precision not in {"fp32", "amp"}:
             raise ValueError("training.precision must be fp32 or amp")
         if self.precision == "amp" and device.type != "cuda":
@@ -538,6 +610,20 @@ class RepresentationRunner:
         source = state.get("best_metric_source")
         if isinstance(source, str) and source:
             self.best_metric_source = source
+
+    def apply_objective_schedule(self, epoch: int) -> float:
+        """Set the staged physical weight for ``epoch`` and return the scale."""
+        if self.loss_context is None:
+            return 1.0
+        scale = (
+            physical_schedule_scale(
+                epoch, self.physical_warmup_epochs, self.physical_ramp_epochs
+            )
+            if self.objective_variant == "recon_delta_physical_warmup"
+            else 1.0
+        )
+        self.loss_context["physical_scale"] = scale
+        return scale
 
     def _epoch_sample_count(self) -> int | None:
         sampler = getattr(self.train_loader, "sampler", None)
@@ -992,6 +1078,10 @@ class RepresentationRunner:
                     + resume_note,
                     flush=True,
                 )
+            physical_scale = self.apply_objective_schedule(epoch)
+            self.schedule_history.append({"epoch": int(epoch), "physical_scale": physical_scale})
+            if _is_main_process() and self.objective_variant == "recon_delta_physical_warmup":
+                print(f"Epoch {epoch}/{self.epochs} physical_scale={physical_scale:.4f}", flush=True)
             train = self.train_epoch(epoch, resume_ordinal=resume_ordinal)
             resume_ordinal = 0
             # The bounded monitoring subset runs every epoch; the unbounded
@@ -1260,6 +1350,7 @@ def main(argv: list[str] | None = None) -> None:
         gradient_probe_path=output / "gradient_probe.jsonl",
         full_val_loader=assembled_loaders.full_val,
         resume_state=resume_state,
+        loss_context=context,
     )
     try:
         result = runner.run(args.workflow_mode, split=args.split)
@@ -1272,7 +1363,16 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(result, indent=2, default=str))
 
 
-__all__ = ["RepresentationRunner", "build_cli_parser", "build_representation", "load_experiment_config", "main"]
+__all__ = [
+    "RepresentationRunner",
+    "build_cli_parser",
+    "build_loss_context",
+    "build_representation",
+    "effective_loss_weights",
+    "load_experiment_config",
+    "main",
+    "physical_schedule_scale",
+]
 
 
 if __name__ == "__main__":
