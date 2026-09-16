@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 
-from .contract import MASK_KINDS, TokenSpec, normalize_mask_mixture
+from .contract import MASK_KINDS, TokenSpec, draw_device, normalize_mask_mixture
 from .layout_adapter import LayoutAdapter
 
 
@@ -202,41 +202,43 @@ class MaskGenerator:
         if kind == "full_generation":
             return torch.zeros_like(visible)
         if kind == "random_coordinate":
-            hidden = torch.rand(
-                (batch, frames, coordinates), generator=generator, device=device
-            ) < float(self.config.coordinate_ratio)
+            draw = draw_device(generator, device or visible.device)
+            hidden = (
+                torch.rand((batch, frames, coordinates), generator=generator, device=draw)
+                .to(visible.device)
+                < float(self.config.coordinate_ratio)
+            )
             return visible & ~hidden
         if kind == "stream":
             assert stream_ids is not None
             streams = int(stream_ids.max()) + 1
             ratio = float(self.config.stream_ratio)
             per_sample = max(1, int(round(ratio * streams)))
+            draw = draw_device(generator, device or visible.device)
             for row in range(batch):
-                order = torch.randperm(streams, generator=generator, device=device)
+                order = torch.randperm(streams, generator=generator, device=draw).to(visible.device)
                 hidden_streams = order[:per_sample]
                 hide = (stream_ids.view(1, -1) == hidden_streams.view(-1, 1)).any(dim=0)
                 visible[row, :, hide] = False
             return visible
         if kind == "temporal_span":
             span = max(1, int(round(float(self.config.span_ratio) * frames)))
+            draw = draw_device(generator, device or visible.device)
             for row in range(batch):
-                start = int(
-                    torch.randint(0, frames - span + 1, (1,), generator=generator, device=device).item()
-                )
+                start = int(torch.randint(0, frames - span + 1, (1,), generator=generator, device=draw).item())
                 visible[row, start : start + span] = False
             return visible
         if kind == "spatiotemporal_block":
             block_frames = min(int(self.config.block_frames), frames)
             block_coordinates = min(int(self.config.block_coordinates), coordinates)
+            draw = draw_device(generator, device or visible.device)
             for row in range(batch):
                 start = int(
-                    torch.randint(
-                        0, frames - block_frames + 1, (1,), generator=generator, device=device
-                    ).item()
+                    torch.randint(0, frames - block_frames + 1, (1,), generator=generator, device=draw).item()
                 )
-                columns = torch.randperm(coordinates, generator=generator, device=device)[
-                    :block_coordinates
-                ]
+                columns = torch.randperm(coordinates, generator=generator, device=draw).to(
+                    visible.device
+                )[:block_coordinates]
                 visible[row, start : start + block_frames, columns] = False
             return visible
         raise ValueError(f"Unknown mask kind {kind!r}")
@@ -245,16 +247,13 @@ class MaskGenerator:
     def _ensure_supervised(visible: torch.Tensor, generator: torch.Generator | None) -> None:
         """Never hand the trainer a sample with nothing to predict."""
         fully_visible = visible.all(dim=(1, 2))
+        draw = draw_device(generator, visible.device)
         for row in torch.nonzero(fully_visible).flatten().tolist():
             coordinate = int(
-                torch.randint(
-                    0, visible.shape[2], (1,), generator=generator, device=visible.device
-                ).item()
+                torch.randint(0, visible.shape[2], (1,), generator=generator, device=draw).item()
             )
             frame = int(
-                torch.randint(
-                    0, visible.shape[1], (1,), generator=generator, device=visible.device
-                ).item()
+                torch.randint(0, visible.shape[1], (1,), generator=generator, device=draw).item()
             )
             visible[row, frame, coordinate] = False
 

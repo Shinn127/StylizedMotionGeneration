@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> None:
     tokenizer_checkpoint, tokenizer = load_representation_checkpoint(
         args.tokenizer_checkpoint, torch.device("cpu")
     )
-    tokenizer.eval()
+    tokenizer = tokenizer.to(device).eval()
     for parameter in tokenizer.parameters():
         parameter.requires_grad_(False)
     adapter = LayoutAdapter(tokenizer.token_layout(), num_levels=int(tokenizer.num_levels))

@@ -80,6 +80,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Overrides loader.batch_size. The temporal encoder folds the 13 streams "
+        "into the batch axis, so the effective batch is 13x this value.",
+    )
+    parser.add_argument("--dim", type=int, default=None, help="Overrides transport.dim.")
+    parser.add_argument(
         "--overfit-clips",
         type=int,
         default=0,
@@ -208,6 +216,10 @@ def main(argv: list[str] | None = None) -> None:
     config = load_transport_config(args.config)
     if args.feature_database is not None:
         config["data"] = {**config["data"], "fsq_window_index": str(args.feature_database)}
+    if args.batch_size is not None:
+        config["loader"] = {**dict(config.get("loader") or {}), "batch_size": int(args.batch_size)}
+    if args.dim is not None:
+        config["transport"] = {**dict(config["transport"]), "dim": int(args.dim)}
     training = dict(config["training"])
     if args.epochs is not None:
         training["epochs"] = args.epochs
@@ -237,7 +249,10 @@ def main(argv: list[str] | None = None) -> None:
         )
     if bool(tokenizer_section.get("freeze", True)) is False:
         raise ValueError("The MTS transport never updates its tokenizer; set tokenizer.freeze: true")
-    tokenizer.eval()
+    # The tokenizer follows the compute device: batches (and therefore the
+    # motion handed to encode_indices) already live there, and encoding on the
+    # GPU is an order of magnitude faster than shuttling tensors back to CPU.
+    tokenizer = tokenizer.to(device).eval()
     for parameter in tokenizer.parameters():
         parameter.requires_grad_(False)
     layout = tokenizer.token_layout()

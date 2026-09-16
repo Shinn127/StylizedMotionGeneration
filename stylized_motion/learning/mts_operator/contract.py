@@ -211,6 +211,17 @@ class TransportOutput:
         return torch.ones(self.logits.shape[:2], dtype=torch.bool, device=device or self.logits.device)
 
 
+def draw_device(generator: torch.Generator | None, fallback: torch.device) -> torch.device:
+    """Device a random draw must happen on.
+
+    ``torch.rand``/``randperm``/``multinomial`` all require the generator and the
+    tensors to share a device, while callers reasonably keep a CPU generator for
+    reproducibility and put their data on the GPU.  Drawing on the generator's
+    own device and moving the *result* keeps both possible.
+    """
+    return generator.device if generator is not None else fallback
+
+
 def require_frame_mask(
     valid_mask: torch.Tensor | None, *, batch: int, frames: int, device: torch.device
 ) -> torch.Tensor:
@@ -396,6 +407,7 @@ __all__ = [
     "fingerprint_hash",
     "masked_cross_entropy",
     "masked_mean",
+    "draw_device",
     "normalize_mask_mixture",
     "operator_metadata",
     "require_frame_mask",

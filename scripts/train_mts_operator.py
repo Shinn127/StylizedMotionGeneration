@@ -103,6 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--steps-per-epoch", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None, help="Overrides loader.batch_size.")
+    parser.add_argument(
+        "--hidden-dim", type=int, default=None, help="Overrides operator.hidden_dim and the style encoder width."
+    )
     parser.add_argument(
         "--overfit-pairs", type=int, default=0,
         help="Freeze this many reference/target pairs and train on them repeatedly.",
@@ -256,7 +260,7 @@ def main(argv: list[str] | None = None) -> None:
     tokenizer_checkpoint, tokenizer = load_representation_checkpoint(Path(tokenizer_path), torch.device("cpu"))
     if tokenizer.family != NEF_FSQ_FAMILY:
         raise ValueError(f"The MTS operator requires a {NEF_FSQ_FAMILY!r} tokenizer")
-    tokenizer.eval()
+    tokenizer = tokenizer.to(device).eval()
     for parameter in tokenizer.parameters():
         parameter.requires_grad_(False)
     layout = tokenizer.token_layout()

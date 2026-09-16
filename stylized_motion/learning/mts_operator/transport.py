@@ -369,8 +369,15 @@ class MotionTransportTransformer(nn.Module):
             if sampler is not None:
                 drawn = sampler(probs)
             else:
+                # multinomial requires the generator and its input on one device:
+                # draw where the generator lives, then bring the tokens back.
                 flat = probs.reshape(-1, probs.shape[-1])
-                drawn = torch.multinomial(flat, 1, generator=generator).reshape(probs.shape[:-1])
+                draw = flat.device if generator is None else generator.device
+                drawn = (
+                    torch.multinomial(flat.to(draw), 1, generator=generator)
+                    .reshape(probs.shape[:-1])
+                    .to(probs.device)
+                )
             tokens = torch.where(support.unsqueeze(0), drawn, tokens)
             visible = visible | support.unsqueeze(0)
         return tokens
