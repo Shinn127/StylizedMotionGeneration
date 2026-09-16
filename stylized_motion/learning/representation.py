@@ -85,6 +85,8 @@ class RepresentationProtocol(Protocol):
 
     def decode_from_codes(self, codes: torch.Tensor) -> torch.Tensor: ...
 
+    def token_layout(self) -> object | None: ...
+
     def representation_metadata(self) -> dict[str, object]: ...
 
     def compute_representation_losses(
@@ -393,6 +395,35 @@ class RepresentationAdapter(nn.Module):
     def decode_from_codes(self, codes: torch.Tensor) -> torch.Tensor:
         return self.module.decode_from_codes(codes)
 
+    @torch.no_grad()
+    def encode_indices(
+        self, motion: torch.Tensor, *, lengths: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Alias of :meth:`encode_to_indices` for research callers."""
+        alias = getattr(self.module, "encode_indices", None)
+        if alias is not None:
+            return alias(motion, lengths=lengths)
+        return self.module.encode_to_indices(motion)
+
+    @torch.no_grad()
+    def decode_indices(
+        self, indices: torch.Tensor, *, lengths: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Alias of :meth:`decode_from_indices` for research callers."""
+        alias = getattr(self.module, "decode_indices", None)
+        if alias is not None:
+            return alias(indices, lengths=lengths)
+        return self.module.decode_from_indices(indices)
+
+    def token_layout(self) -> object | None:
+        """The representation's spatial ownership table, when it has one.
+
+        Flat-FSQ has no region contract, so callers must treat ``None`` as
+        "this representation can only be edited as a whole".
+        """
+        getter = getattr(self.module, "get_token_layout", None)
+        return None if getter is None else getter()
+
     def representation_metadata(self) -> dict[str, object]:
         result = self._spec.as_dict()
         result["feature_schema"] = dict(self.feature_schema)
@@ -407,7 +438,9 @@ class RepresentationAdapter(nn.Module):
         if self.family == NEF_FSQ_FAMILY:
             # Persist the stream/feature ownership so a restore can reject a
             # checkpoint whose partition no longer matches.
-            result["nef_layout"] = self.module.layout.to_dict()
+            layout = self.module.layout
+            result["nef_layout"] = layout.to_dict()
+            result["nef_layout_hash"] = layout.layout_hash()
         return result
 
     def compute_representation_losses(
@@ -543,6 +576,11 @@ def load_representation_checkpoint(
     for key in compared_keys:
         if representation_metadata_value.get(key) != expected.get(key):
             raise ValueError(f"Checkpoint representation metadata mismatch at {key!r}")
+    # The layout hash arrived with the research contract; checkpoints written
+    # before it stay loadable, but a checkpoint that carries one must agree.
+    stored_layout_hash = representation_metadata_value.get("nef_layout_hash")
+    if stored_layout_hash is not None and stored_layout_hash != expected.get("nef_layout_hash"):
+        raise ValueError("Checkpoint NEF layout hash does not match the rebuilt layout")
     checkpoint_schema = representation_metadata_value.get("feature_schema")
     top_level_schema = checkpoint.get("feature_schema")
     if not isinstance(checkpoint_schema, Mapping) or not isinstance(top_level_schema, Mapping):

@@ -7,6 +7,8 @@ chains, so Geno numeric joint indices are never reused for SOMA.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -77,6 +79,9 @@ NEF_EDIT_PARTS: dict[str, tuple[str, str]] = {
 
 NEF_ARCHITECTURE_VERSION = 1
 NEF_VARIANT = "independent"
+
+# The only region token accepted next to the edit parts: the full 13-stream body.
+NEF_WHOLE_BODY_REGION = "whole_body"
 
 
 @dataclass(frozen=True)
@@ -392,6 +397,173 @@ class NEFLayout:
             "families": {family: list(streams) for family, streams in NEF_FAMILY_STREAMS.items()},
         }
 
+    def layout_hash(self) -> str:
+        """Stable sha256 over the persisted layout payload.
+
+        Two layouts hash equally exactly when their skeleton, stream order,
+        coordinate spans and ownership tables agree, so a tokenizer, a token
+        store and a generator can fingerprint the same alphabet without
+        comparing dictionaries field by field.
+        """
+        payload = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def stream_graph(self) -> tuple[tuple[str, str, str], ...]:
+        """Stream adjacency implied by the recorded skeleton chains.
+
+        Each entry is ``(parent_stream, child_stream, relation)`` where the
+        relation is one of:
+
+        - ``global_to_root``: the root stream to the stream owning the body root;
+        - ``node_to_edge``: a Node stream to the Edge stream of a child region;
+        - ``edge_to_child``: an Edge stream to the Node stream it parents;
+        - ``edge_to_edge`` / ``node_to_node``: same-kind hand-off between regions.
+
+        These are *relations*, not a causal claim: an Edge stream owns the
+        joint between two regions, so a token in it constrains both sides.
+        """
+        owner = {
+            self.names[joint]: stream
+            for stream in NEF_STREAM_NAMES
+            for joint in self.stream_joints(stream)
+        }
+        spec = NEF_SKELETON_SPECS[self.skeleton]
+        relations: list[tuple[str, str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for chain in spec.chains:
+            for parent_name, child_name in zip(chain[:-1], chain[1:]):
+                parent_stream = owner.get(parent_name, "global" if parent_name == "Simulation" else None)
+                child_stream = owner.get(child_name)
+                if parent_stream is None or child_stream is None or parent_stream == child_stream:
+                    continue
+                relation = (parent_stream, child_stream, _stream_relation(parent_stream, child_stream))
+                if relation not in seen:
+                    seen.add(relation)
+                    relations.append(relation)
+        return tuple(relations)
+
+    def coordinate_metadata(self) -> tuple[dict[str, object], ...]:
+        """One JSON-safe record per FSQ coordinate, in canonical coordinate order."""
+        slices = self.stream_slices
+        feature_indices = self.feature_indices(9 * self.num_joints + 5)
+        records: list[dict[str, object]] = []
+        for stream_index, stream in enumerate(NEF_STREAM_NAMES):
+            span = slices[stream]
+            joints = [self.names[joint] for joint in self.stream_joints(stream)]
+            for offset in range(span.stop - span.start):
+                records.append(
+                    {
+                        "coordinate": span.start + offset,
+                        "stream": stream,
+                        "stream_index": stream_index,
+                        "stream_slice": [span.start, span.stop],
+                        "coordinate_in_stream": offset,
+                        "family": NEF_STREAM_FAMILY[stream],
+                        "joints": joints,
+                        "feature_count": int(feature_indices[stream].numel()),
+                    }
+                )
+        return tuple(records)
+
+    def region_streams(self, regions: str | Sequence[str], *, graph_radius: int = 0) -> tuple[str, ...]:
+        """Streams covered by named edit regions under a graph radius.
+
+        The region vocabulary is the toolkit's own: the parts of
+        :data:`NEF_EDIT_PARTS` plus ``whole_body``.  Radii follow the design:
+
+        - ``0``: the Node stream of each part only;
+        - ``1``: the designed part, i.e. its Node stream and incoming Edge stream;
+        - ``>= 2``: that part expanded by ``radius - 1`` undirected hops over
+          :meth:`stream_graph`.
+
+        Streams are returned in canonical :data:`NEF_STREAM_NAMES` order.
+        """
+        names = [regions] if isinstance(regions, str) else [str(name) for name in regions]
+        if not names:
+            raise ValueError("regions must name at least one NEF edit part")
+        radius = int(graph_radius)
+        if radius < 0:
+            raise ValueError(f"graph_radius must be non-negative, got {graph_radius}")
+        unknown = sorted(
+            name for name in names if name != NEF_WHOLE_BODY_REGION and name not in NEF_EDIT_PARTS
+        )
+        if unknown:
+            raise ValueError(
+                f"Unknown NEF region(s) {unknown}; expected {sorted(NEF_EDIT_PARTS)} or "
+                f"{NEF_WHOLE_BODY_REGION!r}"
+            )
+        if NEF_WHOLE_BODY_REGION in names:
+            return tuple(NEF_STREAM_NAMES)
+        selected: set[str] = set()
+        for name in names:
+            selected.update(nef_edit_streams(name, full_part=radius >= 1))
+        if radius >= 2:
+            selected = self._expand_streams(selected, radius - 1)
+        return tuple(stream for stream in NEF_STREAM_NAMES if stream in selected)
+
+    def _expand_streams(self, streams: set[str], hops: int) -> set[str]:
+        adjacency: dict[str, set[str]] = {}
+        for parent, child, _ in self.stream_graph():
+            adjacency.setdefault(parent, set()).add(child)
+            adjacency.setdefault(child, set()).add(parent)
+        selected = set(streams)
+        frontier = set(streams)
+        for _ in range(hops):
+            frontier = {n for stream in frontier for n in adjacency.get(stream, set())} - selected
+            if not frontier:
+                break
+            selected |= frontier
+        return selected
+
+    def make_region_mask(
+        self,
+        regions: str | Sequence[str],
+        *,
+        graph_radius: int = 0,
+        frame_range: tuple[int, int] | None = None,
+        length: int,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        """Boolean ``[length, 40]`` support mask for the named regions.
+
+        ``frame_range`` is a half-open ``(start, stop)`` interval inside
+        ``length``; ``None`` keeps every frame.  Callers never hand-write
+        coordinate slices: the stream span comes from this layout.
+        """
+        length = int(length)
+        if length <= 0:
+            raise ValueError(f"length must be positive, got {length}")
+        streams = self.region_streams(regions, graph_radius=graph_radius)
+        slices = self.stream_slices
+        mask = torch.zeros((length, self.num_coordinates), dtype=torch.bool, device=device)
+        for stream in streams:
+            mask[:, slices[stream]] = True
+        if frame_range is not None:
+            start, stop = (int(frame_range[0]), int(frame_range[1]))
+            if not 0 <= start < stop <= length:
+                raise ValueError(
+                    f"frame_range {frame_range} must be a non-empty half-open interval inside [0, {length})"
+                )
+            frames = torch.zeros(length, dtype=torch.bool, device=mask.device)
+            frames[start:stop] = True
+            mask &= frames.unsqueeze(-1)
+        return mask
+
+
+def _stream_relation(parent_stream: str, child_stream: str) -> str:
+    """Names how a stream hands off to the next one along a skeleton chain."""
+    if parent_stream == "global":
+        return "global_to_root"
+    if child_stream == "global":
+        raise ValueError("No skeleton chain may enter the global stream")
+    parent_kind = "node" if parent_stream.endswith("_node") else "edge"
+    child_kind = "node" if child_stream.endswith("_node") else "edge"
+    if (parent_kind, child_kind) == ("node", "edge"):
+        return "node_to_edge"
+    if (parent_kind, child_kind) == ("edge", "node"):
+        return "edge_to_child"
+    return f"{parent_kind}_to_{child_kind}"
+
 
 def nef_edit_streams(part: str, *, full_part: bool) -> tuple[str, ...]:
     """Strict edits replace the Node stream only; full-part edits add the incoming Edge."""
@@ -412,6 +584,7 @@ __all__ = [
     "NEF_STREAM_FAMILY",
     "NEF_STREAM_NAMES",
     "NEF_VARIANT",
+    "NEF_WHOLE_BODY_REGION",
     "NEFLayout",
     "NEFSkeletonSpec",
     "SOMA_SKELETON",

@@ -352,5 +352,42 @@ class NEFMotionAutoencoder(nn.Module):
     def decode_from_codes(self, codes: torch.Tensor) -> torch.Tensor:
         return self._decode_embeddings(self._decode_codes_to_embeddings(codes))
 
+    # -- research-facing aliases -------------------------------------------
+    # Read-only shortcuts for probes, generators and style operators.  They do
+    # not change the persisted contract: the same index tensor in means the same
+    # decode out, and ``lengths`` is validated but never used to truncate.
+    def get_token_layout(self) -> NEFLayout:
+        """The live layout object, without copying or re-validating it."""
+        return self.layout
+
+    @staticmethod
+    def _validate_lengths(lengths: torch.Tensor | Sequence[int] | None, batch: int, frames: int) -> None:
+        if lengths is None:
+            return
+        values = torch.as_tensor(lengths).detach().reshape(-1)
+        if values.numel() != batch:
+            raise ValueError(f"lengths must have {batch} entries, got {values.numel()}")
+        if bool((values <= 0).any()) or bool((values > frames).any()):
+            raise ValueError(
+                f"lengths must be in [1, {frames}]; padded frames stay in the tensor until a "
+                "padding-aware API exists"
+            )
+
+    @torch.no_grad()
+    def encode_indices(
+        self, motion: torch.Tensor, *, lengths: torch.Tensor | Sequence[int] | None = None
+    ) -> torch.Tensor:
+        self._validate_motion(motion)
+        self._validate_lengths(lengths, motion.shape[0], motion.shape[1])
+        return self.encode_to_indices(motion)
+
+    @torch.no_grad()
+    def decode_indices(
+        self, indices: torch.Tensor, *, lengths: torch.Tensor | Sequence[int] | None = None
+    ) -> torch.Tensor:
+        self._validate_code_tensor(indices, "indices")
+        self._validate_lengths(lengths, indices.shape[0], indices.shape[1])
+        return self.decode_from_indices(indices)
+
 
 __all__ = ["NEFMotionAutoencoder", "NEF_DECODER_RECEPTIVE_FIELD", "NEF_ENCODER_RECEPTIVE_FIELD"]

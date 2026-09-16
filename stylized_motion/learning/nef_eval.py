@@ -57,7 +57,7 @@ def _frame_mask(frames: int, start: int, stop: int, device: torch.device) -> tor
     return mask
 
 
-def _rotation_angle_error(pred_6d: torch.Tensor, target_6d: torch.Tensor) -> torch.Tensor:
+def rotation_angle_error(pred_6d: torch.Tensor, target_6d: torch.Tensor) -> torch.Tensor:
     """Geodesic angle between two [..., 3, 2] rotation-matrix columns."""
     pred = rotation_6d_to_matrix(pred_6d)
     target = rotation_6d_to_matrix(target_6d)
@@ -149,7 +149,7 @@ def _mean_of(values: Mapping[str, list[float]]) -> dict[str, float]:
     return {name: float(np.mean(items)) for name, items in values.items()}
 
 
-def _read_window(store, range_idx: int, relative_start: int, length: int, history: int):
+def read_window(store, range_idx: int, relative_start: int, length: int, history: int):
     """Reads [history + length] stored feature frames with left padding."""
     if range_idx < 0 or range_idx >= len(store.range_names):
         raise ValueError(f"Range index {range_idx} must be in [0, {len(store.range_names) - 1}]")
@@ -178,13 +178,13 @@ def _read_window(store, range_idx: int, relative_start: int, length: int, histor
     return window, shard_idx
 
 
-def _model_space(window: np.ndarray, store, feature_stats: Mapping[str, object]) -> torch.Tensor:
+def model_space(window: np.ndarray, store, feature_stats: Mapping[str, object]) -> torch.Tensor:
     """The store normalizes with its own statistics; the checkpoint may differ."""
     raw = denormalize_motion_features(window, store.stats)
-    return torch.from_numpy(_renormalize(raw, feature_stats))
+    return torch.from_numpy(renormalize(raw, feature_stats))
 
 
-def _renormalize(raw: np.ndarray, feature_stats: Mapping[str, object]) -> np.ndarray:
+def renormalize(raw: np.ndarray, feature_stats: Mapping[str, object]) -> np.ndarray:
     offset = np.asarray(feature_stats["offset"], dtype=np.float32)
     scale = np.asarray(feature_stats["scale"], dtype=np.float32)
     return ((raw - offset) / scale).astype(np.float32)
@@ -236,7 +236,7 @@ def _world_positions(motion, offset, scale, ref_pos, parents, dt) -> torch.Tenso
     return reconstruct_joint_positions(motion, offset, scale, ref_pos, parents, dt, world_space=True)
 
 
-def _contacts_from_toe_motion(
+def contacts_from_toe_motion(
     positions: torch.Tensor,
     toe_indices: Sequence[int],
     dt: float,
@@ -252,7 +252,7 @@ def _contacts_from_toe_motion(
     return torch.cat((contacts[:, :1], contacts), dim=1)
 
 
-def _validate_checkpoint_store(checkpoint, model, store) -> None:
+def validate_checkpoint_store(checkpoint, model, store) -> None:
     """Validate semantic feature and skeleton fields without relying on hashes."""
     module = model.module
     layout = module.layout
@@ -274,7 +274,7 @@ def run_report(args: argparse.Namespace) -> dict[str, object]:
     try:
         checkpoint, model = load_representation_checkpoint(args.checkpoint, torch.device("cpu"))
         _validate_nef_model(model)
-        _validate_checkpoint_store(checkpoint, model, store)
+        validate_checkpoint_store(checkpoint, model, store)
         device = choose_device(args.device)
         model = model.to(device).eval()
         module = model.module
@@ -302,7 +302,7 @@ def run_report(args: argparse.Namespace) -> dict[str, object]:
         with torch.inference_mode():
             for window in windows:
                 raw = np.asarray(store.read_motion(window), dtype=np.float32)
-                motion = torch.from_numpy(_renormalize(denormalize_motion_features(raw, store.stats), feature_stats))
+                motion = torch.from_numpy(renormalize(denormalize_motion_features(raw, store.stats), feature_stats))
                 motion = motion.to(device)[None]
                 output = model(motion, collect_metrics=False)
                 recon = output["recon_state"]
@@ -333,7 +333,7 @@ def run_report(args: argparse.Namespace) -> dict[str, object]:
                 rotation_shape = (1, recon.shape[1], layout.num_joints - 1, 3, 2)
                 recon_raw = recon * scale + offset
                 motion_raw = motion * scale + offset
-                rotation_error = _rotation_angle_error(
+                rotation_error = rotation_angle_error(
                     recon_raw[..., rotation_slice].reshape(rotation_shape),
                     motion_raw[..., rotation_slice].reshape(rotation_shape),
                 ).mean(dim=(0, 1))
@@ -386,7 +386,7 @@ def run_transfer(args: argparse.Namespace) -> dict[str, object]:
     try:
         checkpoint, model = load_representation_checkpoint(args.checkpoint, torch.device("cpu"))
         _validate_nef_model(model)
-        _validate_checkpoint_store(checkpoint, model, store)
+        validate_checkpoint_store(checkpoint, model, store)
         device = choose_device(args.device)
         model = model.to(device).eval()
         module = model.module
@@ -402,10 +402,10 @@ def run_transfer(args: argparse.Namespace) -> dict[str, object]:
         history = int(model.history_frames)
         length = int(args.length)
 
-        target_window, _ = _read_window(store, args.target_range_idx, args.target_start, length, history)
-        donor_window, _ = _read_window(store, args.donor_range_idx, args.donor_start, length, history)
+        target_window, _ = read_window(store, args.target_range_idx, args.target_start, length, history)
+        donor_window, _ = read_window(store, args.donor_range_idx, args.donor_start, length, history)
         pair = torch.stack(
-            (_model_space(target_window, store, feature_stats), _model_space(donor_window, store, feature_stats))
+            (model_space(target_window, store, feature_stats), model_space(donor_window, store, feature_stats))
         ).to(device)
 
         streams = nef_edit_streams(args.part, full_part=args.edit == "full")
@@ -470,7 +470,7 @@ def run_transfer(args: argparse.Namespace) -> dict[str, object]:
             )[..., (0, 2)].abs().mean(dim=-1) / float(args.root_dt)
             # Preprocessing labels contact below 0.15 m/s.  The first frame has
             # no backward difference, so reuse the first available transition.
-            inferred_contact = _contacts_from_toe_motion(
+            inferred_contact = contacts_from_toe_motion(
                 edited_positions, toe_indices, args.root_dt
             )
             nonzero = target_indices[0, edit_start:edit_stop, layout.stream_slices["global"]]
@@ -560,6 +560,16 @@ def run_transfer(args: argparse.Namespace) -> dict[str, object]:
     finally:
         store.close()
     return report
+
+
+# Public names are the shared evaluation entry points; the underscored aliases
+# are kept because tests and older callers import them.
+_rotation_angle_error = rotation_angle_error
+_contacts_from_toe_motion = contacts_from_toe_motion
+_validate_checkpoint_store = validate_checkpoint_store
+_read_window = read_window
+_model_space = model_space
+_renormalize = renormalize
 
 
 def build_parser() -> argparse.ArgumentParser:
