@@ -380,6 +380,21 @@ class StylePairSampler:
         self._by_style: dict[str, list[ClipRecord]] = defaultdict(list)
         for record in self.records:
             self._by_style[record.style].append(record)
+        # Candidate lookup must not scan the whole catalogue: on SEED that is
+        # 142k records per target, which dominated the operator's step time
+        # (0.6 s/step at batch 8).  Index by (split, style) and by (split, content)
+        # so the scan stays proportional to the candidate pool.
+        self._by_split_style: dict[tuple[str, str], list[ClipRecord]] = defaultdict(list)
+        self._by_split_content: dict[tuple[str, str], list[ClipRecord]] = defaultdict(list)
+        self._by_style_all: dict[str, list[ClipRecord]] = defaultdict(list)
+        self._by_content_all: dict[str, list[ClipRecord]] = defaultdict(list)
+        self._records_by_split: dict[str, list[ClipRecord]] = defaultdict(list)
+        for record in self.records:
+            self._records_by_split[record.split].append(record)
+            self._by_split_style[(record.split, record.style)].append(record)
+            self._by_split_content[(record.split, record.content)].append(record)
+            self._by_style_all[record.style].append(record)
+            self._by_content_all[record.content].append(record)
 
     def styles_for_stage(self, stage: str) -> tuple[str, ...]:
         if stage == "train":
@@ -419,11 +434,33 @@ class StylePairSampler:
             raise ValueError(f"Unknown pair mode {mode!r}; expected {list(PAIR_MODES)}")
         split = self._stage_split(stage)
         allowed = set(self.styles_for_stage(stage)) if split is None and stage != "all" else None
+        # Only the buckets this mode can accept are scanned, not every record.
+        if mode == "same_style":
+            pool = (
+                self._by_split_style.get((split, target.style), [])
+                if split is not None
+                else self._by_style_all.get(target.style, [])
+            )
+        elif mode == "same_content":
+            pool = (
+                self._by_split_content.get((split, target.content), [])
+                if split is not None
+                else self._by_content_all.get(target.content, [])
+            )
+        else:  # different_style
+            pool = (
+                [
+                    record
+                    for (pool_split, _style), records in self._by_split_style.items()
+                    if pool_split == split
+                    for record in records
+                ]
+                if split is not None
+                else self.records
+            )
         result = []
-        for record in self.records:
+        for record in pool:
             if record.clip_id == target.clip_id:
-                continue
-            if split is not None and record.split != split:
                 continue
             if not self.allow_same_take and record.source_group >= 0 and record.source_group == target.source_group:
                 continue
@@ -492,10 +529,10 @@ class StylePairSampler:
         if targets is not None:
             pool = list(targets)
         elif split is not None:
-            pool = [record for record in self.records if record.split == split]
+            pool = self._records_by_split.get(split, [])
         else:
             allowed = set(self.styles_for_stage(stage))
-            pool = [record for record in self.records if record.style in allowed]
+            pool = [record for style in allowed for record in self._by_style_all.get(style, [])]
         if not pool:
             return []
         order = rng.permutation(len(pool))

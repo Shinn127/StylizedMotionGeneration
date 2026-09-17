@@ -31,7 +31,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from stylized_motion.data import build_data_loaders, open_any_feature_store, open_token_store  # noqa: E402
+from stylized_motion.data import build_data_loaders, open_any_feature_store  # noqa: E402
+from stylized_motion.data.packed_token import open_any_token_store  # noqa: E402
 from stylized_motion.learning.mts_operator import LayoutAdapter  # noqa: E402
 from stylized_motion.learning.mts_operator.checkpoint import (  # noqa: E402
     load_mts_checkpoint,
@@ -88,6 +89,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dim", type=int, default=None, help="Overrides transport.dim.")
     parser.add_argument(
+        "--val-batches",
+        type=int,
+        default=8,
+        help="Validation batches per epoch; the full split would otherwise dominate "
+        "a fast training step (measured: 0.074 s/step vs 36 s for the whole val split).",
+    )
+    parser.add_argument(
         "--overfit-clips",
         type=int,
         default=0,
@@ -133,9 +141,10 @@ class TokenSource:
     def __iter__(self) -> Iterable[torch.Tensor]:
         for batch in self.loader:
             if self.tokenizer is None:
-                tokens = batch["indices"]
+                # v3 token stores yield "indices", the packed store yields "tokens".
+                tokens = batch.get("indices", batch.get("tokens"))
                 if not isinstance(tokens, torch.Tensor):
-                    raise TypeError("Token batches must carry an 'indices' tensor")
+                    raise TypeError("Token batches must carry an 'indices' or 'tokens' tensor")
                 yield tokens.to(self.device).long()
                 continue
             batch = apply_batch_normalization(move_batch_to_device(batch, self.device), self.device)
@@ -183,7 +192,7 @@ def build_sources(
     loader_config.setdefault("batch_size", 256)
     loader_config.setdefault("num_workers", 0)
     if token_store_path is not None:
-        store = open_token_store(token_store_path)
+        store = open_any_token_store(token_store_path)
         assembled = build_data_loaders(
             "generator", store, sampling_config=sampling, loader_config=loader_config
         )
@@ -321,7 +330,17 @@ def main(argv: list[str] | None = None) -> None:
     def val_batches(epoch: int) -> Iterable[Any]:
         if frozen_batches is not None:
             return frozen_batches
-        return sources["val"]
+        limit = int(args.val_batches)
+        if limit <= 0:
+            return sources["val"]
+
+        def bounded() -> Iterable[Any]:
+            for index, batch in enumerate(sources["val"]):
+                if index >= limit:
+                    break
+                yield batch
+
+        return bounded()
 
     best_loss = float(resume_metrics.get("val_loss", float("inf")))
     saved_best = args.checkpoint is not None

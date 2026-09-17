@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Sampler
 
 from .feature_data import FeatureDataset, FeatureStore
 from .packed_store import PackedFeatureDataset, PackedFeatureStore
+from .packed_token import PackedTokenDataset, PackedTokenStore
 from .sampling import FixedWindowSampler, SampleRequest, TrainWindowSampler, sampling_contract
 from .token_data import TokenDataset, TokenStore
 from .trajectory_data import ConditionalTokenDataset, TrajectoryStore
@@ -143,7 +144,7 @@ def _batch_bytes(kind: DataKind, batch_size: int, target_frames: int, motion_dim
 
 def build_data_loaders(
     kind: DataKind,
-    store: FeatureStore | PackedFeatureStore | TokenStore,
+    store: FeatureStore | PackedFeatureStore | TokenStore | PackedTokenStore,
     *,
     trajectory_store: TrajectoryStore | None = None,
     sampling_config: Mapping[str, object],
@@ -157,8 +158,13 @@ def build_data_loaders(
         raise ValueError(f"Unsupported data kind: {kind!r}")
     if kind == "representation" and not isinstance(store, (FeatureStore, PackedFeatureStore)):
         raise TypeError("representation loaders require a FeatureStore or a PackedFeatureStore")
-    if kind != "representation" and not isinstance(store, TokenStore):
-        raise TypeError("generator loaders require a TokenStore")
+    if kind != "representation" and not isinstance(store, (TokenStore, PackedTokenStore)):
+        raise TypeError("generator loaders require a TokenStore or a PackedTokenStore")
+    if kind == "conditional_generator" and isinstance(store, PackedTokenStore):
+        raise TypeError(
+            "conditional_generator loaders are not wired to a packed token store yet; "
+            "the packed trajectory store still needs a conditional dataset"
+        )
     if kind == "conditional_generator" and trajectory_store is None:
         raise ValueError("conditional_generator loaders require trajectory_store")
     if trajectory_store is not None and not isinstance(trajectory_store, TrajectoryStore):
@@ -234,6 +240,10 @@ def build_data_loaders(
                 )
             return FeatureDataset(split, store, max_open_shards=max_open_shards)
         if kind == "generator":
+            if isinstance(store, PackedTokenStore):
+                return PackedTokenDataset(
+                    split, store, sequence_frames=65, max_open_shards=max_open_shards
+                )
             return TokenDataset(split, store, sequence_frames=65, max_open_shards=max_open_shards)
         assert trajectory_store is not None
         return ConditionalTokenDataset(split, store, trajectory_store, max_open_shards=max_open_shards)

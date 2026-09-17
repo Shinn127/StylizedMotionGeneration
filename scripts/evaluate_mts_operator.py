@@ -31,7 +31,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from stylized_motion.data import open_any_feature_store, open_token_store  # noqa: E402
+from stylized_motion.data import open_any_feature_store  # noqa: E402
+from stylized_motion.data.packed_token import open_any_token_store  # noqa: E402
 from stylized_motion.learning.mts_operator import (  # noqa: E402
     LayoutAdapter,
     MaskGenerator,
@@ -215,7 +216,7 @@ def main(argv: list[str] | None = None) -> None:
     store_path = args.token_store
     feature_path = args.feature_database
     if store_path:
-        store = open_token_store(store_path)
+        store = open_any_token_store(store_path)
     elif feature_path:
         store = open_any_feature_store(feature_path)
     else:

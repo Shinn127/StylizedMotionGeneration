@@ -35,7 +35,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from stylized_motion.data import open_any_feature_store, open_token_store  # noqa: E402
+from stylized_motion.data import open_any_feature_store  # noqa: E402
+from stylized_motion.data.packed_token import open_any_token_store  # noqa: E402
 from stylized_motion.learning.mts_operator import (  # noqa: E402
     LayoutAdapter,
     MaskGenerator,
@@ -82,7 +83,7 @@ COMMON_OPERATOR_KEYS = ("hidden_dim", "coordinate_dim")
 OPERATOR_SPECIFIC_KEYS = {
     "logit_field": (),
     "arbitrary_kernel": ("identity_mix",),
-    "birth_death": ("max_rate", "uniformization_tolerance", "max_terms"),
+    "birth_death": ("max_rate", "uniformization_tolerance", "max_terms", "level_order"),
 }
 OPERATOR_KEYS = COMMON_OPERATOR_KEYS + tuple(
     key for keys in OPERATOR_SPECIFIC_KEYS.values() for key in keys
@@ -106,6 +107,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=None, help="Overrides loader.batch_size.")
     parser.add_argument(
         "--hidden-dim", type=int, default=None, help="Overrides operator.hidden_dim and the style encoder width."
+    )
+    parser.add_argument(
+        "--style-encoder-kind",
+        choices=["reference", "style_id"],
+        default=None,
+        help="Phase 3 (style_id) vs Phase 4 (reference); overrides style_encoder.kind.",
+    )
+    parser.add_argument("--num-styles", type=int, default=None, help="Required for style_id encoders.")
+    parser.add_argument(
+        "--shuffled-adjacency",
+        type=int,
+        default=None,
+        metavar="SEED",
+        help="Geometry control: permute which FSQ levels count as neighbours (birth_death only).",
     )
     parser.add_argument(
         "--overfit-pairs", type=int, default=0,
@@ -334,7 +349,7 @@ def main(argv: list[str] | None = None) -> None:
     store_path = args.token_store or config["data"].get("token_store")
     feature_path = args.feature_database or config["data"].get("fsq_window_index")
     if store_path:
-        store = open_token_store(Path(store_path))
+        store = open_any_token_store(Path(store_path))
     elif feature_path:
         store = open_any_feature_store(feature_path)
     else:
@@ -348,6 +363,7 @@ def main(argv: list[str] | None = None) -> None:
         unseen_fraction=float(style_split_config.get("unseen_fraction", 0.2)),
         seed=trainer_config.seed,
     )
+    pair_config = dict(config["data"].get("pairs") or {})
     held_out_styles = tuple(str(style) for style in (pair_config.get("held_out_styles") or ()))
     if held_out_styles:
         print(f"held-out styles (never used for operator training): {list(held_out_styles)}", flush=True)
@@ -357,7 +373,6 @@ def main(argv: list[str] | None = None) -> None:
         seed=trainer_config.seed,
         held_out_styles=held_out_styles,
     )
-    pair_config = dict(config["data"].get("pairs") or {})
     loader_config = dict(config.get("loader") or {})
     frames = int(config["data"].get("frames", 64))
 
@@ -398,7 +413,11 @@ def main(argv: list[str] | None = None) -> None:
     def train_batches(epoch: int) -> Iterable[OperatorBatch]:
         if frozen_pairs is not None:
             return frozen_pairs * max(1, int(loader_config.get("batch_size", 32)) // len(frozen_pairs))
-        return sources["train"].batches(int(loader_config.get("batch_size", 32)))
+        # One *batch* per training step: passing the batch size here trained only
+        # `batch_size` steps per epoch, which silently capped long runs at a few
+        # hundred steps.
+        steps = int(trainer_config.steps_per_epoch or trainer_config.max_steps or 1000)
+        return sources["train"].batches(steps)
 
     def val_batches(epoch: int) -> Iterable[OperatorBatch]:
         if frozen_pairs is not None:

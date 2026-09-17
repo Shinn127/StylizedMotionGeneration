@@ -32,7 +32,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from stylized_motion.data import open_any_feature_store, open_token_store  # noqa: E402
+from stylized_motion.data import open_any_feature_store  # noqa: E402
+from stylized_motion.data.packed_token import open_any_token_store  # noqa: E402
 from stylized_motion.learning.mts_operator import (  # noqa: E402
     CommonRandomNumbers,
     LayoutAdapter,
@@ -156,7 +157,7 @@ def main(argv: list[str] | None = None) -> None:
     model.eval()
 
     if args.token_store:
-        store = open_token_store(args.token_store)
+        store = open_any_token_store(args.token_store)
     elif args.feature_database:
         store = open_any_feature_store(args.feature_database)
     else:

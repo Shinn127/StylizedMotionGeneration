@@ -285,6 +285,27 @@ class PackedTokenStore:
         return state
 
 
+def open_any_token_store(database: str | Path, *, max_open_shards: int = 16) -> Any:
+    """Open a v4 packed token store or fall back to the v3 reader.
+
+    Mirrors :func:`stylized_motion.data.packed_store.open_any_feature_store`, so a
+    caller can point at either generation without knowing which one it has.
+    """
+    path = Path(database)
+    manifest_path = path / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing token store manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    version = int(manifest.get("data_schema_version", 0))
+    if version == PACKED_SCHEMA_VERSION:
+        return open_packed_token_store(path, max_open_shards=max_open_shards)
+    if version == 3:
+        from stylized_motion.data.token_data import open_token_store
+
+        return open_token_store(path)
+    raise ValueError(f"Unsupported token store schema version {version!r} at {path}")
+
+
 def open_packed_token_store(database: str | Path, *, max_open_shards: int = 16) -> PackedTokenStore:
     database = Path(database)
     manifest_path = database / "manifest.json"
@@ -848,6 +869,7 @@ def verify_token_store(
 
 __all__ = [
     "DEFAULT_TOKEN_SHARD_BYTES",
+    "open_any_token_store",
     "TOKEN_PACKED_STORE_TYPE",
     "PackedTokenDataset",
     "PackedTokenStore",

@@ -41,13 +41,29 @@ def read_window_tokens(
     feature_stats: Mapping[str, object] | None = None,
     shards: dict[int, Any] | None = None,
 ) -> torch.Tensor:
-    """Returns one ``[frames, 40]`` long token window for a sampler request."""
+    """Returns one ``[frames, 40]`` long token window for a sampler request.
+
+    Three backends: a v3 token store (``read_indices``), a v4 packed token store
+    (``read_window`` over the clip table) and a feature store plus the frozen
+    tokenizer.  All three present the same window convention, so the sampler is
+    the only thing that has to know which one it is reading.
+    """
     frames = int(frames)
     if has_token_indices(store):
         values = np.asarray(store.read_indices(request, frames), dtype=np.int64)
         if values.shape != (frames, 40):
             raise ValueError(
                 f"Token store returned {values.shape}, expected {(frames, 40)}"
+            )
+        return torch.from_numpy(np.ascontiguousarray(values))
+    if hasattr(store, "clip_split") and hasattr(store, "read_window") and tokenizer is None:
+        values = np.asarray(
+            store.read_window(int(request.variant_idx), int(request.target_start), frames),
+            dtype=np.int64,
+        )
+        if values.shape != (frames, 40):
+            raise ValueError(
+                f"Packed token store returned {values.shape}, expected {(frames, 40)}"
             )
         return torch.from_numpy(np.ascontiguousarray(values))
     if tokenizer is None or feature_stats is None:

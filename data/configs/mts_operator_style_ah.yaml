@@ -3,7 +3,7 @@ tokenizer:
   checkpoint: outputs/nef_fsq_soma_packed_40x9_ah/best.pt
   freeze: true
 transport:
-  checkpoint: outputs/mts_transport/seed3407/best.pt
+  checkpoint: outputs/mts_transport/seed_ah/best.pt
   freeze: true
 style_encoder:
   kind: reference
