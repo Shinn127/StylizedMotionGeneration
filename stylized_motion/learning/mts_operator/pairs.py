@@ -416,6 +416,82 @@ class StylePairSampler:
             return "train"
         return None
 
+    def _bucket(
+        self, target: ClipRecord, *, mode: str, split: str | None, allowed: set[str] | None
+    ) -> list[ClipRecord]:
+        """Records this mode may consider at all (before the leak rules)."""
+        if mode == "same_style":
+            return (
+                self._by_split_style.get((split, target.style), [])
+                if split is not None
+                else self._by_style_all.get(target.style, [])
+            )
+        if mode == "same_content":
+            return (
+                self._by_split_content.get((split, target.content), [])
+                if split is not None
+                else self._by_content_all.get(target.content, [])
+            )
+        # different_style: every record of the split that is not the target's style.
+        if split is not None:
+            return [
+                record
+                for record in self._records_by_split.get(split, [])
+                if record.style != target.style
+            ]
+        return self.records
+
+    def _accepts(
+        self,
+        record: ClipRecord,
+        target: ClipRecord,
+        *,
+        mode: str,
+        split: str | None,
+        allowed: set[str] | None,
+    ) -> bool:
+        if record.clip_id == target.clip_id:
+            return False
+        if not self.allow_same_take and record.source_group >= 0 and record.source_group == target.source_group:
+            return False
+        if allowed is not None and record.style not in allowed:
+            return False
+        if split == "train" and record.style in self.held_out_styles:
+            return False
+        # The evidence each mode is supposed to carry.
+        if mode == "same_style":
+            return record.style == target.style and record.content != target.content
+        if mode == "same_content":
+            return record.content == target.content and record.style != target.style
+        return record.style != target.style
+
+    def draw_candidate(
+        self,
+        target: ClipRecord,
+        *,
+        mode: str,
+        stage: str = "train",
+        rng: np.random.Generator,
+        attempts: int = 64,
+    ) -> ClipRecord | None:
+        """One reference drawn by rejection sampling.
+
+        Materializing the candidate list is O(bucket), and a majority style's
+        bucket holds most of the catalogue (SEED: ~105k of 142k records), which
+        cost ~7 minutes per epoch when every target scanned it.  Drawing with a
+        bounded number of attempts keeps the cost independent of the bucket size.
+        """
+        split = self._stage_split(stage)
+        allowed = set(self.styles_for_stage(stage)) if split is None and stage != "all" else None
+        bucket = self._bucket(target, mode=mode, split=split, allowed=allowed)
+        if not bucket:
+            return None
+        for _ in range(int(attempts)):
+            record = bucket[int(rng.integers(len(bucket)))]
+            if self._accepts(record, target, mode=mode, split=split, allowed=allowed):
+                return record
+        return None
+
     def candidates(
         self,
         target: ClipRecord,
@@ -434,55 +510,12 @@ class StylePairSampler:
             raise ValueError(f"Unknown pair mode {mode!r}; expected {list(PAIR_MODES)}")
         split = self._stage_split(stage)
         allowed = set(self.styles_for_stage(stage)) if split is None and stage != "all" else None
-        # Only the buckets this mode can accept are scanned, not every record.
-        if mode == "same_style":
-            pool = (
-                self._by_split_style.get((split, target.style), [])
-                if split is not None
-                else self._by_style_all.get(target.style, [])
-            )
-        elif mode == "same_content":
-            pool = (
-                self._by_split_content.get((split, target.content), [])
-                if split is not None
-                else self._by_content_all.get(target.content, [])
-            )
-        else:  # different_style
-            pool = (
-                [
-                    record
-                    for (pool_split, _style), records in self._by_split_style.items()
-                    if pool_split == split
-                    for record in records
-                ]
-                if split is not None
-                else self.records
-            )
-        result = []
-        for record in pool:
-            if record.clip_id == target.clip_id:
-                continue
-            if not self.allow_same_take and record.source_group >= 0 and record.source_group == target.source_group:
-                continue
-            if allowed is not None and record.style not in allowed:
-                continue
-            if split == "train" and record.style in self.held_out_styles:
-                continue
-            if mode == "same_style":
-                if record.style != target.style:
-                    continue
-                if record.content == target.content:
-                    continue
-            elif mode == "different_style":
-                if record.style == target.style:
-                    continue
-            else:  # same_content
-                if record.content != target.content:
-                    continue
-                if record.style == target.style:
-                    continue
-            result.append(record)
-        return result
+        bucket = self._bucket(target, mode=mode, split=split, allowed=allowed)
+        return [
+            record
+            for record in bucket
+            if self._accepts(record, target, mode=mode, split=split, allowed=allowed)
+        ]
 
     def pairs_for(
         self,
@@ -493,17 +526,19 @@ class StylePairSampler:
         stage: str = "train",
         generator: np.random.Generator | None = None,
     ) -> list[StylePair]:
-        candidates = self.candidates(target, mode=mode, stage=stage)
-        if not candidates:
-            return []
         if generator is not None and not isinstance(generator, np.random.Generator):
             raise TypeError(
                 "StylePairSampler needs a numpy.random.Generator, got "
                 f"{type(generator).__name__}"
             )
         rng = generator or np.random.default_rng(self.seed)
-        indices = rng.choice(len(candidates), size=min(int(count), len(candidates)), replace=False)
-        return [StylePair(target=target, reference=candidates[int(index)], mode=mode) for index in indices]
+        pairs: list[StylePair] = []
+        for _ in range(int(count)):
+            reference = self.draw_candidate(target, mode=mode, stage=stage, rng=rng)
+            if reference is None:
+                break
+            pairs.append(StylePair(target=target, reference=reference, mode=mode))
+        return pairs
 
     def sample(
         self,

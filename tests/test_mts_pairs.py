@@ -335,3 +335,36 @@ def test_audit_reports_both_generalization_axes():
     plain = build_pair_audit(records, sample_pairs=8, seed=3)
     assert plain["style_axis"]["held_out_styles"] == []
     assert plain["style_axis"]["zero_shot_style_supported"] == bool(plain["style_axis"]["styles_in_test_only"])
+
+def test_sampling_does_not_scale_with_the_majority_bucket():
+    """A majority style's bucket is most of the catalogue; draws must stay O(1).
+
+    Regression guard: candidate selection used to materialize the whole bucket per
+    target, which cost ~7 minutes per training epoch on SEED (105k of 142k records
+    in one style).
+    """
+    import time
+
+    records = [
+        ClipRecord(
+            clip_id=clip_id,
+            style=("big", "small", "tiny")[clip_id % 3] if clip_id % 1000 == 0 else "big",
+            content=f"c{clip_id % 20}",
+            performer=f"A{clip_id % 50}",
+            source_group=clip_id,
+            split="train",
+            frames=200,
+        )
+        for clip_id in range(60_000)
+    ]
+    sampler = StylePairSampler(
+        records, style_split=StyleSplit(train_styles=("big", "small", "tiny")), seed=1, use_data_splits=False
+    )
+    generator = np.random.default_rng(1)
+    started = time.perf_counter()
+    pairs = sampler.sample(count=64, mode="same_style", stage="train", generator=generator)
+    elapsed = time.perf_counter() - started
+    assert len(pairs) == 64
+    assert elapsed < 1.5, f"sampling 64 pairs took {elapsed:.2f}s; it must not scan the bucket"
+    for pair in pairs:
+        assert pair.same_style and not pair.same_content and not pair.leaks()
