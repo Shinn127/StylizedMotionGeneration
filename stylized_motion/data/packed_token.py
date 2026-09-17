@@ -780,12 +780,37 @@ def verify_token_store(
             "feature_schema_hash": store.feature_schema_hash,
         }
         if feature_store is not None:
-            if len(store.clip_shard) != len(feature_store.clip_shard):
-                raise ValueError("Token store clip table does not match the feature store width")
-            # Row alignment is a real contract: conditioning reads the feature
-            # row and the token row for the same clip.
-            # Rows must line up clip for clip; the physical shard offsets may
-            # differ because token and feature arrays pack at different widths.
+            if len(store.clip_shard) > len(feature_store.clip_shard):
+                raise ValueError("Token store covers more clips than the feature store")
+            # Row alignment is a real contract: conditioning reads the feature row
+            # and the token row for the same clip.  A `--limit-clips` build covers
+            # a *subset* of the feature rows, so the contract is checked against
+            # the rows the token store actually claims (`clip_source_id`) instead
+            # of a plain count comparison; the physical shard offsets are not part
+            # of it because token and feature arrays pack at different widths.
+            # Each (catalogue source clip, variant) pair identifies exactly one
+            # feature row, which is what the token table can be matched against:
+            # a limited build holds a *subset* of rows in packed order, so
+            # positional equality only applies to a full build.
+            feature_rows = {
+                (int(source), int(variant)): row
+                for row, (source, variant) in enumerate(
+                    zip(feature_store.clip_source_id, feature_store.clip_variant)
+                )
+            }
+            rows: list[int] = []
+            for token_row in range(len(store.clip_shard)):
+                key = (int(store.clip_source_id[token_row]), int(store.clip_variant[token_row]))
+                matched = feature_rows.get(key)
+                if matched is None:
+                    raise ValueError(
+                        f"Token store clip {key} does not exist in the feature store"
+                    )
+                rows.append(matched)
+            source_rows = np.asarray(rows, dtype=np.int64)
+            is_full = len(store.clip_shard) == len(feature_store.clip_shard)
+            if is_full and not np.array_equal(source_rows, np.arange(len(source_rows))):
+                raise ValueError("A full token store must follow the feature store's row order")
             for key in (
                 "clip_source_group",
                 "clip_variant",
@@ -797,16 +822,21 @@ def verify_token_store(
                 "clip_package_id",
                 "clip_length",
             ):
-                if not np.array_equal(np.asarray(getattr(store, key)), np.asarray(getattr(feature_store, key))):
+                expected = np.asarray(getattr(feature_store, key))[source_rows]
+                if not np.array_equal(np.asarray(getattr(store, key)), expected):
                     raise ValueError(f"Token store clip table disagrees with the feature store at {key}")
-            if store.clip_length.sum() != feature_store.clip_length.sum():
-                raise ValueError("Token store covers a different number of frames than the feature store")
             if store.normalization_hash != feature_store.normalization_hash:
                 raise ValueError("Token store normalization hash does not match the feature store")
             if store.split_manifest_hash != feature_store.split_manifest_hash:
                 raise ValueError("Token store split hash does not match the feature store")
             if store.feature_schema_hash != feature_store.feature_schema_hash:
                 raise ValueError("Token store feature schema hash does not match the feature store")
+            if is_full:
+                if store.clip_length.sum() != feature_store.clip_length.sum():
+                    raise ValueError("Token store covers a different number of frames than the feature store")
+            else:
+                report["limited_build"] = True
+                report["feature_store_clips"] = int(len(feature_store.clip_shard))
         if full:
             for relative, digest in zip(store.manifest["shard_files"], store.manifest["shard_sha256"]):
                 if sha256_file(Path(database) / str(relative)) != digest:

@@ -348,7 +348,15 @@ def main(argv: list[str] | None = None) -> None:
         unseen_fraction=float(style_split_config.get("unseen_fraction", 0.2)),
         seed=trainer_config.seed,
     )
-    sampler = StylePairSampler(records, style_split=style_split, seed=trainer_config.seed)
+    held_out_styles = tuple(str(style) for style in (pair_config.get("held_out_styles") or ()))
+    if held_out_styles:
+        print(f"held-out styles (never used for operator training): {list(held_out_styles)}", flush=True)
+    sampler = StylePairSampler(
+        records,
+        style_split=style_split,
+        seed=trainer_config.seed,
+        held_out_styles=held_out_styles,
+    )
     pair_config = dict(config["data"].get("pairs") or {})
     loader_config = dict(config.get("loader") or {})
     frames = int(config["data"].get("frames", 64))

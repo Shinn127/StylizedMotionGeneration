@@ -27,6 +27,7 @@ escape ``hard_mask``.  ``hard_mask == 0`` therefore implies ``Q == 0`` and
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -284,6 +285,8 @@ class StyleOperator(nn.Module):
         for name in ("identity_mix", "max_rate", "uniformization_tolerance", "max_terms"):
             if hasattr(self, name):
                 payload[name] = getattr(self, name)
+        if getattr(self, "shuffled_adjacency", False):
+            payload["level_order"] = list(self.level_order)
         return payload
 
     def describe(self) -> dict[str, Any]:
@@ -526,7 +529,7 @@ class BirthDeathCTMCOperator(StyleOperator):
                  hidden_dim: int = 64, style_dim: int | None = None,
                  stream_dim: int = 0, max_rate: float = 2.0,
                  uniformization_tolerance: float = 1e-10,
-                 max_terms: int = 256) -> None:
+                 max_terms: int = 256, level_order: Sequence[int] | None = None) -> None:
         super().__init__(
             num_levels=num_levels,
             coordinate_dim=coordinate_dim,
@@ -539,6 +542,19 @@ class BirthDeathCTMCOperator(StyleOperator):
         self.max_rate = float(max_rate)
         self.uniformization_tolerance = float(uniformization_tolerance)
         self.max_terms = int(max_terms)
+        # `level_order` defines which levels count as neighbours: the identity
+        # order is the design (adjacent FSQ levels), a shuffled order is the
+        # geometry control that asks whether the adjacency prior itself helps.
+        if level_order is None:
+            order = tuple(range(self.num_levels))
+        else:
+            order = tuple(int(value) for value in level_order)
+            if sorted(order) != list(range(self.num_levels)):
+                raise ValueError(
+                    f"level_order must be a permutation of 0..{self.num_levels - 1}, got {order}"
+                )
+        self.level_order = order
+        self.shuffled_adjacency = order != tuple(range(self.num_levels))
         # Two rate heads: up (L-1 useful entries) and down (L-1 useful entries).
         self.rate_head = self._mlp(self.context_width, 2 * self.num_levels)
         nn.init.zeros_(self.rate_head[-1].weight)
@@ -556,9 +572,23 @@ class BirthDeathCTMCOperator(StyleOperator):
         down_rate = self.max_rate * torch.sigmoid(down) * support.unsqueeze(-1)
         return up_rate, down_rate, support
 
+    def _level_generator(self, up_rate: torch.Tensor, down_rate: torch.Tensor) -> torch.Tensor:
+        """Generator over FSQ levels, optionally with a permuted adjacency.
+
+        The rates live on the *visit order* (``level_order``); permuting the
+        generator back into level space keeps the object a valid birth-death
+        CTMC on that order, so a shuffled run differs from the design only in
+        which levels are neighbours.
+        """
+        generator = birth_death_generator(up_rate, down_rate)
+        if not self.shuffled_adjacency:
+            return generator
+        order = torch.as_tensor(self.level_order, device=generator.device)
+        return generator[..., order][..., order, :]
+
     def forward(self, inputs: OperatorInputs) -> OperatorOutput:
         up_rate, down_rate, support = self.rates(inputs)
-        generator = birth_death_generator(up_rate, down_rate)
+        generator = self._level_generator(up_rate, down_rate)
         styled, diagnostics = uniformization_expm_apply(
             generator,
             inputs.base_probabilities(),
@@ -568,6 +598,9 @@ class BirthDeathCTMCOperator(StyleOperator):
         diagnostics["support_fraction"] = support.mean()
         diagnostics["max_up_rate"] = up_rate.max()
         diagnostics["max_down_rate"] = down_rate.max()
+        diagnostics["shuffled_adjacency"] = up_rate.new_tensor(
+            1.0 if self.shuffled_adjacency else 0.0
+        )
         return OperatorOutput(
             probabilities=styled,
             rates=torch.stack((up_rate, down_rate), dim=-2),
@@ -577,7 +610,7 @@ class BirthDeathCTMCOperator(StyleOperator):
     def reference_expm(self, inputs: OperatorInputs) -> torch.Tensor:
         """``torch.matrix_exp`` reference for tests and spot checks."""
         up_rate, down_rate, _ = self.rates(inputs)
-        generator = birth_death_generator(up_rate, down_rate)
+        generator = self._level_generator(up_rate, down_rate)
         applied = inputs.base_probabilities().unsqueeze(-2) @ torch.matrix_exp(generator)
         return applied.squeeze(-2)
 

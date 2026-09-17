@@ -1,0 +1,55 @@
+tokenizer:
+  representation: nef-fsq
+  checkpoint: outputs/nef_fsq_soma_packed_40x9_ah/best.pt
+  freeze: true
+data:
+  fsq_window_index: data/processed/seed_soma_pruned_v4_ah
+  required_data_schema_version: 3
+  token_store: data/processed/seed_soma_pruned_v4_ah_tokens
+transport:
+  dim: 256
+  depth: 8
+  heads: 8
+  dropout: 0.1
+  graph_mode: local_relational
+  graph_depth: 2
+  temporal_mode: bidirectional
+  content_dim: null
+  content_classes: null
+masking:
+  random_coordinate: 0.2
+  stream: 0.25
+  temporal_span: 0.2
+  spatiotemporal_block: 0.2
+  full_generation: 0.15
+  coordinate_ratio: 0.3
+  stream_ratio: 0.3
+  span_ratio: 0.5
+  block_frames: 16
+  block_coordinates: 8
+sampling:
+  strategy: clip_uniform
+  target_frames: 64
+  samples_per_epoch: 100000
+  seed: 3407
+  mirror_probability: 0.5
+training:
+  epochs: 100
+  lr: 0.0002
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  precision: fp32
+  seed: 3407
+  log_every_steps: 50
+  steps_per_epoch: null
+  max_steps: null
+  output_dir: outputs/mts_transport/seed_ah
+loader:
+  batch_size: 256
+  num_workers: 4
+  pin_memory: auto
+  persistent_workers: true
+  prefetch_factor: 2
+  drop_last_train: true
+  max_open_shards: 32
+  prefetch_memory_limit_mb: 512

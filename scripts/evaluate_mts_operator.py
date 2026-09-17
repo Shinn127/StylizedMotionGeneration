@@ -100,9 +100,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--frames", type=int, default=64)
     parser.add_argument("--mask-kind", default="full_generation")
     parser.add_argument("--strengths", nargs="*", type=float, default=[0.0, 0.5, 1.0, 1.5, 2.0])
-    parser.add_argument("--support", nargs="*", default=None, help="Region names for locality metrics.")
+    parser.add_argument(
+        "--support",
+        nargs="*",
+        default=None,
+        help="Region names for the edit support (several regions = a disjoint multi-region edit).",
+    )
     parser.add_argument("--graph-radius", type=int, default=0)
+    parser.add_argument(
+        "--frame-range",
+        nargs=2,
+        type=int,
+        default=None,
+        metavar=("START", "STOP"),
+        help="Temporal support: only frames in [START, STOP) are editable.",
+    )
+    parser.add_argument("--label", default="", help="Row label for the experiment matrix.")
     parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument(
+        "--held-out-styles",
+        nargs="*",
+        default=None,
+        help="Styles the operator was never trained on (the unseen-style axis).",
+    )
     parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
     parser.add_argument("--output", type=Path, default=None)
     return parser
@@ -202,7 +222,9 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("Pass --feature-database or --token-store to read evaluation windows")
     records = clip_records_from_store(store)
     style_split = split_styles_by_performer(records, seed=int(args.seed))
-    sampler = StylePairSampler(records, style_split=style_split, seed=int(args.seed))
+    sampler = StylePairSampler(
+        records, style_split=style_split, seed=int(args.seed), held_out_styles=tuple(args.held_out_styles or ())
+    )
     windows = windows_by_clip(store, args.split, frames=int(args.frames))
     history = int(tokenizer.history_frames)
     feature_stats = tokenizer_checkpoint.get("feature_stats")
@@ -274,10 +296,18 @@ def main(argv: list[str] | None = None) -> None:
             wrong_reference=torch.stack(wrong_references).to(device),
             random_reference=torch.stack(random_references).to(device),
         )
+        row["label"] = args.label or f"{operator_kind}:{encoder_kind}:{args.mask_kind}"
+        row["split"] = args.split
+        row["regions"] = ",".join(args.support) if args.support else "none"
+        row["graph_radius"] = int(args.graph_radius)
+        row["frame_range"] = (
+            f"{int(args.frame_range[0])}-{int(args.frame_range[1])}" if args.frame_range else "all"
+        )
         row.update(content_preservation(model, batch))
         if args.support:
             support = adapter.hard_mask(
                 list(args.support), graph_radius=int(args.graph_radius), length=target_tokens.shape[1],
+                frame_range=tuple(args.frame_range) if args.frame_range else None,
                 device=device,
             )
             batch = OperatorBatch(
@@ -308,11 +338,16 @@ def main(argv: list[str] | None = None) -> None:
                 with torch.no_grad():
                     base_motion = tokenizer.decode_indices(target_tokens)
                     edited_motion = tokenizer.decode_indices(edited_tokens)
+                interval = (
+                    (int(args.frame_range[0]), int(args.frame_range[1]))
+                    if args.frame_range
+                    else (0, target_tokens.shape[1])
+                )
                 physics = physics_metrics(
                     baseline_motion=base_motion,
                     edited_motion=edited_motion,
                     kinematic=kinematic,
-                    edit_interval=(0, target_tokens.shape[1]),
+                    edit_interval=interval,
                 )
                 physics_rows.append({"strength": float(strength), **physics})
 
@@ -330,7 +365,11 @@ def main(argv: list[str] | None = None) -> None:
 
     summary = {
         "checkpoint": str(args.checkpoint),
+        "label": args.label or f"{operator_kind}:{encoder_kind}",
         "split": args.split,
+        "regions": list(args.support) if args.support else [],
+        "graph_radius": int(args.graph_radius),
+        "frame_range": list(args.frame_range) if args.frame_range else None,
         "operator": operator_kind,
         "style_encoder": encoder_kind,
         "batches": len(rows),

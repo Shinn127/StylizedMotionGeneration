@@ -334,3 +334,34 @@ def test_operators_can_use_stream_hidden_context_and_accept_valid_masks():
         AdditiveLogitField(style_dim=8)(
             OperatorInputs(base_logits=logits, style_embedding=torch.zeros(BATCH, 8), stream_hidden=hidden)
         )
+
+def test_shuffled_adjacency_is_the_geometry_control():
+    """A permuted level order must stay a valid, identity-clean CTMC."""
+    torch.manual_seed(11)
+    logits = base_logits()
+    base_probs = logits.softmax(-1)
+    order = [3, 7, 1, 8, 0, 5, 2, 6, 4]
+    design = trained(BirthDeathCTMCOperator(num_levels=LEVELS, hidden_dim=16, style_dim=16))
+    shuffled = trained(
+        BirthDeathCTMCOperator(num_levels=LEVELS, hidden_dim=16, style_dim=16, level_order=order)
+    )
+    assert design.shuffled_adjacency is False and shuffled.shuffled_adjacency is True
+    assert shuffled.level_order == tuple(order)
+    assert shuffled.config()["level_order"] == order
+    assert "level_order" not in design.config()
+    zero = shuffled(inputs_for(logits, strength=0.0, hard_mask=full_mask()))
+    assert torch.equal(zero.probabilities, base_probs)
+    output = shuffled(inputs_for(logits, strength=1.0, hard_mask=full_mask()))
+    assert float(output.probabilities.sum(-1).sub(1).abs().max()) < 1e-5
+    assert float((output.probabilities - shuffled.reference_expm(
+        inputs_for(logits, strength=1.0, hard_mask=full_mask())
+    )).abs().max()) < 1e-5
+    assert float(output.diagnostics["shuffled_adjacency"]) == 1.0
+    assert not torch.allclose(
+        output.probabilities,
+        design(inputs_for(logits, strength=1.0, hard_mask=full_mask())).probabilities,
+    )
+    with pytest.raises(ValueError, match="permutation"):
+        BirthDeathCTMCOperator(num_levels=LEVELS, level_order=[0, 1, 2])
+    with pytest.raises(ValueError, match="permutation"):
+        BirthDeathCTMCOperator(num_levels=LEVELS, level_order=[0, 1, 2, 3, 4, 5, 6, 7, 7])

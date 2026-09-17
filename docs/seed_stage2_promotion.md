@@ -58,16 +58,20 @@ clip 表新增 `clip_performer_id`，manifest 新增 `performer_names`（来自 
 † flat 的解码足部几乎静止（foot slide 0.004 m/s），于是"永远接触"就能拿到高准确率与召回 1.000：
 这是退化解，不能读作 flat 的接触建模更好（precision 0.760 恰等于目标接触率即为证据）。
 
-**①的结论**：物理目标确实作用在预期的通道上——接触召回 +33%、准确率 +18%、脚滑 −16%、脚高 −6%，
-代价是 FK 平均误差 +6%、root 漂移 0.93 → 2.05 cm。**注意这里有一个未排除的混淆**：v1.1 比 v1 多练了
-11,350 步，所以"目标变化"与"训练更久"尚未分离。下一步的对照是让 v1 用同一预算继续跑 recon+delta
-（约 39 分钟）再比一次：
+**①的结论（已由等预算对照确认）**：物理目标确实作用在预期的通道上，且与"训练更久"分离。
 
-```bash
-# 用 1h 配置从 v1 best.pt 续跑 11,350 步、同样重启 LR、同样清除继承 best
-# 只改 training：max_steps 25350、epochs 141、scheduler_epochs 61、
-#                reset_scheduler_on_resume/reset_best_on_resume: true
-```
+等预算对照（`data/configs/nef_fsq_soma_packed_40x9_1h_ctrl.yaml`）：v1 从同一 checkpoint 续跑
+**同样的 11,350 步**，但只用 recon+delta。三个 checkpoint 在同样的 128 个 test 窗口上：
+
+| checkpoint | FK mean | root 漂移 | foot slide | 接触准确率 | 接触召回 | 脚高误差 |
+|---|---|---|---|---|---|---|
+| v1 (14.0k, recon+delta) | 8.22 cm | 0.93 cm | 0.3298 m/s | 0.526 | 0.379 | 4.27 cm |
+| v1-ctrl (25.4k, recon+delta) | 8.15 cm | 0.93 cm | 0.3284 m/s | 0.533 | 0.390 | 4.23 cm |
+| v1.1 (25.4k, +physical) | 8.71 cm | 2.05 cm | **0.2765 m/s** | **0.620** | **0.505** | 4.02 cm |
+
+多练 11,350 步本身几乎不改变任何物理指标（脚滑 −0.4%、接触召回 +3%）；同样步数下加上物理目标才带来
+脚滑 −16%、接触准确率 +18%、召回 +33%。因此 **① 的改善归因于 staged physical objective**；
+FK +7% 与 root 漂移 0.93 → 2.05 cm 的代价同样归因于它（对照组的 root 漂移没有变化）。
 
 ## ③ R1：flat / part / NEF 的局部编辑对照
 
