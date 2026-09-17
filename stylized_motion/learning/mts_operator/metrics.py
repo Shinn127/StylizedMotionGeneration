@@ -388,7 +388,17 @@ def aggregate(rows: Sequence[Mapping[str, float]]) -> dict[str, dict[str, float]
     keys = sorted({key for row in rows for key in row})
     result: dict[str, dict[str, float]] = {}
     for key in keys:
-        values = np.asarray([float(row[key]) for row in rows if key in row], dtype=np.float64)
+        # Rows also carry descriptive columns (split, regions, frame_range); only
+        # numeric metrics are summarized instead of failing on a label.
+        collected: list[float] = []
+        for row in rows:
+            if key not in row:
+                continue
+            try:
+                collected.append(float(row[key]))
+            except (TypeError, ValueError):
+                continue
+        values = np.asarray(collected, dtype=np.float64)
         if values.size == 0:
             continue
         result[key] = {

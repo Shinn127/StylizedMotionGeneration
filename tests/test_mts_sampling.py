@@ -131,3 +131,25 @@ def test_region_support_mask_delegates_to_the_layout():
     assert sorted(torch.nonzero(mask.any(0)).flatten().tolist()) == [10, 11, 12, 13, 32, 33]
     windowed = region_support_mask(adapter, ["left_arm"], frame_range=(2, 4), length=8)
     assert int(windowed.sum()) == 2 * 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the device-mismatch guard")
+def test_sampling_works_with_a_cpu_generator_on_cuda_tensors():
+    """Regression guard: a CPU generator with CUDA probabilities must not crash.
+
+    This is the production configuration (reproducible CPU generator, GPU model)
+    and it was silently broken in three places: the mask generator, the transport
+    generator loop and sample_tokens().
+    """
+    from stylized_motion.learning.mts_operator.sampling import sample_tokens
+    from stylized_motion.learning.mts_operator.masking import MaskGenerator
+
+    probabilities = one_hot_probabilities(3, 3).to("cuda")
+    generator = torch.Generator(device="cpu").manual_seed(5)
+    drawn = sample_tokens(probabilities, generator=generator)
+    assert drawn.device.type == "cuda" and drawn.tolist() == [3, 3]
+    masks = MaskGenerator({"random_coordinate": 1.0})
+    batch = masks.sample_kind(
+        "random_coordinate", 2, 8, generator=torch.Generator(device="cpu").manual_seed(1), device=torch.device("cuda")
+    )
+    assert batch.visible_mask.device.type == "cuda" and not bool(batch.visible_mask.all())

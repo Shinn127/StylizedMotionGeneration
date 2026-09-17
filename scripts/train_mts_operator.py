@@ -164,6 +164,7 @@ class PairedBatchSource:
         stage: str = "train",
         strength: tuple[float, float] | None = None,
         seed: int = 3407,
+        style_index: Mapping[str, int] | None = None,
     ) -> None:
         self.store = store
         self.sampler = sampler
@@ -179,6 +180,9 @@ class PairedBatchSource:
         self.mode = str(mode)
         self.stage = str(stage)
         self.strength = strength
+        # The Phase 3 sandbox conditions on a style *id*: the pairs already know
+        # their style, so the batch carries the id the encoder expects.
+        self.style_index = dict(style_index) if style_index else None
         self.rng = np.random.default_rng(seed)
         self.generator = torch.Generator(device="cpu").manual_seed(seed)
         self._shards: dict[int, Any] = {}
@@ -235,9 +239,18 @@ class PairedBatchSource:
                 self.rng.uniform(low, high, size=batch_size).astype(np.float32)
             )
             strength = values
+        style_ids = None
+        if self.style_index is not None:
+            unknown = sorted({pair.target.style for pair in pairs} - set(self.style_index))
+            if unknown:
+                raise ValueError(f"Style id map is missing {unknown}")
+            style_ids = torch.tensor(
+                [self.style_index[pair.target.style] for pair in pairs], dtype=torch.long
+            )
         return OperatorBatch(
             target_tokens=target_tokens.to(self.device),
             reference_tokens=reference_tokens.to(self.device),
+            style_ids=None if style_ids is None else style_ids.to(self.device),
             visible_mask=mask.visible_mask,
             target_valid_mask=torch.ones(batch_size, frames, dtype=torch.bool, device=self.device),
             strength=1.0 if strength is None else strength.to(self.device),
@@ -268,6 +281,30 @@ def main(argv: list[str] | None = None) -> None:
     trainer_config = TrainerConfig.from_mapping(training)
     set_seed(trainer_config.seed, deterministic=False)
     device = choose_device(args.device)
+    # CLI overrides are applied to the *config* before anything is built from it;
+    # an override that only reaches the parser would be silently ignored (which is
+    # how the first sandbox runs trained reference encoders instead of style ids).
+    if args.feature_database is not None:
+        config["data"] = {**config["data"], "fsq_window_index": str(args.feature_database)}
+    if args.batch_size is not None:
+        config["loader"] = {**dict(config.get("loader") or {}), "batch_size": int(args.batch_size)}
+    if args.hidden_dim is not None:
+        config["operator"] = {**dict(config["operator"]), "hidden_dim": int(args.hidden_dim)}
+        config["style_encoder"] = {
+            **dict(config["style_encoder"]),
+            "dim": int(args.hidden_dim),
+            "output_dim": int(args.hidden_dim),
+        }
+    if args.style_encoder_kind is not None:
+        encoder_overrides: dict[str, object] = {"kind": args.style_encoder_kind}
+        if args.style_encoder_kind == "style_id":
+            if args.num_styles is None:
+                raise ValueError("--style-encoder-kind style_id requires --num-styles")
+            encoder_overrides["num_styles"] = int(args.num_styles)
+            encoder_overrides["output_dim"] = int(
+                args.hidden_dim or config["style_encoder"].get("output_dim") or 256
+            )
+        config["style_encoder"] = {**dict(config["style_encoder"]), **encoder_overrides}
 
     tokenizer_path = args.tokenizer_checkpoint or config["tokenizer"].get("checkpoint")
     if tokenizer_path is None:
@@ -300,14 +337,21 @@ def main(argv: list[str] | None = None) -> None:
 
     # Unset YAML keys are dropped, and each kind only accepts its own options,
     # so a config can carry both kinds' keys without confusing either one.
-    style_config = {key: value for key, value in dict(config["style_encoder"]).items() if value is not None}
+    # A config may carry both kinds' keys (so `--style-encoder-kind` can switch
+    # families); validate against the union to catch typos, then pass only the
+    # chosen kind's arguments.
+    style_config = {
+        key: value for key, value in dict(config["style_encoder"]).items() if value is not None
+    }
     kind = str(style_config.pop("kind", "reference"))
-    allowed = REFERENCE_ENCODER_KEYS if kind == "reference" else STYLE_ID_ENCODER_KEYS
-    unknown = sorted(set(style_config) - set(allowed) - {"num_styles"} if kind == "reference" else set(style_config) - set(allowed))
+    union = set(REFERENCE_ENCODER_KEYS) | set(STYLE_ID_ENCODER_KEYS)
+    unknown = sorted(set(style_config) - union)
     if unknown:
-        raise ValueError(f"Unknown style_encoder options {unknown} for kind {kind!r}")
+        raise ValueError(f"Unknown style_encoder options {unknown}")
     if kind == "reference":
-        style_encoder = GlobalStyleEncoder(adapter, **style_config)
+        style_encoder = GlobalStyleEncoder(
+            adapter, **{key: value for key, value in style_config.items() if key in REFERENCE_ENCODER_KEYS}
+        )
     elif kind == "style_id":
         if "num_styles" not in style_config:
             raise ValueError("style_encoder.kind=style_id requires num_styles")
@@ -317,6 +361,7 @@ def main(argv: list[str] | None = None) -> None:
         )
     else:
         raise ValueError(f"Unknown style_encoder.kind {kind!r}; expected reference or style_id")
+    print(f"style encoder: {kind} -> {style_encoder.config()}", flush=True)
 
     operator_config = dict(config["operator"])
     # Pop before choosing: `args.operator or config.pop(...)` would skip the pop
@@ -327,6 +372,17 @@ def main(argv: list[str] | None = None) -> None:
     unknown = sorted(set(operator_config) - set(OPERATOR_KEYS))
     if unknown:
         raise ValueError(f"Unknown operator options {unknown}")
+    if args.shuffled_adjacency is not None:
+        if operator_name != "birth_death":
+            raise ValueError("--shuffled-adjacency only applies to the birth_death operator")
+        import numpy as _np
+
+        order = [
+            int(value)
+            for value in _np.random.default_rng(int(args.shuffled_adjacency)).permutation(adapter.num_levels)
+        ]
+        operator_config["level_order"] = order
+        print(f"shuffled adjacency (seed {args.shuffled_adjacency}): {order}", flush=True)
     accepted = set(COMMON_OPERATOR_KEYS) | set(OPERATOR_SPECIFIC_KEYS.get(operator_name, ()))
     ignored = sorted(set(operator_config) - accepted)
     if ignored:
@@ -364,6 +420,13 @@ def main(argv: list[str] | None = None) -> None:
         seed=trainer_config.seed,
     )
     pair_config = dict(config["data"].get("pairs") or {})
+    style_index = (
+        {style: index for index, style in enumerate(sorted({record.style for record in records}))}
+        if kind == "style_id"
+        else None
+    )
+    if style_index is not None:
+        print(f"style ids: {style_index}", flush=True)
     held_out_styles = tuple(str(style) for style in (pair_config.get("held_out_styles") or ()))
     if held_out_styles:
         print(f"held-out styles (never used for operator training): {list(held_out_styles)}", flush=True)
@@ -398,6 +461,7 @@ def main(argv: list[str] | None = None) -> None:
             stage=split,
             strength=tuple(strength_range) if strength_range else None,
             seed=trainer_config.seed,
+            style_index=style_index,
         )
         for split in ("train", "val")
     }

@@ -234,7 +234,7 @@ def main(argv: list[str] | None = None) -> None:
     pair_rng = np.random.default_rng(int(args.seed))
     mask_generator = MaskGenerator(MaskConfig(mixture={args.mask_kind: 1.0}))
     kinematic = (
-        KinematicContext.from_feature_stats(feature_stats)
+        KinematicContext.from_feature_stats(feature_stats).to(device)
         if feature_stats and "ref_pos" in feature_stats
         else None
     )

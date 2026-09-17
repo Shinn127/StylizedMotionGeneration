@@ -100,8 +100,11 @@ def sample_tokens(
     """Samples tokens either with fresh randomness or with shared uniforms."""
     if crn is not None:
         return crn.sample(probabilities)
-    uniforms = torch.rand(probabilities.shape[:-1], generator=generator, device=probabilities.device)
-    return inverse_cdf_sample(probabilities, uniforms)
+    # A CPU generator (the reproducible default) with CUDA probabilities is the
+    # normal case: draw on the generator's device and move the *result*.
+    draw = probabilities.device if generator is None else generator.device
+    uniforms = torch.rand(probabilities.shape[:-1], generator=generator, device=draw)
+    return inverse_cdf_sample(probabilities, uniforms.to(probabilities.device))
 
 
 def paired_comparison(
@@ -124,9 +127,10 @@ def paired_comparison(
     coupling = crn or CommonRandomNumbers()
     uniforms = coupling.uniforms(base_probabilities.shape[:-1], device=base_probabilities.device)
     if generator is not None and crn is None:
+        draw = generator.device
         uniforms = torch.rand(
-            base_probabilities.shape[:-1], generator=generator, device=base_probabilities.device
-        )
+            base_probabilities.shape[:-1], generator=generator, device=draw
+        ).to(base_probabilities.device)
     base_tokens = inverse_cdf_sample(base_probabilities.detach(), uniforms)
     styled_tokens = inverse_cdf_sample(styled_probabilities.detach(), uniforms)
     changed = base_tokens != styled_tokens
