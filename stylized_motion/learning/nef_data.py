@@ -151,6 +151,37 @@ def model_space_window(
     return torch.from_numpy(renormalize(raw, feature_stats))
 
 
+def validate_checkpoint_against_store(checkpoint: Any, model: Any, store: Any) -> None:
+    """Checks that a checkpoint and a store describe the same motion data.
+
+    ``nef_eval.validate_checkpoint_store`` is NEF-specific: it compares stream
+    ownership through ``module.layout``.  Representation comparisons (R1's
+    flat / part / NEF table) need the skeleton and feature-schema half of that
+    check without assuming a layout, so this is the shared version.
+    """
+    module = getattr(model, "module", model)
+    if int(getattr(module, "motion_dim")) != int(store.motion_dim):
+        raise ValueError("Checkpoint and feature database motion dimensions differ")
+    stats = (checkpoint or {}).get("feature_stats") if isinstance(checkpoint, Mapping) else None
+    if isinstance(stats, Mapping):
+        names = stats.get("names")
+        parents = stats.get("parents")
+        if names is not None and [str(name) for name in names] != [str(name) for name in store.names]:
+            raise ValueError("Checkpoint and feature database skeletons differ")
+        if parents is not None and [int(value) for value in np.asarray(parents).tolist()] != [
+            int(value) for value in np.asarray(store.parents).tolist()
+        ]:
+            raise ValueError("Checkpoint and feature database topology differs")
+    checkpoint_schema = (checkpoint or {}).get("feature_schema") if isinstance(checkpoint, Mapping) else None
+    if isinstance(checkpoint_schema, Mapping):
+        store_schema = store.feature_schema()
+        for key in ("name", "motion_dim", "joint_subset"):
+            if checkpoint_schema.get(key) != store_schema.get(key):
+                raise ValueError(
+                    f"Checkpoint and feature database differ at feature schema field {key!r}"
+                )
+
+
 def module_device(model: torch.nn.Module) -> torch.device:
     """Device of a module that may hold no parameters (buffers only)."""
     for tensor in model.parameters():
@@ -169,5 +200,6 @@ __all__ = [
     "read_sampler_window",
     "renormalize",
     "split_clip_geometry",
+    "validate_checkpoint_against_store",
     "store_length",
 ]

@@ -32,7 +32,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from stylized_motion.data import open_any_feature_store  # noqa: E402
 from stylized_motion.data.sampling import FixedWindowSampler  # noqa: E402
-from stylized_motion.learning.nef_eval import validate_checkpoint_store  # noqa: E402
+from stylized_motion.learning.nef_data import validate_checkpoint_against_store  # noqa: E402
 from stylized_motion.learning.nef_layout import NEF_EDIT_PARTS, NEFLayout, nef_edit_streams  # noqa: E402
 from stylized_motion.learning.nef_probe import (  # noqa: E402
     KinematicContext,
@@ -210,7 +210,7 @@ def evaluate_checkpoint(args: argparse.Namespace, checkpoint_path: Path, *, wind
     device = choose_device(args.device)
     checkpoint, model = load_representation_checkpoint(checkpoint_path, device)
     store = windows_cache["store"]
-    validate_checkpoint_store(checkpoint, model, store)
+    validate_checkpoint_against_store(checkpoint, model, store)
     model = model.to(device).eval()
     module = model.module
     history = int(model.history_frames)
