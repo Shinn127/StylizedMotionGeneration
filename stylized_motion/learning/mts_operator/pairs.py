@@ -183,8 +183,16 @@ def build_pair_audit(
     style_split: StyleSplit | None = None,
     sample_pairs: int = 512,
     seed: int = 3407,
+    held_out_styles: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """The ``style_pair_audit.json`` payload of plan Phase 1."""
+    """The ``style_pair_audit.json`` payload of plan Phase 1.
+
+    Reports the two generalization axes separately, because they are not the
+    same experiment: *unseen performer* comes from the data split (a catalogue
+    actor holdout freezes whole actors into test), while *unseen style* requires
+    excluding a style from operator training outright.  A style that merely
+    happens to be rare in the held-out actors is not an unseen style.
+    """
     if not records:
         raise ValueError("Pair audit needs at least one clip record")
     split = style_split or split_styles_by_performer(records, seed=seed)
@@ -243,13 +251,16 @@ def build_pair_audit(
     overlapping_unseen = {
         style: performers for style, performers in performer_overlap.items() if performers
     }
-    if overlapping_unseen:
+    if overlapping_unseen and performer_axis["zero_shot_performer_supported"] is False:
+        # Only a warning when the *data* split is not actor-disjoint: if the store
+        # already froze whole actors into test, a style-level partition that
+        # overlaps performers is beside the point.
         warnings.append(
-            "Unseen styles share actors with training styles "
-            f"({ {style: len(names) for style, names in overlapping_unseen.items()} }), so a "
-            "style-level holdout cannot separate style from performer identity: freeze whole "
-            "actors into test at the catalogue level (seed-catalog --actor-holdout) before "
-            "claiming zero-shot style transfer."
+            "The style-level partition puts styles whose actors also appear in training "
+            f"styles into the unseen set ({ {style: len(names) for style, names in overlapping_unseen.items()} }), "
+            "and the data split is not actor-disjoint either: freeze whole actors into test at "
+            "the catalogue level (seed-catalog --actor-holdout-ratio) before claiming zero-shot "
+            "style transfer."
         )
 
     sampler = StylePairSampler(records, style_split=split, seed=seed)
@@ -263,6 +274,35 @@ def build_pair_audit(
     styles_train = [
         style for style in split.train_styles if clips_per_style.get(style, 0) > 0
     ]
+    split_styles: dict[str, set[str]] = defaultdict(set)
+    split_actors: dict[str, set[str]] = defaultdict(set)
+    for record in records:
+        split_styles[record.split].add(record.style)
+        if record.performer:
+            split_actors[record.split].add(record.performer)
+    held_out = {str(style) for style in held_out_styles}
+    test_only_styles = sorted(split_styles["test"] - split_styles["train"] - split_styles["val"])
+    performer_axis = {
+        "train_actors": len(split_actors["train"]),
+        "val_actors": len(split_actors["val"]),
+        "test_actors": len(split_actors["test"]),
+        "train_test_actor_overlap": len(split_actors["train"] & split_actors["test"]),
+        "test_actor_examples": sorted(split_actors["test"])[:5],
+        "zero_shot_performer_supported": len(split_actors["train"] & split_actors["test"]) == 0
+        and len(split_actors["test"]) > 0,
+    }
+    style_axis = {
+        "train_styles": sorted(split_styles["train"]),
+        "styles_in_test_only": test_only_styles,
+        "held_out_styles": sorted(held_out),
+        "zero_shot_style_supported": bool(test_only_styles or held_out),
+    }
+    if not style_axis["zero_shot_style_supported"]:
+        warnings.append(
+            "No style is exclusive to the held-out actors, so this split supports the "
+            "unseen-performer axis only: excluding styles from operator training is what "
+            "creates an unseen-style axis (config data.pairs.held_out_styles)."
+        )
     return {
         "clips": len(records),
         "style_groups": len(clips_per_style),
@@ -276,6 +316,8 @@ def build_pair_audit(
         },
         "performer_analysis": performer_analysis,
         "performer_overlap": performer_overlap,
+        "performer_axis": performer_axis,
+        "style_axis": style_axis,
         "style_balance": {
             "dominant_style": dominant_style,
             "dominant_share": float(dominant_share),
@@ -322,6 +364,8 @@ class StylePairSampler:
         style_split: StyleSplit | None = None,
         seed: int = 3407,
         allow_same_take: bool = False,
+        held_out_styles: Sequence[str] = (),
+        use_data_splits: bool = True,
     ) -> None:
         if not records:
             raise ValueError("StylePairSampler needs at least one clip record")
@@ -329,6 +373,10 @@ class StylePairSampler:
         self.style_split = style_split or split_styles_by_performer(self.records, seed=seed)
         self.seed = int(seed)
         self.allow_same_take = bool(allow_same_take)
+        #: Styles the operator must never train on (the unseen-style axis).
+        self.held_out_styles = {str(style) for style in held_out_styles}
+        #: When records carry a real split (an actor holdout), stage follows it.
+        self.use_data_splits = bool(use_data_splits)
         self._by_style: dict[str, list[ClipRecord]] = defaultdict(list)
         for record in self.records:
             self._by_style[record.style].append(record)
@@ -342,6 +390,17 @@ class StylePairSampler:
             return self.style_split.test_unseen_styles
         raise ValueError(f"Unknown stage {stage!r}; expected train, val or test")
 
+    def _stage_split(self, stage: str) -> str | None:
+        if not self.use_data_splits:
+            return None
+        if stage in {"test", "unseen"}:
+            return "test"
+        if stage == "val":
+            return "val"
+        if stage == "train":
+            return "train"
+        return None
+
     def candidates(
         self,
         target: ClipRecord,
@@ -349,17 +408,28 @@ class StylePairSampler:
         mode: str,
         stage: str = "train",
     ) -> list[ClipRecord]:
-        """Reference candidates for one target, split-safe and leak-free."""
+        """Reference candidates for one target, split-safe and leak-free.
+
+        With ``use_data_splits`` the stage selects the record's own data split
+        (so a held-out actor never appears as a training reference or target);
+        otherwise the stage selects by style vocabulary, which is the behaviour
+        for stores without an actor holdout.
+        """
         if mode not in PAIR_MODES:
             raise ValueError(f"Unknown pair mode {mode!r}; expected {list(PAIR_MODES)}")
-        allowed = set(self.styles_for_stage(stage)) if stage != "all" else None
+        split = self._stage_split(stage)
+        allowed = set(self.styles_for_stage(stage)) if split is None and stage != "all" else None
         result = []
         for record in self.records:
             if record.clip_id == target.clip_id:
                 continue
+            if split is not None and record.split != split:
+                continue
             if not self.allow_same_take and record.source_group >= 0 and record.source_group == target.source_group:
                 continue
             if allowed is not None and record.style not in allowed:
+                continue
+            if split == "train" and record.style in self.held_out_styles:
                 continue
             if mode == "same_style":
                 if record.style != target.style:
@@ -418,9 +488,14 @@ class StylePairSampler:
                 f"{type(generator).__name__}"
             )
         rng = generator or np.random.default_rng(self.seed)
-        pool = list(targets) if targets is not None else [
-            record for record in self.records if record.style in set(self.styles_for_stage(stage))
-        ]
+        split = self._stage_split(stage)
+        if targets is not None:
+            pool = list(targets)
+        elif split is not None:
+            pool = [record for record in self.records if record.split == split]
+        else:
+            allowed = set(self.styles_for_stage(stage))
+            pool = [record for record in self.records if record.style in allowed]
         if not pool:
             return []
         order = rng.permutation(len(pool))

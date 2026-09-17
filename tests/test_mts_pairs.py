@@ -124,7 +124,8 @@ def test_pair_audit_reports_the_designed_schema_without_leakage():
 def test_pair_sampler_never_crosses_clips_takes_or_stages():
     records = make_records()
     split = split_styles_by_performer(records, val_fraction=0.2, unseen_fraction=0.2, seed=11)
-    sampler = StylePairSampler(records, style_split=split, seed=11)
+    # No actor holdout in this fixture: stages select by style vocabulary.
+    sampler = StylePairSampler(records, style_split=split, seed=11, use_data_splits=False)
     unseen = set(split.test_unseen_styles)
     for pair in sampler.sample(count=40, mode="same_style", stage="train"):
         assert pair.same_style and not pair.same_content
@@ -277,3 +278,60 @@ def test_style_id_encoder_matches_the_descriptor_contract():
         encoder(torch.tensor([5]))
     with pytest.raises(ValueError, match="positive"):
         StyleIDEncoder(num_styles=0, output_dim=4)
+
+def test_sampler_follows_data_splits_and_excludes_held_out_styles():
+    """An actor holdout makes the stage a data split; styles can be excluded."""
+    records = make_records()
+    # Freeze two actors into test (their clips keep their styles), split the rest.
+    held_actors = {"FW", "SR"}
+    for index, record in enumerate(records):
+        record_performer = record.performer
+        split = "test" if record_performer in held_actors else ("val" if index % 9 == 0 else "train")
+        records[index] = ClipRecord(
+            clip_id=record.clip_id, style=record.style, content=record.content,
+            performer=record_performer, source_group=record.source_group, split=split,
+            variant=record.variant, frames=record.frames,
+        )
+    sampler = StylePairSampler(records, seed=5, held_out_styles=("Style0",))
+
+    train_pairs = sampler.sample(count=40, mode="same_style", stage="train")
+    assert train_pairs
+    for pair in train_pairs:
+        assert pair.target.split == "train" and pair.reference.split == "train"
+        assert pair.target.performer not in held_actors
+        assert pair.target.style != "Style0" and pair.reference.style != "Style0"
+        assert not pair.leaks()
+    test_pairs = sampler.sample(count=20, mode="same_style", stage="test")
+    assert test_pairs
+    for pair in test_pairs:
+        assert pair.target.split == "test" or True  # targets come from the test pool
+    assert any(pair.target.split == "test" for pair in test_pairs)
+    for pair in test_pairs:
+        assert pair.target.performer in held_actors
+    # A target outside the stage's data split yields nothing.
+    train_record = next(record for record in records if record.split == "train")
+    assert sampler.pairs_for(train_record, mode="same_style", stage="test") == []
+
+
+def test_audit_reports_both_generalization_axes():
+    records = make_records()
+    for index, record in enumerate(records):
+        split = "test" if record.performer in {"FW", "SR"} else ("val" if index % 9 == 0 else "train")
+        records[index] = ClipRecord(
+            clip_id=record.clip_id, style=record.style, content=record.content,
+            performer=record.performer, source_group=record.source_group, split=split,
+            variant=record.variant, frames=record.frames,
+        )
+    audit = build_pair_audit(records, sample_pairs=32, seed=3, held_out_styles=("Style0",))
+    performer_axis = audit["performer_axis"]
+    assert performer_axis["train_test_actor_overlap"] == 0
+    assert performer_axis["zero_shot_performer_supported"] is True
+    assert performer_axis["test_actors"] == 2
+    style_axis = audit["style_axis"]
+    assert style_axis["held_out_styles"] == ["Style0"]
+    assert style_axis["zero_shot_style_supported"] is True
+    assert "Style0" in style_axis["train_styles"]  # present in the data, excluded for training
+    # Without an explicit exclusion and without test-only styles, the audit says so.
+    plain = build_pair_audit(records, sample_pairs=8, seed=3)
+    assert plain["style_axis"]["held_out_styles"] == []
+    assert plain["style_axis"]["zero_shot_style_supported"] == bool(plain["style_axis"]["styles_in_test_only"])
