@@ -48,6 +48,7 @@ docs/
   seed_1h_run_report.md                       BONES-SEED 全量数据 + 1 小时训练记录
   seed_stage2_promotion.md                    performer 标签 / 物理 fine-tune / R1 表征对照
   seed_actor_holdout.md                       actor holdout 划分与 zero-shot 两条轴
+  mts_operator_stage_status.md                MTS 算子阶段（P0–P5）执行状态快照
   bones_seed_data_pipeline_plan.md          SEED 数据管线迁移方案
   bones_seed_pipeline_implementation.md     落地范围、验证情况与待办
   assets/pbr_baseline/        受版本控制的离屏渲染回归图像
@@ -152,7 +153,7 @@ python -m stylized_motion.run --mode benchmark --pipeline data \
 ```
 
 落地范围、已验证内容与待办见 [docs/bones_seed_pipeline_implementation.md](docs/bones_seed_pipeline_implementation.md)。
-全量数据构建与 1 小时 NEF-FSQ 训练的实测数字见 [docs/seed_1h_run_report.md](docs/seed_1h_run_report.md)；performer 标签、物理 fine-tune（v1 vs v1.1）与 flat/part/NEF 的 R1 局部性对照见 [docs/seed_stage2_promotion.md](docs/seed_stage2_promotion.md)；zero-shot 泛化的 actor holdout 划分（52 演员整组进 test）见 [docs/seed_actor_holdout.md](docs/seed_actor_holdout.md)。
+全量数据构建与 1 小时 NEF-FSQ 训练的实测数字见 [docs/seed_1h_run_report.md](docs/seed_1h_run_report.md)；performer 标签、物理 fine-tune（v1 vs v1.1）与 flat/part/NEF 的 R1 局部性对照见 [docs/seed_stage2_promotion.md](docs/seed_stage2_promotion.md)；zero-shot 泛化的 actor holdout 划分（52 演员整组进 test）见 [docs/seed_actor_holdout.md](docs/seed_actor_holdout.md)；MTS 算子阶段（数据→token store→transport→算子→矩阵）的完成情况、需要重做的产物与恢复命令见 [docs/mts_operator_stage_status.md](docs/mts_operator_stage_status.md)。
 
 ## Representation 训练
 
