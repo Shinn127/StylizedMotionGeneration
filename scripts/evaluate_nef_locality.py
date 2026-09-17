@@ -17,8 +17,10 @@ flat tokenizer can only be edited as a whole, and that contrast is the point.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -55,7 +57,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Decoded locality report for flat / part / NEF token edits."
     )
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        action="append",
+        required=True,
+        help="Repeat once per representation to build the R1 comparison table "
+        "(flat / part / NEF on the same windows).",
+    )
     parser.add_argument("--feature-database", type=Path, required=True)
     parser.add_argument("--split", choices=["train", "val", "test"], default="test")
     parser.add_argument("--parts", nargs="+", default=["left_arm", "right_arm", "left_leg", "right_leg"])
@@ -196,16 +205,103 @@ def evaluate_region(model, tokens, donor_tokens, *, slices, features, joints, ki
     return _aggregate(flat, support_meta)
 
 
+def evaluate_checkpoint(args: argparse.Namespace, checkpoint_path: Path, *, windows_cache) -> dict[str, Any]:
+    """Evaluates one representation on the shared window set."""
+    device = choose_device(args.device)
+    checkpoint, model = load_representation_checkpoint(checkpoint_path, device)
+    store = windows_cache["store"]
+    validate_checkpoint_store(checkpoint, model, store)
+    model = model.to(device).eval()
+    module = model.module
+    history = int(model.history_frames)
+    windows = windows_cache["windows"]
+    donors = windows_cache["donors"]
+    feature_stats = checkpoint["feature_stats"]
+    shards: dict[int, Any] = windows_cache.setdefault("shards", {})
+    target_windows, donor_windows = [], []
+    with torch.no_grad():
+        for request, donor_request in zip(windows, donors):
+            for source, sink in ((request, target_windows), (donor_request, donor_windows)):
+                window = read_probe_window(store, source, history=history, shards=shards)
+                motion = model_space_window(window, store, feature_stats).to(device)
+                sink.append(model.encode_indices(motion[None])[0, history:])
+    tokens = torch.stack(target_windows)
+    donor_tokens = torch.stack(donor_windows)
+    kinematic = KinematicContext.from_feature_stats(feature_stats, dt=args.root_dt)
+
+    regions = list(args.parts)
+    if args.include_whole_body:
+        regions.append(WHOLE_BODY)
+    parts: list[dict[str, Any]] = []
+    for region in regions:
+        slices, features, joints, scope = region_support(
+            model, store, region, full_part=args.edit == "full"
+        )
+        if not joints and region != WHOLE_BODY:
+            joints = _semantic_part_joints(model, store, region)
+        parts.append(
+            {
+                "part": region,
+                "scope": scope,
+                "edit": args.edit if region != WHOLE_BODY else "whole-token",
+                **_aggregate_region(
+                    model,
+                    tokens,
+                    donor_tokens,
+                    slices=slices,
+                    features=features,
+                    joints=joints,
+                    kinematic=kinematic,
+                    start=int(args.edit_start),
+                    stop=int(args.edit_stop),
+                ),
+            }
+        )
+        print(f"  [{model.family}] {region}: {parts[-1]['scope']}", flush=True)
+    layout = module.get_token_layout() if hasattr(module, "get_token_layout") else None
+    return {
+        "family": model.family,
+        "representation_id": model.representation_id,
+        "checkpoint": str(checkpoint_path),
+        "layout_hash": layout.layout_hash() if layout is not None else None,
+        "parts": parts,
+    }
+
+
+def comparison_table(results: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """One row per (representation, part): the numbers R1 is decided on.
+
+    Per-part metrics are aggregated over windows, so each numeric metric becomes
+    two flat columns (``<metric>_mean`` and ``<metric>_max``) — a CSV cell holding
+    a summary dict would not be usable in a table or a plot.
+    """
+    rows: list[dict[str, Any]] = []
+    for result in results:
+        for part in result["parts"]:
+            row: dict[str, Any] = {
+                "representation": result["family"],
+                "representation_id": result["representation_id"],
+                "part": part["part"],
+                "scope": part["scope"],
+                "edit": part.get("edit"),
+            }
+            for name, value in part.items():
+                if name in {"part", "scope", "edit"}:
+                    continue
+                if isinstance(value, Mapping):
+                    for statistic in ("mean", "max"):
+                        if statistic in value:
+                            row[f"{name}_{statistic}"] = value[statistic]
+                elif isinstance(value, (int, float, str, bool)) or value is None:
+                    row[name] = value
+            rows.append(row)
+    return rows
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    device = choose_device(args.device)
     store = open_any_feature_store(args.feature_database)
     try:
-        checkpoint, model = load_representation_checkpoint(args.checkpoint, device)
-        validate_checkpoint_store(checkpoint, model, store)
-        model = model.to(device).eval()
-        module = model.module
-        history = int(model.history_frames)
         windows = list(
             FixedWindowSampler(store, args.split, target_frames=64, stride=64, include_tail=True)
         )
@@ -214,69 +310,39 @@ def main(argv: list[str] | None = None) -> None:
         if len(windows) < 2:
             raise ValueError("Locality evaluation needs at least two windows for a donor pair")
         donors = windows[len(windows) // 2 :] + windows[: len(windows) // 2]
-
-        feature_stats = checkpoint["feature_stats"]
-        shards: dict[int, object] = {}
-        target_windows, donor_windows = [], []
-        with torch.no_grad():
-            for request, donor_request in zip(windows, donors):
-                for source, sink in ((request, target_windows), (donor_request, donor_windows)):
-                    window = read_probe_window(store, source, history=history, shards=shards)
-                    motion = model_space_window(window, store, feature_stats).to(device)
-                    sink.append(model.encode_indices(motion[None])[0, history:])
-        tokens = torch.stack(target_windows)
-        donor_tokens = torch.stack(donor_windows)
-
-        kinematic = KinematicContext.from_feature_stats(feature_stats, dt=args.root_dt)
-        regions = list(args.parts)
-        if args.include_whole_body:
-            regions.append(WHOLE_BODY)
-
-        parts: list[dict[str, object]] = []
-        for region in regions:
-            slices, features, joints, scope = region_support(
-                model, store, region, full_part=args.edit == "full"
-            )
-            if not joints and region != WHOLE_BODY:
-                joints = _semantic_part_joints(model, store, region)
-            parts.append(
-                {
-                    "part": region,
-                    "scope": scope,
-                    "edit": args.edit if region != WHOLE_BODY else "whole-token",
-                    **_aggregate_region(
-                        model,
-                        tokens,
-                        donor_tokens,
-                        slices=slices,
-                        features=features,
-                        joints=joints,
-                        kinematic=kinematic,
-                        start=int(args.edit_start),
-                        stop=int(args.edit_stop),
-                    ),
-                }
-            )
-            print(f"measured {region}: {parts[-1]['scope']}", flush=True)
-
+        cache = {"store": store, "windows": windows, "donors": donors}
+        results: list[dict[str, Any]] = []
+        for checkpoint_path in args.checkpoint:
+            print(f"evaluating {checkpoint_path}", flush=True)
+            results.append(evaluate_checkpoint(args, Path(checkpoint_path), windows_cache=cache))
         payload = {
             "kind": "nef_locality",
-            "checkpoint": str(args.checkpoint),
             "feature_database": str(args.feature_database),
             "split": args.split,
             "windows": len(windows),
-            "representation_family": model.family,
-            "representation_id": model.representation_id,
-            "layout_hash": module.layout.layout_hash() if hasattr(module, "get_token_layout") else None,
             "edit_interval": [int(args.edit_start), int(args.edit_stop)],
-            "parts": parts,
+            "representations": results,
+            "comparison": comparison_table(results),
+            "note": (
+                "support_fraction is the fraction of the 40 coordinates the "
+                "representation can edit for this part (flat has no region "
+                "contract, so its honest edit is the whole token); "
+                "off_target_feature_max is the decoded feature change outside that "
+                "support and non_target_joint_change_* excludes the edit's own "
+                "kinematic descendants."
+            ),
         }
-        if args.output is not None:
-            args.output.mkdir(parents=True, exist_ok=True)
-            (args.output / "locality.json").write_text(json_dumps(payload) + "\n", encoding="utf-8")
-        print(json.dumps({"family": model.family, "parts": [part["part"] for part in parts]}, indent=2))
-        if args.output is not None:
-            print(f"wrote {args.output / 'locality.json'}")
+        output = args.output or Path("outputs/nef_locality/run")
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "locality.json").write_text(json_dumps(payload) + "\n", encoding="utf-8")
+        header = list(payload["comparison"][0]) if payload["comparison"] else []
+        if header:
+            with (output / "locality.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=header)
+                writer.writeheader()
+                writer.writerows(payload["comparison"])
+        print(json.dumps({"representations": [r["family"] for r in results], "rows": len(payload["comparison"])}, indent=2))
+        print(f"wrote {output / 'locality.json'} and {output / 'locality.csv'}")
     finally:
         store.close()
 

@@ -29,6 +29,7 @@ from stylized_motion.learning.runner import (
 CONFIG_DIR = Path(__file__).parents[1] / "data" / "configs"
 BASELINE = CONFIG_DIR / "nef_fsq_40x9.yaml"
 PHYSICAL = CONFIG_DIR / "nef_fsq_40x9_physical.yaml"
+PHYSICAL_FT = CONFIG_DIR / "nef_fsq_soma_packed_40x9_physical_ft.yaml"
 
 
 def skeleton_from_spec(spec) -> tuple[list[str], list[int]]:
@@ -294,3 +295,64 @@ def test_loss_context_rejects_an_unknown_objective_variant():
     config["training"] = training
     with pytest.raises(ValueError, match="objective_variant"):
         build_loss_context(config, store, torch.device("cpu"))
+
+def test_physical_schedule_is_relative_to_the_run_start():
+    """A resumed fine-tune ramps from its own start, not from the checkpoint's epoch."""
+    config = load_experiment_config(PHYSICAL)
+    names, parents = skeleton_from_spec(GENO_SKELETON)
+    store = _StoreStub(names, parents)
+    context = build_loss_context(config, store, torch.device("cpu"))
+    model = NEFMotionAutoencoder(names, parents, stream_dim=8).eval()
+
+    def runner_with(start_epoch: int) -> RepresentationRunner:
+        runner = RepresentationRunner(
+            model,
+            family="nef_fsq",
+            train_loader=None,
+            val_loader=None,
+            test_loader=None,
+            loss_fn=build_loss_fn(model, context, config),
+            metric_suite={},
+            checkpoint_manager=None,  # type: ignore[arg-type]
+            config=config,
+            feature_schema={},
+            feature_stats={},
+            device=torch.device("cpu"),
+            epochs=100,
+            optimizer=None,
+            loss_context=context,
+        )
+        runner.start_epoch = start_epoch
+        return runner
+
+    # PHYSICAL uses warmup 10 / ramp 20.
+    fresh = runner_with(1)
+    assert fresh.apply_objective_schedule(10) == 0.0
+    assert fresh.apply_objective_schedule(20) == pytest.approx(0.5)
+    assert fresh.apply_objective_schedule(30) == 1.0
+    # Resuming at epoch 72 counts as this run's epoch 1: the ramp restarts there
+    # instead of treating epoch 73 as already past a 10+20 schedule.
+    resumed = runner_with(73)
+    assert resumed.apply_objective_schedule(73) == 0.0
+    assert resumed.apply_objective_schedule(82) == 0.0
+    assert resumed.apply_objective_schedule(83) == pytest.approx(1 / 20)
+    assert resumed.apply_objective_schedule(92) == pytest.approx(0.5)
+    assert resumed.apply_objective_schedule(102) == 1.0
+
+
+def test_reset_scheduler_flag_is_read_from_training_config():
+    config = load_experiment_config(PHYSICAL_FT)
+    assert config["training"]["reset_scheduler_on_resume"] is True
+    assert config["training"]["physical_warmup_epochs"] == 2
+    assert config["training"]["physical_ramp_epochs"] == 6
+    assert config["training"]["objective_variant"] == "recon_delta_physical_warmup"
+    assert load_experiment_config(BASELINE)["training"].get("reset_scheduler_on_resume") is None
+    # The fine-tune ramps over 2 + 6 epochs counted from the resume point.
+    ft = load_experiment_config(PHYSICAL_FT)
+    assert {
+        epoch: physical_schedule_scale(epoch, ft["training"]["physical_warmup_epochs"],
+                                       ft["training"]["physical_ramp_epochs"])
+        for epoch in (1, 2, 3, 5, 8, 9)
+    } == {1: 0.0, 2: 0.0, 3: pytest.approx(1 / 6), 5: pytest.approx(0.5), 8: 1.0, 9: 1.0}
+    # Representation identity is unchanged: the fine-tune stays a NEF-FSQ 40x9.
+    assert representation_spec(config) == representation_spec(load_experiment_config(BASELINE))

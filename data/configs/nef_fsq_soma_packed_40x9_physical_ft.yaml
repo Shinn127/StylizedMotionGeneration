@@ -1,0 +1,69 @@
+representation:
+  family: nef_fsq
+  variant: independent
+  config:
+    motion_dim: 248
+    stream_dim: 128
+    num_levels: 9
+    activation: relu
+    norm: null
+    fsq_scale: null
+    fsq_preserve_symmetry: false
+    fsq_noise_dropout: 0.0
+data:
+  fsq_window_index: data/processed/seed_soma_pruned_v4
+  required_data_schema_version: 4
+sampling:
+  strategy: clip_uniform
+  target_frames: 64
+  samples_per_epoch: 100000
+  seed: 3407
+  mirror_probability: 0.5
+  tail: drop
+  eval_limit: 2048
+  track_coverage: true
+training:
+  epochs: 150
+  steps_per_epoch: 195
+  max_steps: 28000
+  checkpoint_every_steps: 500
+  lr: 0.0005
+  weight_decay: 0.0
+  precision: fp32
+  seed: 3407
+  deterministic: false
+  grad_clip_norm: 1.0
+  output_dir: outputs/nef_fsq_soma_packed_40x9_physical_ft
+  delta_weight: 3.0
+  root_pos_weight: 0.05
+  root_rot_weight: 0.05
+  joint_weight: 0.1
+  contact_weight: 0.03
+  foot_slide_weight: 0.05
+  foot_height_weight: 0.02
+  reuse_weight: 0.0
+  base_reuse_weight: 0.0
+  latent_energy_weight: 0.0
+  base_recon_weight: 0.0
+  edit_weight: 0.0
+  edit_preserve_weight: 0.0
+  physical_warmup_epochs: 2
+  physical_ramp_epochs: 6
+  reset_scheduler_on_resume: true
+  objective_variant: recon_delta_physical_warmup
+  scheduler_epochs: 72
+  reset_best_on_resume: true
+evaluation:
+  metrics_interval: 100
+  root_dt: 0.016666666666666666
+  eval_every_steps: 0
+  full_eval_every_epochs: 10
+loader:
+  batch_size: 512
+  num_workers: 4
+  prefetch_factor: 2
+  persistent_workers: true
+  drop_last_train: true
+  max_open_shards: 16
+  prefetch_memory_limit_mb: 512
+  normalize_on: cpu

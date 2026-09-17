@@ -528,6 +528,9 @@ class RepresentationRunner:
         self.checkpoint_every_steps = int(training.get("checkpoint_every_steps", 0))
         if self.checkpoint_every_steps < 0:
             raise ValueError("training.checkpoint_every_steps must be non-negative")
+        # Read before the resume state is applied: a fine-tune drops the inherited
+        # best metric because its objective is not comparable with the old one.
+        self.reset_best_on_resume = bool(training.get("reset_best_on_resume", False))
         if resume_state:
             self._apply_resume_state(resume_state)
         evaluation = self.config.get("evaluation", {})
@@ -606,22 +609,34 @@ class RepresentationRunner:
                 self.start_epoch = max(1, checkpoint_epoch)
                 self.resume_ordinal = next_ordinal
         best_val = state.get("best_val")
-        self.best_val = None if best_val is None else float(best_val)
+        if self.reset_best_on_resume:
+            # A new phase (a fine-tune with a different objective) produces loss
+            # values that are not comparable with the inherited ones, so keeping
+            # them would silently prevent best.pt from ever being written.
+            self.best_val = None
+        else:
+            self.best_val = None if best_val is None else float(best_val)
         source = state.get("best_metric_source")
-        if isinstance(source, str) and source:
+        if isinstance(source, str) and source and not self.reset_best_on_resume:
             self.best_metric_source = source
 
     def apply_objective_schedule(self, epoch: int) -> float:
-        """Set the staged physical weight for ``epoch`` and return the scale."""
+        """Set the staged physical weight for ``epoch`` and return the scale.
+
+        The schedule is counted from **where this run starts**, not from the
+        checkpoint's absolute epoch: a physical fine-tune resumed from epoch 72
+        must still ramp its physical terms in, while an absolute count would see
+        epoch 73 and jump straight to full weight.
+        """
         if self.loss_context is None:
             return 1.0
-        scale = (
-            physical_schedule_scale(
-                epoch, self.physical_warmup_epochs, self.physical_ramp_epochs
+        if self.objective_variant != "recon_delta_physical_warmup":
+            scale = 1.0
+        else:
+            relative_epoch = int(epoch) - int(self.start_epoch) + 1
+            scale = physical_schedule_scale(
+                relative_epoch, self.physical_warmup_epochs, self.physical_ramp_epochs
             )
-            if self.objective_variant == "recon_delta_physical_warmup"
-            else 1.0
-        )
         self.loss_context["physical_scale"] = scale
         return scale
 
@@ -1311,11 +1326,28 @@ def main(argv: list[str] | None = None) -> None:
     scheduler = None
     if args.workflow_mode == "train":
         optimizer = torch.optim.AdamW(representation.parameters(), lr=float(training.get("lr", 2e-4)), weight_decay=float(training.get("weight_decay", 0.0)))
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, int(training.get("epochs", 100))))
+        # `epochs`/`max_steps` are absolute budgets (a resume continues the same
+        # run); `scheduler_epochs` is the length of *this* phase's cosine, which a
+        # fine-tune resuming at epoch 73 has to set to its own horizon.
+        scheduler_epochs = int(training.get("scheduler_epochs", training.get("epochs", 100)))
+        if scheduler_epochs <= 0:
+            raise ValueError("training.scheduler_epochs must be positive")
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, scheduler_epochs)
+        )
+        reset_scheduler = bool(training.get("reset_scheduler_on_resume", False))
         if checkpoint is not None and "optimizer" in checkpoint:
+            # Optimizer moments always carry over; the LR schedule does not when
+            # the run is a new phase (a fine-tune) rather than crash recovery.
             optimizer.load_state_dict(checkpoint["optimizer"])
-            if scheduler is not None and "scheduler" in checkpoint:
+            if scheduler is not None and "scheduler" in checkpoint and not reset_scheduler:
                 scheduler.load_state_dict(checkpoint["scheduler"])
+            if reset_scheduler and _is_main_process():
+                print(
+                    f"restarting the LR schedule at lr={float(training.get('lr', 2e-4))} "
+                    "(training.reset_scheduler_on_resume=true)",
+                    flush=True,
+                )
     writer = SummaryWriter(output / "tensorboard") if args.workflow_mode == "train" and _is_main_process() else None
     resume_state: dict[str, Any] | None = None
     if args.workflow_mode == "train" and checkpoint is not None:

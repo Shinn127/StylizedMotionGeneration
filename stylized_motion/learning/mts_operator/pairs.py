@@ -240,6 +240,17 @@ def build_pair_audit(
         )
     if not split.val_styles:
         warnings.append("No validation styles were held out; model selection has no style split.")
+    overlapping_unseen = {
+        style: performers for style, performers in performer_overlap.items() if performers
+    }
+    if overlapping_unseen:
+        warnings.append(
+            "Unseen styles share actors with training styles "
+            f"({ {style: len(names) for style, names in overlapping_unseen.items()} }), so a "
+            "style-level holdout cannot separate style from performer identity: freeze whole "
+            "actors into test at the catalogue level (seed-catalog --actor-holdout) before "
+            "claiming zero-shot style transfer."
+        )
 
     sampler = StylePairSampler(records, style_split=split, seed=seed)
     leakage = {"same_clip": 0, "same_take": 0, "pairs": 0, "verified": 0}

@@ -1,0 +1,70 @@
+# flat_fsq on BONES-SEED (schema-v4 packed SOMA store) — R1 control condition.
+#
+# Identical data, sampling, loader and budget as
+# nef_fsq_soma_packed_40x9_1h.yaml; only the representation differs, so
+# `scripts/evaluate_nef_locality.py` compares representation locality rather than
+# training recipes.  For flat there is no region contract at all — the only
+# honest flat edit is the whole token — and part-FSQ edits one group slice.
+representation:
+  family: flat_fsq
+  variant: flat
+  config:
+    motion_dim: 248
+    code_dim: 128
+    width: 512
+    num_coordinates: 40
+    num_levels: 9
+    fsq_scale: null
+    fsq_preserve_symmetry: false
+    fsq_noise_dropout: 0.0
+data:
+  fsq_window_index: data/processed/seed_soma_pruned_v4
+  required_data_schema_version: 4
+sampling:
+  strategy: clip_uniform
+  target_frames: 64
+  samples_per_epoch: 100000
+  seed: 3407
+  mirror_probability: 0.5
+  tail: drop
+  eval_limit: 2048
+  track_coverage: true
+training:
+  epochs: 80
+  steps_per_epoch: 195
+  max_steps: 14000
+  checkpoint_every_steps: 500
+  lr: 0.0005
+  weight_decay: 0.0
+  precision: fp32
+  seed: 3407
+  deterministic: false
+  grad_clip_norm: 1.0
+  output_dir: outputs/flat_fsq_soma_packed_40x9_1h
+  delta_weight: 3.0
+  root_pos_weight: 0.0
+  root_rot_weight: 0.0
+  joint_weight: 0.0
+  contact_weight: 0.0
+  foot_slide_weight: 0.0
+  foot_height_weight: 0.0
+  reuse_weight: 0.0
+  base_reuse_weight: 0.0
+  latent_energy_weight: 0.0
+  base_recon_weight: 0.0
+  edit_weight: 0.0
+  edit_preserve_weight: 0.0
+evaluation:
+  metrics_interval: 100
+  root_dt: 0.016666666666666666
+  eval_every_steps: 0
+  full_eval_every_epochs: 10
+loader:
+  batch_size: 512
+  num_workers: 4
+  prefetch_factor: 2
+  persistent_workers: true
+  drop_last_train: true
+  max_open_shards: 16
+  prefetch_memory_limit_mb: 512
+  normalize_on: cpu
