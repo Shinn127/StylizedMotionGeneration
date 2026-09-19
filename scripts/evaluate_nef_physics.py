@@ -44,13 +44,17 @@ from stylized_motion.learning.losses import (  # noqa: E402
     integrate_root_trajectory,
     reconstruct_joint_positions,
 )
+from stylized_motion.learning.mts_operator.physics_context import (  # noqa: E402
+    PHYSICAL_METRIC_VERSION,
+    PhysicsContext,
+)
 from stylized_motion.learning.nef_data import read_clip_window  # noqa: E402
 from stylized_motion.learning.nef_eval import contacts_from_toe_motion  # noqa: E402
 from stylized_motion.learning.representation import load_representation_checkpoint  # noqa: E402
 from stylized_motion.learning.runner import choose_device  # noqa: E402
 
 CSV_FIELDS = (
-    "checkpoint", "family", "windows", "frames",
+    "checkpoint", "family", "physical_metric_version", "skeleton_source", "windows", "frames",
     "fk_joint_error_mean_cm", "fk_joint_error_median_cm", "fk_joint_error_max_cm",
     "fk_worst_joint", "fk_worst_joint_error_cm",
     "root_drift_cm", "root_rotation_deg",
@@ -66,13 +70,18 @@ def evaluate(args: argparse.Namespace, checkpoint_path: Path, store: Any, window
     model = model.to(device).eval()
     module = model.module
     stats = checkpoint["feature_stats"]
-    offset = torch.as_tensor(np.asarray(stats["offset"], dtype=np.float32), device=device)
-    scale = torch.as_tensor(np.asarray(stats["scale"], dtype=np.float32), device=device)
-    ref_pos = torch.as_tensor(np.asarray(stats["ref_pos"], dtype=np.float32), device=device)
-    parents = tuple(int(value) for value in np.asarray(stats["parents"]).tolist())
-    names = [str(name) for name in np.asarray(stats["names"])]
-    toe_indices = (names.index("LeftToeBase"), names.index("RightToeBase"))
-    dt = float(args.root_dt)
+    # N01: the FK context comes from one place (bind asset, units, joint order and
+    # the mirror rule), not from the store's own ``ref_pos`` -- that value is the
+    # dataset mean of the local positions, and mirroring cancels every constant
+    # axis-aligned offset, so it collapses the spine.  Historical numbers measured
+    # against it are not comparable with these.
+    context = PhysicsContext.from_feature_stats(stats, dt=float(args.root_dt))
+    offset = torch.as_tensor(np.asarray(context.stats.offset, dtype=np.float32), device=device)
+    scale = torch.as_tensor(np.asarray(context.stats.scale, dtype=np.float32), device=device)
+    parents = context.parents
+    names = list(context.names)
+    toe_indices = context.toe_indices
+    dt = float(context.dt)
     frames = int(args.frames)
 
     joint_errors, root_errors, slides, height_errors = [], [], [], []
@@ -90,6 +99,12 @@ def evaluate(args: argparse.Namespace, checkpoint_path: Path, store: Any, window
             )[None].to(device)
             recon = model(motion, collect_metrics=False)["recon_state"]
             pair = torch.cat((recon, motion), dim=0)
+            # A mirrored clip needs the mirrored skeleton; the store's own table
+            # says which clips those are.
+            mirrored = bool(np.asarray(store.clip_mirror)[int(window.variant_idx)])
+            ref_pos = torch.as_tensor(
+                np.asarray(context.stats_for(mirror=mirrored).ref_pos, dtype=np.float32), device=device
+            )
             positions = reconstruct_joint_positions(pair, offset, scale, ref_pos, parents, dt, world_space=True)
             pred_positions, target_positions = positions[0], positions[1]
             joint_errors.append((pred_positions - target_positions).norm(dim=-1).cpu().numpy())
@@ -138,6 +153,9 @@ def evaluate(args: argparse.Namespace, checkpoint_path: Path, store: Any, window
     return {
         "checkpoint": str(checkpoint_path),
         "family": model.family,
+        "physical_metric_version": PHYSICAL_METRIC_VERSION,
+        "skeleton_source": context.skeleton_source,
+        "bind_asset_sha256": context.bind_asset_sha256,
         "windows": len(windows),
         "frames": total_frames,
         "fk_joint_error_mean_cm": float(per_joint.mean() * 100),
@@ -210,7 +228,10 @@ def main(argv: list[str] | None = None) -> None:
         "note": (
             "Metrics are computed on decoded motion, so they are independent of the "
             "training weights: the v1 baseline never computes joint/contact/foot losses "
-            "and cannot report them from its own val_full block."
+            "and cannot report them from its own val_full block.  N01: the FK context now "
+            "comes from the SOMA bind asset (see physical_metric_version and "
+            "skeleton_source in every row); results measured against the store's own "
+            "ref_pos are not comparable with these."
         ),
     }
     output = args.output or Path("outputs/nef_physics/run")

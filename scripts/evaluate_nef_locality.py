@@ -36,9 +36,11 @@ from stylized_motion.learning.nef_data import validate_checkpoint_against_store 
 from stylized_motion.learning.nef_layout import NEF_EDIT_PARTS, NEFLayout, nef_edit_streams  # noqa: E402
 from stylized_motion.learning.nef_probe import (  # noqa: E402
     KinematicContext,
+    reference_positions_for_fk,
     json_dumps,
     locality_report,
     model_space_window,
+    store_normalized_window,
     read_probe_window,
 )
 from stylized_motion.learning.part_layout import PART_NAMES  # noqa: E402
@@ -70,6 +72,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--parts", nargs="+", default=["left_arm", "right_arm", "left_leg", "right_leg"])
     parser.add_argument("--edit", choices=["strict", "full"], default="strict")
     parser.add_argument("--max-clips", type=int, default=64, help="Target windows (0 = all).")
+    parser.add_argument(
+        "--graph-radius",
+        nargs="*",
+        type=int,
+        default=[0, 1],
+        help="Support radii to report (NEF only): 0 is the region's own coordinates, "
+        "1 adds its immediate skeleton neighbours. Both are reported side by side so "
+        "an edit-strength difference cannot be read as a locality difference.",
+    )
     parser.add_argument("--edit-start", type=int, default=16)
     parser.add_argument("--edit-stop", type=int, default=48)
     parser.add_argument("--include-whole-body", action="store_true", default=True)
@@ -86,10 +97,18 @@ def _semantic_part_joints(model, store, part: str) -> list[int]:
 
 
 def region_support(
-    model, store, region: str, *, full_part: bool
+    model, store, region: str, *, full_part: bool, graph_radius: int = 0
 ) -> tuple[list[slice], list[int], list[int], str]:
-    """Coordinate slices, feature support, target joints and scope label."""
+    """Coordinate slices, feature support, target joints and scope label.
+
+    ``graph_radius`` widens the support to coordinates within that many skeleton
+    hops of the region's joints (the same expansion the MTS operator uses), so a
+    radius-0 and a radius-1 edit can be reported side by side with the *same*
+    off-support measurement.  Families without an adjacency contract report the
+    radius they cannot express instead of pretending radius 1 equals radius 0.
+    """
     module = model.module
+    graph_radius = int(graph_radius)
     if region == WHOLE_BODY:
         support = slice(0, int(module.num_coordinates))
         return [support], list(range(int(module.motion_dim))), [], f"all:{module.num_coordinates} coordinates"
@@ -97,11 +116,27 @@ def region_support(
         layout = module.layout
         streams = nef_edit_streams(region, full_part=full_part)
         feature_indices = layout.feature_indices(module.motion_dim)
+        if graph_radius <= 0:
+            return (
+                [layout.stream_slices[stream] for stream in streams],
+                torch.cat([feature_indices[stream] for stream in streams]).tolist(),
+                sorted({joint for stream in streams for joint in layout.stream_joints(stream)}),
+                "streams:" + ",".join(streams),
+            )
+        from stylized_motion.learning.mts_operator import LayoutAdapter
+
+        adapter = LayoutAdapter(layout, num_levels=int(module.num_levels))
+        mask = adapter.hard_mask([region], graph_radius=graph_radius, length=1, device="cpu")[0]
+        coordinates = [int(index) for index in mask.nonzero().flatten().tolist()]
+        if not coordinates:
+            raise ValueError(f"graph_radius={graph_radius} produced an empty support for {region!r}")
+        owner = adapter.coordinate_stream_ids(device="cpu").tolist()
+        streams = sorted({layout.coordinate_order[int(owner[index])] for index in coordinates})
         return (
             [layout.stream_slices[stream] for stream in streams],
             torch.cat([feature_indices[stream] for stream in streams]).tolist(),
             sorted({joint for stream in streams for joint in layout.stream_joints(stream)}),
-            "streams:" + ",".join(streams),
+            f"streams@{graph_radius}:" + ",".join(streams),
         )
     if model.family == PART_FSQ_FAMILY:
         if region not in PART_NAMES:
@@ -151,9 +186,32 @@ def _aggregate(parts: list[dict[str, object]], support_meta: dict[str, object]) 
     return result
 
 
-def evaluate_region(model, tokens, donor_tokens, *, slices, features, joints, kinematic, start, stop):
+def evaluate_region(
+    model,
+    tokens,
+    donor_tokens,
+    *,
+    slices,
+    features,
+    joints,
+    kinematic,
+    start,
+    stop,
+    kinematic_mirrored=None,
+    mirror_flags=None,
+):
+    """One report per window.
+
+    A window from a mirrored clip (``clip_mirror``) needs the mirrored reference
+    skeleton, or FK folds its torso and the world-space numbers are meaningless;
+    ``kinematic_mirrored`` carries that context and ``mirror_flags`` says which
+    windows need it.
+    """
     reports = []
-    for target, donor in zip(tokens, donor_tokens):
+    for index, (target, donor) in enumerate(zip(tokens, donor_tokens)):
+        context = kinematic
+        if kinematic_mirrored is not None and mirror_flags is not None and bool(mirror_flags[index]):
+            context = kinematic_mirrored
         reports.append(
             locality_report(
                 model,
@@ -164,7 +222,7 @@ def evaluate_region(model, tokens, donor_tokens, *, slices, features, joints, ki
                 stop=stop,
                 target_joints=joints,
                 feature_support=features,
-                kinematic=kinematic,
+                kinematic=context,
             )
         )
     flat: list[dict[str, object]] = []
@@ -223,45 +281,91 @@ def evaluate_checkpoint(args: argparse.Namespace, checkpoint_path: Path, *, wind
         for request, donor_request in zip(windows, donors):
             for source, sink in ((request, target_windows), (donor_request, donor_windows)):
                 window = read_probe_window(store, source, history=history, shards=shards)
-                motion = model_space_window(window, store, feature_stats).to(device)
+                motion = model_space_window(
+                    store_normalized_window(store, window), store, feature_stats
+                ).to(device)
                 sink.append(model.encode_indices(motion[None])[0, history:])
     tokens = torch.stack(target_windows)
     donor_tokens = torch.stack(donor_windows)
-    kinematic = KinematicContext.from_feature_stats(feature_stats, dt=args.root_dt)
+    # FK needs a skeleton, not the mirror-averaged ref_pos (see the helper), and a
+    # mirrored window needs the mirrored skeleton.
+    kinematic = KinematicContext.from_feature_stats(
+        feature_stats,
+        dt=args.root_dt,
+        reference_positions=reference_positions_for_fk(feature_stats),
+    )
+    kinematic_mirrored = KinematicContext.from_feature_stats(
+        feature_stats,
+        dt=args.root_dt,
+        reference_positions=reference_positions_for_fk(feature_stats, mirror=True),
+    )
+    mirror_flags = [
+        bool(getattr(store, "clip_mirror", None) is not None and store.clip_mirror[int(request.variant_idx)])
+        for request in windows
+    ]
+    print(
+        f"windows: {len(windows)} ({sum(mirror_flags)} mirrored) with "
+        f"{len(set(mirror_flags))} reference-skeleton variant(s)",
+        flush=True,
+    )
 
     regions = list(args.parts)
     if args.include_whole_body:
         regions.append(WHOLE_BODY)
     parts: list[dict[str, Any]] = []
+    radii = sorted({int(value) for value in (args.graph_radius or [0])})
     for region in regions:
-        slices, features, joints, scope = region_support(
-            model, store, region, full_part=args.edit == "full"
-        )
-        if not joints and region != WHOLE_BODY:
-            joints = _semantic_part_joints(model, store, region)
-        parts.append(
-            {
-                "part": region,
-                "scope": scope,
-                "edit": args.edit if region != WHOLE_BODY else "whole-token",
-                **_aggregate_region(
-                    model,
-                    tokens,
-                    donor_tokens,
-                    slices=slices,
-                    features=features,
-                    joints=joints,
-                    kinematic=kinematic,
-                    start=int(args.edit_start),
-                    stop=int(args.edit_stop),
-                ),
-            }
-        )
-        print(f"  [{model.family}] {region}: {parts[-1]['scope']}", flush=True)
+        for radius in radii:
+            if radius > 0 and model.family != NEF_FSQ_FAMILY and region != WHOLE_BODY:
+                # flat/part tokens have no adjacency contract: radius 1 is not a
+                # bigger support, it is a different family.  Recorded, not faked.
+                parts.append(
+                    {
+                        "part": f"{region}@r{radius}",
+                        "graph_radius": int(radius),
+                        "scope": "not_applicable",
+                        "edit": "not_applicable",
+                        "note": (
+                            f"{model.family} has no graph-adjacency contract, so a radius-"
+                            f"{radius} support is not defined; radius 0 is the whole token"
+                        ),
+                    }
+                )
+                continue
+            slices, features, joints, scope = region_support(
+                model, store, region, full_part=args.edit == "full", graph_radius=int(radius)
+            )
+            if not joints and region != WHOLE_BODY:
+                joints = _semantic_part_joints(model, store, region)
+            parts.append(
+                {
+                    "part": f"{region}@r{radius}",
+                    "graph_radius": int(radius),
+                    "scope": scope,
+                    "edit": args.edit if region != WHOLE_BODY else "whole-token",
+                    **_aggregate_region(
+                        model,
+                        tokens,
+                        donor_tokens,
+                        slices=slices,
+                        features=features,
+                        joints=joints,
+                        kinematic=kinematic,
+                        start=int(args.edit_start),
+                        stop=int(args.edit_stop),
+                        kinematic_mirrored=kinematic_mirrored,
+                        mirror_flags=mirror_flags,
+                    ),
+                }
+            )
+            print(f"  [{model.family}] {region}@{radius}: {parts[-1]['scope']}", flush=True)
     layout = module.get_token_layout() if hasattr(module, "get_token_layout") else None
     return {
         "family": model.family,
         "representation_id": model.representation_id,
+        "protocol_revision": 2,
+        "mirror_flags": [bool(value) for value in mirror_flags],
+        "graph_radii": [int(value) for value in radii],
         "checkpoint": str(checkpoint_path),
         "layout_hash": layout.layout_hash() if layout is not None else None,
         "parts": parts,
@@ -347,7 +451,20 @@ def main(argv: list[str] | None = None) -> None:
         store.close()
 
 
-def _aggregate_region(model, tokens, donor_tokens, *, slices, features, joints, kinematic, start, stop):
+def _aggregate_region(
+    model,
+    tokens,
+    donor_tokens,
+    *,
+    slices,
+    features,
+    joints,
+    kinematic,
+    start,
+    stop,
+    kinematic_mirrored=None,
+    mirror_flags=None,
+):
     return evaluate_region(
         model,
         tokens,
@@ -358,6 +475,8 @@ def _aggregate_region(model, tokens, donor_tokens, *, slices, features, joints, 
         kinematic=kinematic,
         start=start,
         stop=stop,
+        kinematic_mirrored=kinematic_mirrored,
+        mirror_flags=mirror_flags,
     )
 
 

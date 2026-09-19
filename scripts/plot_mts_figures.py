@@ -34,6 +34,34 @@ DEFAULT_PHYSICS = ("outputs/stage3_eval/physics/physics.csv", "outputs/stage3_ev
 DEFAULT_GEOMETRY = ("outputs/nef_eval_1h/nef_geometry/probe_geometry.json",)
 
 
+#: Metrics written under a different revision cannot be averaged into the same
+#: figure: the numbers changed definition, not just value.
+EXPECTED_METRICS_VERSION = 2
+
+
+def check_artifact_version(path: Path, payload: dict[str, Any]) -> str | None:
+    """Returns a refusal reason when an artifact is from another metrics revision."""
+    version = payload.get("metrics_version")
+    if version is None:
+        return (
+            f"{path}: no metrics_version field, so it predates revision "
+            f"{EXPECTED_METRICS_VERSION} and cannot be mixed with current results"
+        )
+    if int(version) != EXPECTED_METRICS_VERSION:
+        return (
+            f"{path}: metrics_version={int(version)} != {EXPECTED_METRICS_VERSION}; the metrics "
+            "changed definition, so plotting it next to current results would compare "
+            "different quantities"
+        )
+    return None
+
+
+def load_operator_artifact(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    reason = check_artifact_version(path, payload)
+    return (None, reason) if reason else (payload, None)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Render MTS paper figures and tables from artifacts.")
     parser.add_argument("--locality", type=Path, action="append", default=None)
