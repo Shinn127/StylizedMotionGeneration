@@ -315,6 +315,17 @@ def _metadata_value(manifest: Mapping[str, object], key: str, default: Any = Non
     return default
 
 
+def _clip_labels(store: Any, row: int) -> dict[str, str]:
+    """The style/action/performer labels of one store row, table first.
+
+    Imported lazily because the label conventions live with the pair sampler, and
+    the data layer must not depend on the learning package at import time.
+    """
+    from stylized_motion.learning.mts_operator.pairs import clip_label_from_tables
+
+    return clip_label_from_tables(store, row)
+
+
 def open_token_store(database: str | Path, *, max_open_shards: int = 32) -> TokenStore:
     database = Path(database)
     manifest = _read_manifest(database, "Token")
@@ -491,6 +502,10 @@ class TokenDataset(Dataset):
                 "target_frames": int(request.target_frames),
                 "variant_idx": int(request.variant_idx),
                 "range_name": self.store.range_names[int(request.variant_idx)],
+                # The clip's own style/action labels: a conditioned model needs the
+                # same labels the vocabulary was built from, and a geometry-only
+                # dict has no action to condition on at all.
+                **_clip_labels(self.store, int(request.variant_idx)),
             }
         return item
 

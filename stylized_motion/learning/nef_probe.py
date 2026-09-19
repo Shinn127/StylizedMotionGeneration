@@ -157,6 +157,37 @@ def far_perturbations(
 # kinematics context and measurement
 
 
+def reference_positions_for_fk(
+    feature_stats: Mapping[str, object], *, mirror: bool = False
+) -> np.ndarray | None:
+    """Bind-skeleton local offsets (metres) for a stats payload, or ``None``.
+
+    A store's ``ref_pos`` is the dataset mean of the local positions; the mirrored
+    clips cancel every constant axis-aligned offset, so FK on it collapses the
+    spine.  This resolves the real skeleton from the SOMA bind contract, and
+    returns ``None`` when the payload already carries a usable one (synthetic
+    fixtures) so callers can fall back to the stored values.
+    """
+    from stylized_motion.anim.features import (
+        deserialize_motion_feature_stats,
+        stats_with_reference_skeleton,
+    )
+
+    payload = dict(feature_stats)
+    if "dist" not in payload and "offset" in payload:
+        # A partial stats payload is still enough to place a skeleton; the missing
+        # dispersion is only used by the normalisation.
+        payload["dist"] = np.ones_like(np.asarray(payload["offset"], dtype=np.float32))
+    try:
+        stats, metadata = deserialize_motion_feature_stats(payload)
+    except (KeyError, ValueError, TypeError):
+        return None  # too incomplete to contain a skeleton: keep the stored value
+    corrected = stats_with_reference_skeleton(stats, metadata["names"], mirror=mirror)
+    if corrected is stats:  # the bind skeleton was unavailable; keep the stored value
+        return None
+    return np.asarray(corrected.ref_pos, dtype=np.float32)
+
+
 @dataclass(frozen=True)
 class KinematicContext:
     """Denormalisation and FK context needed to measure world-space effects."""
@@ -176,7 +207,22 @@ class KinematicContext:
         *,
         dt: float = 1.0 / 60.0,
         contact_threshold: float = 0.15,
+        reference_positions: np.ndarray | None = None,
     ) -> KinematicContext:
+        """Build the FK context, optionally with an explicit reference skeleton.
+
+        ``reference_positions`` exists because a store's ``ref_pos`` is the
+        *dataset mean* of the local positions: mirror augmentation cancels every
+        constant axis-aligned offset, so FK on the stored value collapses the
+        spine and hides joint motion.  Callers that report world-space numbers
+        pass the bind skeleton's offsets (``features.stats_with_reference_skeleton``);
+        the default keeps the stored value so synthetic fixtures are unaffected.
+        """
+        ref_values = (
+            np.asarray(feature_stats["ref_pos"], dtype=np.float32)
+            if reference_positions is None
+            else np.asarray(reference_positions, dtype=np.float32)
+        )
         return cls(
             feature_offset=torch.as_tensor(
                 np.asarray(feature_stats["offset"], dtype=np.float32)
@@ -184,7 +230,7 @@ class KinematicContext:
             feature_scale=torch.as_tensor(
                 np.asarray(feature_stats["scale"], dtype=np.float32)
             ),
-            ref_pos=torch.as_tensor(np.asarray(feature_stats["ref_pos"], dtype=np.float32)),
+            ref_pos=torch.as_tensor(ref_values),
             parents=tuple(int(value) for value in np.asarray(feature_stats["parents"]).tolist()),
             names=tuple(str(name) for name in feature_stats["names"]),
             dt=float(dt),
@@ -590,6 +636,9 @@ class LevelGeometryProbe:
             stream = self._stream_of(coordinate, metadata)
             adjacent = _mean_of_dicts(collected.get((coordinate, "adjacent"), []))
             far = _mean_of_dicts(collected.get((coordinate, "far"), []))
+            # Named so a reader cannot mistake this arm for the support-matched far
+            # move of protocol revision 2.
+            far = {"far_kind": "random_per_frame_stress", **far}
             adjacent_distance = float(adjacent.get(self.PRIMARY_METRIC, 0.0))
             far_distance = float(far.get(self.PRIMARY_METRIC, 0.0))
             ratio = adjacent_distance / far_distance if far_distance > 0.0 else float("inf")
@@ -613,6 +662,19 @@ class LevelGeometryProbe:
         finite_ratios = [value for value in ratios if np.isfinite(value)]
         consistencies = [record["direction_consistency"] for record in records]
         summary = {
+            "kind": "level_geometry",
+            "protocol_revision": 1,
+            # The legacy geometry screen compares adjacent steps against *random
+            # per-frame* far jumps.  That is a stress test, not an ordinal-geometry
+            # measurement: the far arm changes many positions by different amounts at
+            # once.  The fair comparison (same source/coordinate/time support, ±1 vs
+            # ±d) is `stratified_span_probe` in protocol revision 2, which writes its
+            # own artifact and never overwrites this one.
+            "far_perturbation": "random_per_frame_stress",
+            "ordinal_geometry_note": (
+                "adjacent_to_far_ratio is a screen over random per-frame far jumps; "
+                "use the protocol-v2 stratified probe for a support-matched comparison"
+            ),
             "coordinates": len(records),
             "num_levels": self.num_levels,
             "frames": int(frames),
@@ -670,6 +732,258 @@ class LevelGeometryProbe:
         # ordinal axis, so the negation of their cosine is the consistency.
         cosine = float(torch.dot(plus, minus) / denominator)
         return float(np.clip(-cosine, -1.0, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# protocol revision 2: signed pulses and spans with a shared legal support
+
+
+PROBE_PROTOCOL_REVISION = 2
+
+
+def signed_span_perturbations(
+    indices: torch.Tensor,
+    coordinate: int,
+    *,
+    num_levels: int = 9,
+    magnitude: int = 1,
+    sign: int = 1,
+    start: int = 0,
+    stop: int | None = None,
+) -> TokenPerturbation:
+    """One *signed* level step applied over a fixed frame span.
+
+    ``sign=+1, magnitude=1`` is the near perturbation and ``sign=+1, magnitude=d``
+    the far one; both cover the same coordinate and the same frames, so the two
+    differ only in how far the level moved.  Positions whose shift would leave
+    ``[0, num_levels)`` are flagged in ``valid`` and left at the clamped level --
+    the caller intersects the valid masks instead of comparing different supports.
+    """
+    _validate_levels(indices, num_levels, coordinate)
+    frames = int(indices.shape[1])
+    start = int(start)
+    stop = frames if stop is None else int(stop)
+    if not 0 <= start < stop <= frames:
+        raise ValueError(f"span [{start}, {stop}) is not inside [0, {frames})")
+    sign = int(sign)
+    magnitude = int(magnitude)
+    if sign not in (-1, 1):
+        raise ValueError(f"sign must be +1 or -1, got {sign}")
+    if magnitude < 1 or int(magnitude) >= int(num_levels):
+        raise ValueError(f"magnitude must be in [1, {int(num_levels) - 1}], got {magnitude}")
+    offsets = torch.zeros(
+        indices.shape[:2], dtype=torch.long, device=indices.device
+    )
+    offsets[:, start:stop] = sign * magnitude
+    return _apply_offsets(indices, coordinate, offsets, num_levels)
+
+
+def signed_pulse_perturbations(
+    indices: torch.Tensor,
+    coordinate: int,
+    *,
+    frame: int,
+    num_levels: int = 9,
+    magnitude: int = 1,
+    sign: int = 1,
+) -> TokenPerturbation:
+    """A single-frame signed step: the pulse form of :func:`signed_span_perturbations`."""
+    return signed_span_perturbations(
+        indices, coordinate, num_levels=num_levels, magnitude=magnitude, sign=sign,
+        start=int(frame), stop=int(frame) + 1,
+    )
+
+
+def shared_legal_support(*perturbations: TokenPerturbation) -> torch.Tensor:
+    """Frames where *every* perturbation was legal.
+
+    Comparing a near and a far move over different supports measures the support,
+    not the distance; this is the intersection the caller must use.
+    """
+    if not perturbations:
+        raise ValueError("shared_legal_support needs at least one perturbation")
+    support = perturbations[0].valid.clone()
+    for perturbation in perturbations[1:]:
+        if perturbation.valid.shape != support.shape:
+            raise ValueError("perturbations must share a shape")
+        support = support & perturbation.valid
+    return support
+
+
+def influence_profile(
+    model: torch.nn.Module,
+    indices: torch.Tensor,
+    perturbation: TokenPerturbation,
+    *,
+    kinematic: KinematicContext | None = None,
+    valid_mask: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    """Where one perturbation lands: feature L1 per frame, and world FK when asked.
+
+    Two tails are reported separately because they obey different contracts:
+    ``feature_*`` is the decoder's own token-to-feature influence (bounded by the
+    decoder receptive field), while ``world_*`` is the root-integrated world-space
+    motion, which integrates that influence over time and therefore has no such
+    bound.  Sharing one receptive-field ceiling between them would be a category
+    error.  ``valid_mask`` is the comparison support: statistics are computed there,
+    and everything after its last frame is the tail.
+    """
+    module = getattr(model, "module", model)
+    device = module_device(module)
+    tokens = indices.detach().to(device).long()
+    edited = perturbation.tokens.detach().to(device).long()
+    legal = perturbation.valid.detach().to(device).bool()
+    if valid_mask is not None:
+        mask = valid_mask.to(device).bool()
+        if mask.shape != legal.shape:
+            raise ValueError(
+                f"valid_mask must match the perturbation {tuple(legal.shape)}, "
+                f"got {tuple(mask.shape)}"
+            )
+        legal = legal & mask
+    with torch.no_grad():
+        baseline = module.decode_from_indices(tokens)
+        changed = module.decode_from_indices(edited)
+    per_frame = (changed - baseline).abs().mean(dim=-1)  # [B, T]
+    support = legal.any(dim=0)  # [T]
+    inside = per_frame[legal]
+    per_frame_max = per_frame.amax(dim=0)
+    changed_frames = torch.nonzero(per_frame_max > 0).flatten()
+    report: dict[str, Any] = {
+        "unit_feature_l1": "mean |decoded difference| over feature dims",
+        "feature_l1_mean": float(per_frame.mean()),
+        "feature_l1_max": float(per_frame_max.max()),
+        "feature_l1_inside_support": float(inside.mean()) if bool(legal.any()) else None,
+        "feature_first_changed_frame": int(changed_frames.min()) if changed_frames.numel() else None,
+        "feature_last_changed_frame": int(changed_frames.max()) if changed_frames.numel() else None,
+        "support_frames": int(support.sum()),
+        "world_fk_max": None,
+        "world_fk_tail_max": None,
+        "unit_world_fk": "metres",
+    }
+    if kinematic is not None:
+        if not bool(legal.any()):
+            report["world_fk_reason"] = "no legal frame to measure"
+            return report
+        context = kinematic.to(device)
+        base_positions, base_root, _ = _world_kinematics(baseline.detach(), context)
+        edited_positions, edited_root, _ = _world_kinematics(changed.detach(), context)
+        joint_distance = (edited_positions - base_positions).norm(dim=-1).amax(dim=-1)  # [B, T]
+        root_distance = (edited_root - base_root).norm(dim=-1)
+        report["world_fk_max"] = float(joint_distance[:, support].max())
+        report["world_root_max"] = float(root_distance[:, support].max())
+        # The tail is everything after the support ends: the point of reporting it
+        # separately is that the decoder's own influence has stopped there while the
+        # integrated world-space motion still carries the change.
+        after = torch.zeros_like(support)
+        last = int(torch.nonzero(support).flatten().max())
+        if last + 1 < int(support.shape[0]):
+            after[last + 1 :] = True
+        report["world_fk_tail_max"] = (
+            float(joint_distance[:, after].max()) if bool(after.any()) else None
+        )
+        report["world_root_tail_max"] = (
+            float(root_distance[:, after].max()) if bool(after.any()) else None
+        )
+        report["tail_frames"] = int(after.sum())
+    return report
+
+
+def stratified_span_probe(
+    model: torch.nn.Module,
+    indices: torch.Tensor,
+    *,
+    coordinate: int,
+    frame: int,
+    span: int = 1,
+    magnitudes: Sequence[int] = (1, 3),
+    signs: Sequence[int] = (1, -1),
+    kinematic: KinematicContext | None = None,
+    valid_mask: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    """Near/far influence over the *same* source, coordinate, time support and mask.
+
+    ``magnitudes[0]`` is the near step and the rest are the far steps; every move is
+    applied to the same window and compared only on the frames inside the span where
+    *all* of them stayed inside the level range, so a difference cannot come from a
+    different support.  ``temporal_probe_complete`` states whether the window even
+    contains the decoder's full influence tail: a 128-frame edit at frame 32 of a
+    shorter window cannot claim the effect stopped at the window end.
+    """
+    module = getattr(model, "module", model)
+    device = module_device(module)
+    tokens = indices.detach().to(device).long()
+    frames = int(tokens.shape[1])
+    frame = int(frame)
+    span = int(span)
+    if span < 1:
+        raise ValueError("span must be positive")
+    stop = min(frames, frame + span)
+    if not 0 <= frame < stop:
+        raise ValueError(f"span [{frame}, {stop}) is not inside [0, {frames})")
+    receptive_field = int(getattr(module, "receptive_field", 0) or 0)
+    tail_required = max(0, receptive_field - 1)
+    tail_available = max(0, frames - stop)
+    plan: dict[tuple[int, int], TokenPerturbation] = {}
+    for magnitude in magnitudes:
+        for sign in signs:
+            plan[(int(sign), int(magnitude))] = signed_span_perturbations(
+                tokens,
+                int(coordinate),
+                num_levels=int(getattr(module, "num_levels", 9)),
+                magnitude=int(magnitude),
+                sign=int(sign),
+                start=frame,
+                stop=stop,
+            )
+    legality = shared_legal_support(*plan.values())
+    in_span = torch.zeros_like(legality)
+    in_span[:, frame:stop] = True
+    support = legality & in_span
+    if valid_mask is not None:
+        mask = valid_mask.to(device).bool()
+        if mask.shape != support.shape:
+            raise ValueError(
+                f"valid_mask must be {tuple(support.shape)}, got {tuple(mask.shape)}"
+            )
+        support = support & mask
+    rows: list[dict[str, Any]] = []
+    for (sign, magnitude), perturbation in sorted(plan.items()):
+        profile = influence_profile(module, tokens, perturbation, kinematic=kinematic,
+                                    valid_mask=support)
+        rows.append(
+            {
+                "sign": int(sign),
+                "magnitude": int(magnitude),
+                "kind": "near" if int(magnitude) == int(magnitudes[0]) else "far",
+                "coordinate": int(coordinate),
+                "frame_range": [frame, stop],
+                **profile,
+            }
+        )
+    return {
+        "kind": "stratified_span",
+        "protocol_revision": int(PROBE_PROTOCOL_REVISION),
+        "coordinate": int(coordinate),
+        "frame_range": [frame, stop],
+        "span_frames": int(stop - frame),
+        "magnitudes": [int(value) for value in magnitudes],
+        "signs": [int(value) for value in signs],
+        "legal_frames_in_span": int(support.sum()),
+        "excluded_by_level_range": int((in_span & ~legality).sum()),
+        "outside_span_frames": int((~in_span).sum()),
+        "decoder_receptive_field": receptive_field,
+        "decoder_influence_frames": int(DECODER_INFLUENCE_FRAMES),
+        "tail_frames_available": int(tail_available),
+        "tail_frames_required": int(tail_required),
+        # A window that ends before the decoder's influence could have died out
+        # cannot support a claim about where the effect stopped.
+        "temporal_probe_complete": bool(tail_available >= tail_required),
+        "units": {"feature": "mean |decoded difference|", "world": "metres"},
+        "kinematics": kinematic is not None,
+        "seed": None,
+        "rows": rows,
+    }
 
 
 def probe_csv_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -731,6 +1045,20 @@ def kinematic_descendants(parents: Sequence[int], joints: Sequence[int]) -> set[
     return result
 
 
+def decoder_influence_frames(module: torch.nn.Module) -> int:
+    """The decoder's actual influence width: ``receptive_field - 1``.
+
+    Reading it from the module instead of hard-coding 33 keeps the probe honest
+    when the architecture changes: a decoder with a different RF would otherwise be
+    judged against someone else's contract.
+    """
+    for attribute in ("decoder_receptive_field", "receptive_field"):
+        value = getattr(module, attribute, None)
+        if value is not None and int(value) > 0:
+            return int(value) - 1
+    return int(DECODER_INFLUENCE_FRAMES)
+
+
 def temporal_influence_width(
     model: torch.nn.Module,
     indices: torch.Tensor,
@@ -741,8 +1069,8 @@ def temporal_influence_width(
 ) -> dict[str, Any]:
     """How far one edited token frame propagates through the causal decoder.
 
-    The measured width must not exceed ``decoder_receptive_field - 1``; a wider
-    span means the decoder is not the causal module the contract claims.
+    The measured width must not exceed the decoder's own ``receptive_field - 1``; a
+    wider span means the decoder is not the causal module the contract claims.
     """
     module = getattr(model, "module", model)
     layout = module.get_token_layout()
@@ -771,16 +1099,21 @@ def temporal_influence_width(
     affected = torch.nonzero(difference > 0).flatten()
     first = int(affected.min()) if affected.numel() else int(frame)
     last = int(affected.max()) if affected.numel() else int(frame)
+    influence = decoder_influence_frames(module)
     return {
         "kind": "temporal_influence",
         "stream": stream,
         "frame": int(frame),
-        "decoder_influence_frames": int(DECODER_INFLUENCE_FRAMES),
+        "decoder_receptive_field": int(getattr(module, "decoder_receptive_field", influence + 1)),
+        "decoder_influence_frames": int(influence),
         "first_changed_frame": first,
         "last_changed_frame": last,
         "frames_before": int(frame) - first,
         "frames_after": last - int(frame),
-        "within_contract": bool(last - int(frame) <= int(DECODER_INFLUENCE_FRAMES)),
+        # A window shorter than frame + influence cannot observe the whole tail, so
+        # "the effect stopped" is not a statement this measurement can make.
+        "temporal_probe_complete": bool(last + 1 <= frames and int(frame) + influence < frames),
+        "within_contract": bool(last - int(frame) <= int(influence)),
     }
 
 
@@ -981,10 +1314,17 @@ def model_space_window(
     store: Any,
     feature_stats: Mapping[str, object],
 ) -> torch.Tensor:
-    """Re-normalizes a raw store window into the checkpoint's feature space."""
+    """Re-normalizes a *store-normalized* window into the checkpoint's space."""
     from stylized_motion.learning.nef_data import model_space_window as _model_space
 
     return _model_space(window, store, feature_stats)
+
+
+def store_normalized_window(store: Any, window: np.ndarray) -> np.ndarray:
+    """Raw on-disk frames -> the store's own normalized space (see nef_data)."""
+    from stylized_motion.learning.nef_data import store_normalized_window as _normalized
+
+    return _normalized(store, window)
 
 
 def module_device(model: torch.nn.Module) -> torch.device:
@@ -1077,12 +1417,19 @@ def model_space_window(
 
 
 __all__ = [
+    "PROBE_PROTOCOL_REVISION",
+    "influence_profile",
+    "shared_legal_support",
+    "signed_pulse_perturbations",
+    "signed_span_perturbations",
+    "stratified_span_probe",
     "CSV_COLUMNS",
     "DECODER_INFLUENCE_FRAMES",
     "KinematicContext",
     "LevelGeometryProbe",
     "TokenPerturbation",
     "adjacent_perturbations",
+    "decoder_influence_frames",
     "far_perturbations",
     "is_packed_store",
     "json_dumps",
@@ -1091,6 +1438,7 @@ __all__ = [
     "module_device",
     "read_probe_window",
     "split_clip_geometry",
+    "store_normalized_window",
     "locality_report",
     "probe_csv_rows",
     "temporal_influence_width",

@@ -228,23 +228,44 @@ def build_data_loaders(
     if normalize_on not in {"cpu", "none"}:
         raise ValueError("loader.normalize_on must be 'cpu' or 'none'")
 
+    # Callers that need the clip labels of a batch (an action condition, a
+    # per-style report) turn this on; it adds a list of dicts to the batch and
+    # nothing else, so there is no second loader framework.
+    return_metadata = bool(loader_config.get("return_metadata", False))
+
     def _dataset(split: str) -> Any:
         if kind == "representation":
             if isinstance(store, PackedFeatureStore):
                 return PackedFeatureDataset(
-                    split, store, normalize_on=normalize_on, max_open_shards=max_open_shards
+                    split,
+                    store,
+                    normalize_on=normalize_on,
+                    max_open_shards=max_open_shards,
+                    return_metadata=return_metadata,
                 )
             if normalize_on == "none":
                 raise ValueError(
                     "loader.normalize_on='none' requires a packed store; v3 stores are pre-normalized"
                 )
-            return FeatureDataset(split, store, max_open_shards=max_open_shards)
+            return FeatureDataset(
+                split, store, max_open_shards=max_open_shards, return_metadata=return_metadata
+            )
         if kind == "generator":
             if isinstance(store, PackedTokenStore):
                 return PackedTokenDataset(
-                    split, store, sequence_frames=65, max_open_shards=max_open_shards
+                    split,
+                    store,
+                    sequence_frames=65,
+                    max_open_shards=max_open_shards,
+                    return_metadata=return_metadata,
                 )
-            return TokenDataset(split, store, sequence_frames=65, max_open_shards=max_open_shards)
+            return TokenDataset(
+                split,
+                store,
+                sequence_frames=65,
+                max_open_shards=max_open_shards,
+                return_metadata=return_metadata,
+            )
         assert trajectory_store is not None
         return ConditionalTokenDataset(split, store, trajectory_store, max_open_shards=max_open_shards)
 

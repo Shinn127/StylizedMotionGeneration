@@ -146,9 +146,35 @@ def model_space_window(
     store: Any,
     feature_stats: Mapping[str, object],
 ) -> torch.Tensor:
-    """Denormalizes with the store's statistics, then normalizes with the model's."""
+    """Denormalizes with the store's statistics, then normalizes with the model's.
+
+    ``window`` must already be in the store's *normalized* space; callers that
+    read a packed store get raw frames and must pass them through
+    :func:`store_normalized_window` first.
+    """
     raw = denormalize_motion_features(window, store.stats)
     return torch.from_numpy(renormalize(raw, feature_stats))
+
+
+def store_normalized_window(store: Any, window: np.ndarray) -> np.ndarray:
+    """Raw on-disk frames -> the store's own normalized space.
+
+    The two store generations differ here: a v3 row store keeps *normalized*
+    frames on disk, while a v4 packed store keeps raw frames and normalizes them
+    on demand (``normalize_on`` / ``store.normalization``).  Reading a packed
+    store as if it were a v3 store fed the tokenizer raw units -- a scale error of
+    ``1/store.scale`` -- which changed about 71% of a window's tokens.
+    """
+    values = np.asarray(window, dtype=np.float32)
+    if is_packed_store(store):
+        normalization = getattr(store, "normalization", None)
+        if normalization is None:
+            raise ValueError(
+                "A packed feature store must carry its normalization artifact to be "
+                "read in the encoder's input space"
+            )
+        return np.asarray(normalization.normalize(values), dtype=np.float32)
+    return values
 
 
 def validate_checkpoint_against_store(checkpoint: Any, model: Any, store: Any) -> None:
@@ -194,6 +220,7 @@ def module_device(model: torch.nn.Module) -> torch.device:
 __all__ = [
     "is_packed_store",
     "model_space_window",
+    "store_normalized_window",
     "module_device",
     "read_clip_window",
     "read_features",
