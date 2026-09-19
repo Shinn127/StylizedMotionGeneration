@@ -1,0 +1,109 @@
+# N05b ablation A2: one auxiliary seen-style CE term, nothing else changed.
+#
+# The round-1 setup (a fresh encoder, trained end to end with the operator) plus
+# exactly one term: a linear head on the descriptor against the reference's own
+# style id.  The plan asks whether that single term prevents the collapse the
+# round-1 arm showed, without the supervised pretraining.
+#
+# Same architecture, loss, mask, strength range and step budget as the round-1 arm;
+# the frozen transport and the content map are new.  `--seed 3408` reuses this file
+# with `--output` for the second seed: the recipe is the experiment, the seed is a
+# flag, so the two seeds cannot differ in anything but the seed.
+tokenizer:
+  checkpoint: outputs/nef_fsq_soma_packed_40x9_ah/best.pt
+  freeze: true
+transport:
+  checkpoint: outputs/mts_revision2/transport_canonical_s3407/best.pt
+  freeze: true
+  dim: 256
+  depth: 8
+  heads: 8
+  dropout: 0.1
+  graph_mode: local_relational
+  graph_depth: 2
+  temporal_mode: bidirectional
+  position_encoding: sinusoidal
+  token_embed_dim: 16
+style_encoder:
+  kind: reference
+  dim: 256
+  depth: 4
+  heads: 8
+  graph_depth: 1
+  dropout: 0.1
+  temporal_mode: bidirectional
+  position_encoding: sinusoidal
+  pooling: mean_std
+  output_dim: 256
+  # A2 starts from a fresh encoder: the ablation isolates the auxiliary CE term, so
+  # there is no pretrained checkpoint to lean on (style_encoder.checkpoint is absent).
+operator:
+  name: logit_field
+  hidden_dim: 256
+  coordinate_dim: 32
+  strength: 1.0
+data:
+  fsq_window_index: data/processed/seed_soma_pruned_v4_ah
+  required_data_schema_version: 4
+  token_store: data/processed/seed_soma_pruned_v4_ah_tokens
+  frames: 64
+  reference_frames: 64
+  dataset: seed
+  content:
+    kind: action_id
+    schema: data/configs/mts_content_schema_v1.yaml
+    strict: true
+  pairs:
+    mode: same_style
+    stage: train
+    target_sampling: style_uniform
+    held_out_styles: []
+  style_split:
+    val_fraction: 0.2
+    unseen_fraction: 0.2
+masking:
+  random_coordinate: 0.3
+  stream: 0.15
+  temporal_span: 0.1
+  spatiotemporal_block: 0.15
+  full_generation: 0.3
+  coordinate_ratio: 0.8
+  block_frames: 8
+  block_coordinates: 8
+  span_ratio: 0.25
+evaluation:
+  protocol_id: mts-operator-r2-canonical-v1
+  seed: 3407
+  validation_batches_per_kind: 4
+  validation_kinds:
+  - random_coordinate
+  - stream
+  - temporal_span
+  - spatiotemporal_block
+  - full_generation
+training:
+  epochs: 5
+  lr: 0.0002
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  precision: fp32
+  seed: 3407
+  log_every_steps: 50
+  steps_per_epoch: 200
+  max_steps: 1000
+  # A2's single change: the auxiliary seen-style cross-entropy on the descriptor.
+  aux_style_ce_weight: 0.5
+  content_weight: 0.0
+  strength_range:
+  - 0.5
+  - 1.5
+  output_dir: outputs/mts_revision2/operator_reference_auxce_s3407
+sampling:
+  strategy: clip_uniform
+  target_frames: 64
+  samples_per_epoch: 100000
+  seed: 3407
+  mirror_probability: 0.5
+loader:
+  batch_size: 16
+  num_workers: 0

@@ -1,0 +1,72 @@
+# S0 profile / shortest successful chain (see T03 in the readiness plan).
+#
+# Same architecture, mixture and data as the main transport recipe; only the
+# budget, batch size and protocol size differ, and the protocol has its own id so
+# it can never be confused with the full protocol.  20 steps is a throughput
+# measurement and a pipeline check, not a model: do not read its loss as science.
+tokenizer:
+  checkpoint: outputs/nef_fsq_soma_packed_40x9_ah/best.pt
+  freeze: true
+
+data:
+  fsq_window_index: data/processed/seed_soma_pruned_v4_ah
+  required_data_schema_version: 4
+  token_store: data/processed/seed_soma_pruned_v4_ah_tokens
+  frames: 64
+  dataset: seed
+  content:
+    kind: action_id
+
+transport:
+  dim: 256
+  token_embed_dim: 16
+  position_encoding: sinusoidal
+  depth: 8
+  heads: 8
+  dropout: 0.1
+  graph_mode: local_relational
+  graph_depth: 2
+  temporal_mode: bidirectional
+  content_dim: null
+  content_classes: null
+
+masking:
+  random_coordinate: 0.2
+  stream: 0.25
+  temporal_span: 0.2
+  spatiotemporal_block: 0.2
+  full_generation: 0.15
+  coordinate_ratio: 0.3
+  block_frames: 8
+  block_coordinates: 8
+  span_ratio: 0.25
+
+# 2 rows per kind (10 rows total): this protocol is a sanity check and its
+# "best" is never compared with the full protocol's best.
+evaluation:
+  protocol_id: mts-transport-revision2-profile-v1
+  validation_kinds: [random_coordinate, stream, temporal_span, spatiotemporal_block, full_generation]
+  validation_rows_per_kind: 2
+
+training:
+  epochs: 1
+  lr: 0.0003
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  precision: fp32
+  seed: 3407
+  log_every_steps: 1
+  steps_per_epoch: 20
+  max_steps: 20
+  output_dir: outputs/mts_revision2/transport_profile_seed3407
+
+sampling:
+  strategy: clip_uniform
+  target_frames: 64
+  samples_per_epoch: 100000
+  seed: 3407
+
+loader:
+  batch_size: 8
+  num_workers: 0
+  return_metadata: false

@@ -1,10 +1,20 @@
+# SMOKE ONLY: unconditional (content.kind=none), 2 steps.  Never claim a specified
+# action or any research number from this recipe.
 tokenizer:
-  representation: nef-fsq
   checkpoint: outputs/nef_fsq_soma_packed_40x9_ah/best.pt
   freeze: true
 transport:
-  checkpoint: outputs/mts_transport/seed_ah/best.pt
+  checkpoint: outputs/mts_revision2/mts_transport/best.pt
   freeze: true
+  dim: 256
+  depth: 8
+  heads: 8
+  dropout: 0.1
+  graph_mode: local_relational
+  graph_depth: 2
+  temporal_mode: bidirectional
+  position_encoding: sinusoidal
+  token_embed_dim: 16
 style_encoder:
   kind: reference
   dim: 256
@@ -20,47 +30,56 @@ operator:
   hidden_dim: 256
   coordinate_dim: 32
   max_rate: 2.0
+  uniformization_tolerance: 1.0e-10
+  max_terms: 256
   strength: 1.0
 data:
   fsq_window_index: data/processed/seed_soma_pruned_v4_ah
-  required_data_schema_version: 3
-  # Content conditioning: 'none' means the model is unconditional (an output
-  # claiming a specified action needs kind=action_id and a matching vocabulary).
-  content:
-    kind: none
+  required_data_schema_version: 4
   token_store: data/processed/seed_soma_pruned_v4_ah_tokens
   frames: 64
+  reference_frames: 64
+  dataset: seed
+  content:
+    kind: none
   pairs:
     mode: same_style
     stage: train
-    reference_frames: 64
-    held_out_styles: []
     target_sampling: style_uniform
+    held_out_styles: []
   style_split:
     val_fraction: 0.2
     unseen_fraction: 0.2
 masking:
-  random_coordinate: 0.1
+  random_coordinate: 0.3
   stream: 0.15
-  temporal_span: 0.2
-  spatiotemporal_block: 0.25
+  temporal_span: 0.1
+  spatiotemporal_block: 0.15
   full_generation: 0.3
-  coordinate_ratio: 0.3
-  stream_ratio: 0.3
-  span_ratio: 0.5
-  block_frames: 16
+  coordinate_ratio: 0.8
+  block_frames: 8
   block_coordinates: 8
+  span_ratio: 0.25
+evaluation:
+  protocol_id: mts-operator-revision2-smoke-v1
+  validation_batches_per_kind: 1
+  validation_kinds:
+  - random_coordinate
+  - stream
+  - temporal_span
+  - spatiotemporal_block
+  - full_generation
 training:
-  epochs: 100
+  epochs: 1
   lr: 0.0002
   weight_decay: 0.0
   grad_clip_norm: 1.0
   precision: fp32
   seed: 3407
   log_every_steps: 50
-  steps_per_epoch: null
-  max_steps: null
-  output_dir: outputs/mts_operator/style/seed_ah
+  steps_per_epoch: 2
+  max_steps: 2
+  output_dir: outputs/mts_revision2_closure/smoke_operator
   content_weight: 0.0
   strength_range:
   - 0.5
@@ -74,7 +93,3 @@ sampling:
 loader:
   batch_size: 32
   num_workers: 0
-  pin_memory: auto
-  drop_last_train: true
-  max_open_shards: 32
-  prefetch_memory_limit_mb: 512

@@ -1,0 +1,99 @@
+# N04 request manifest (canonical-content round).  Version 1.
+#
+# The round-1 manifest (mts_revision2_experiment_manifest.yaml) stays as the
+# historical record of what was run; this file is the N04 request with the exact
+# commands and budgets.  Nothing here is executed by reading it: it is a plan a
+# human can check, and the run scripts under outputs/mts_next_round_20260918/N04/
+# are what actually ran.
+manifest_version: 1
+generated_by: outputs/mts_next_round_20260918/N04_application.json
+
+identity:
+  dataset: seed
+  feature_store: data/processed/seed_soma_pruned_v4_ah
+  token_store: data/processed/seed_soma_pruned_v4_ah_tokens
+  tokenizer_checkpoint: outputs/nef_fsq_soma_packed_40x9_ah/best.pt
+  frames: 64
+  content_kind: action_id
+  content_schema: data/configs/mts_content_schema_v1.yaml
+  content_schema_strict: true
+  base_transport: outputs/mts_revision2/transport_canonical_s3407/best.pt
+  operator_validation_protocol_id: mts-operator-r2-canonical-v1
+  dev_manifest: outputs/mts_next_round_20260918/N02/benchmark_manifest.json
+
+order:
+  - transport_canonical_base
+  - operator_style_id_logit
+  - operator_constant_logit
+  - operator_style_id_logit_seed3408
+  - operator_constant_logit_seed3408
+
+arms:
+  - id: transport_canonical_base
+    config: data/configs/mts_revision2_transport_canonical.yaml
+    protocol_id: mts-transport-r2-canonical-v1
+    output_dir: outputs/mts_revision2/transport_canonical_s3407
+    budget: {epochs: 10, steps_per_epoch: 200, max_steps: 2000}
+    seed: 3407
+    requires: [tokenizer, token_store, content_schema_v1]
+    note: >
+      The only change against the round-1 pilot is the content map, so the two
+      curves are comparable as "same architecture, different labels" and nothing
+      else.  Its protocol has a new id: the rows carry canonical labels and the
+      fingerprint changes with them.
+    profile: >
+      A 20-step profile (`--max-steps 20 --epochs 1 --steps-per-epoch 20 --output
+      .../base/profile_canonical_s3407`) runs first and is gated before the pilot;
+      a profile checkpoint is never an operator upstream.
+
+  - id: operator_style_id_logit
+    config: data/configs/mts_revision2_style_id_logit_canonical.yaml
+    protocol_id: mts-operator-r2-canonical-v1
+    output_dir: outputs/mts_revision2/operator_styleid_logit_canonical_s3407
+    budget: {epochs: 5, steps_per_epoch: 200, max_steps: 1000}
+    seed: 3407
+    blocked_on: transport_canonical_base/best.pt
+
+  - id: operator_constant_logit
+    config: data/configs/mts_revision2_noref_logit_canonical.yaml
+    protocol_id: mts-operator-r2-canonical-v1
+    output_dir: outputs/mts_revision2/operator_noref_logit_canonical_s3407
+    budget: {epochs: 5, steps_per_epoch: 200, max_steps: 1000}
+    seed: 3407
+    blocked_on: transport_canonical_base/best.pt
+
+  - id: operator_style_id_logit_seed3408
+    config: data/configs/mts_revision2_style_id_logit_canonical.yaml
+    protocol_id: mts-operator-r2-canonical-v1
+    output_dir: outputs/mts_revision2/operator_styleid_logit_canonical_s3408
+    budget: {epochs: 5, steps_per_epoch: 200, max_steps: 1000}
+    seed: 3408
+    blocked_on: transport_canonical_base/best.pt
+    note: >
+      The same recipe with `--seed 3408`; the base transport is the seed-3407
+      canonical base for both seeds, so the seed axis measures operator training
+      randomness only.
+
+  - id: operator_constant_logit_seed3408
+    config: data/configs/mts_revision2_noref_logit_canonical.yaml
+    protocol_id: mts-operator-r2-canonical-v1
+    output_dir: outputs/mts_revision2/operator_noref_logit_canonical_s3408
+    budget: {epochs: 5, steps_per_epoch: 200, max_steps: 1000}
+    seed: 3408
+    blocked_on: transport_canonical_base/best.pt
+
+gates:
+  profile: >
+    the 20-step profile must run end to end with a finite loss and a written dry-run;
+    its checkpoint is evidence about throughput only.
+  pilot: >
+    the pilot must reach 2,000 optimizer steps, reproduce its own val_objective
+    through scripts/summarize_mts_operator.py within 1e-5, and keep the full-mask
+    curve visible next to the context kinds.
+  arms: >
+    row-matched style-input improvement of the style arm over the constant arm, per
+    style and per mask kind, with a take-group bootstrap interval; the N03 grid is
+    re-run on the new arms with the same eval seed.
+  stop_rule: >
+    if the style net effect disappears under the canonical map, the round stops and
+    goes back to the data definition; the budget is not extended in place.

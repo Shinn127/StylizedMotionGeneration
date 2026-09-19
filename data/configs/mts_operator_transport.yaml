@@ -13,10 +13,18 @@ data:
   required_data_schema_version: 3
   # Set to a token store to skip on-the-fly encoding:
   #   python -m stylized_motion.run --mode preprocess --pipeline token-database ...
+  # Content conditioning: 'none' means the model is unconditional (an output
+  # claiming a specified action needs kind=action_id and a matching vocabulary).
+  content:
+    kind: none
   token_store:
 
 transport:
   dim: 256
+  # Per-coordinate token embedding width E; each stream flattens its coordinates
+  # (K_stream * E) and learns its own projection, so E is an explicit knob.
+  token_embed_dim: 16
+  position_encoding: sinusoidal
   depth: 8
   heads: 8
   dropout: 0.1

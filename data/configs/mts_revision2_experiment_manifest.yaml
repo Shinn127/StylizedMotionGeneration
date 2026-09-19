@@ -1,0 +1,168 @@
+# Revision-2 experiment manifest (MTS-FSQ operator stage), version 2.
+#
+# Every arm is a *recipe file* with only that family's fields -- there is no
+# "which operator is this?" flag that turns one config into another experiment.
+# Each entry states its resolved output directory, an integer step budget and the
+# exact command; nothing contains a placeholder that a later step has to invent.
+#
+# Nothing here has been executed: the manifest is a request, not a record.
+# Training needs an explicit budget from the user; the preflights and dry runs do
+# not.
+manifest_version: 2
+generated_by: docs/mts_revision2_experiment_request_zh.md
+
+# Identity every arm shares.  The preflight re-resolves these hashes at run time
+# against the files on disk (they are not copied here, so a re-exported tokenizer
+# cannot pass by accident).
+identity:
+  dataset: seed
+  feature_store: data/processed/seed_soma_pruned_v4_ah
+  token_store: data/processed/seed_soma_pruned_v4_ah_tokens
+  tokenizer_checkpoint: outputs/nef_fsq_soma_packed_40x9_ah/best.pt
+  frames: 64
+  content_kind: action_id
+  required_data_schema_version: 4
+  base_transport: outputs/mts_revision2/transport_pilot_s3407_20260918_1753/best.pt
+  base_transport_sha256: resolved_at_run_time_by_the_preflight
+  operator_validation_protocol_id: mts-operator-r2-shared-val-v1  # same rows for every arm
+  eval_manifest: outputs/mts_revision2/eval_manifest/eval_manifest.json
+  seed: 3407                        # single-seed screening first; three seeds only after S3
+
+order:
+  - transport_profile      # S0: throughput + shortest successful chain, 20 steps
+  - transport_pilot        # S2: the base every arm inherits, 2,000 steps
+  - operator_style_id_logit
+  - operator_noref_logit   # the control for the arm above
+  - operator_style_id_ctmc # after S3 shows the style input carries signal
+  - operator_reference_logit
+
+arms:
+  - id: transport_profile
+    config: data/configs/mts_revision2_transport_profile.yaml
+    protocol_id: mts-transport-revision2-profile-v1
+    output_dir: outputs/mts_revision2/transport_profile_seed3407
+    budget: {epochs: 1, steps_per_epoch: 20, max_steps: 20}
+    requires: [tokenizer, token_store, frozen_protocol]
+    note: >
+      Its 10-row protocol is a sanity check; its loss must never be compared with
+      the pilot's 320-row protocol.  The model is a 20-step random walk, not a
+      result: no animation from it may be presented as method behaviour.
+    command: |
+      OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python scripts/train_mts_transport.py \
+        --config data/configs/mts_revision2_transport_profile.yaml \
+        --device auto
+    preflight: |
+      OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python scripts/preflight_mts_revision2.py \
+        --config data/configs/mts_revision2_transport_profile.yaml \
+        --stage transport_train \
+        --validation-protocol outputs/mts_revision2/transport_profile_seed3407/validation_protocol.json \
+        --max-windows 2 --output outputs/mts_revision2_closure/T03/preflight_transport_profile
+
+  - id: transport_pilot
+    config: data/configs/mts_revision2_transport_pilot.yaml
+    protocol_id: mts-transport-revision2-pilot-v1
+    output_dir: outputs/mts_revision2/transport_pilot_seed3407
+    budget: {epochs: 10, steps_per_epoch: 200, max_steps: 2000}
+    requires: [tokenizer, token_store, frozen_protocol]
+    note: >
+      First segment only: 2,000 steps, validated every epoch on 320 frozen rows.
+      Batch size 16 is provisional until the profile reports throughput; changing
+      it changes wall-clock cost, not the step count.  Extending to 10k/20k steps
+      needs a separate approval and must not be described as the same curve.
+    command: |
+      OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python scripts/train_mts_transport.py \
+        --config data/configs/mts_revision2_transport_pilot.yaml \
+        --device auto
+
+  - id: operator_style_id_logit
+    config: data/configs/mts_revision2_style_id_logit.yaml
+    protocol_id: mts-operator-r2-shared-val-v1
+    output_dir: outputs/mts_revision2/operator_styleid_logit_s3407
+    budget: {epochs: 5, steps_per_epoch: 200, max_steps: 1000}
+    requires: [tokenizer, token_store, base_transport, frozen_protocol]
+    blocked_on: transport_pilot/best.pt
+    command: |
+      OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python scripts/train_mts_operator.py \
+        --config data/configs/mts_revision2_style_id_logit.yaml \
+        --tokenizer-checkpoint outputs/nef_fsq_soma_packed_40x9_ah/best.pt \
+        --transport-checkpoint outputs/mts_revision2/transport_pilot_s3407_20260918_1753/best.pt \
+        --device auto
+
+  - id: operator_noref_logit
+    config: data/configs/mts_revision2_noref_logit.yaml
+    protocol_id: mts-operator-r2-shared-val-v1
+    output_dir: outputs/mts_revision2/operator_noref_logit_s3407
+    budget: {epochs: 5, steps_per_epoch: 200, max_steps: 1000}
+    requires: [tokenizer, token_store, base_transport, frozen_protocol]
+    blocked_on: transport_pilot/best.pt
+    note: >
+      The control that matters: same logit operator, same width, same budget, but
+      the style descriptor is one learned constant and the model reads no
+      reference tokens and no style id (style_encoder.kind=constant).  Report its
+      parameter count next to the style-ID arm's, and never call a real style-ID
+      arm "constant" or a shuffled reference "no reference".
+    command: |
+      OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python scripts/train_mts_operator.py \
+        --config data/configs/mts_revision2_noref_logit.yaml \
+        --tokenizer-checkpoint outputs/nef_fsq_soma_packed_40x9_ah/best.pt \
+        --transport-checkpoint outputs/mts_revision2/transport_pilot_s3407_20260918_1753/best.pt \
+        --device auto
+
+  - id: operator_style_id_ctmc
+    config: data/configs/mts_revision2_style_id_ctmc.yaml
+    protocol_id: mts-operator-r2-shared-val-v1
+    output_dir: outputs/mts_revision2/operator_styleid_ctmc_s3407
+    budget: {epochs: 5, steps_per_epoch: 200, max_steps: 1000}
+    requires: [tokenizer, token_store, base_transport, frozen_protocol]
+    blocked_on: operator_style_id_logit
+    note: >
+      Same budget, data, mask and protocol as the logit arm: the comparison is the
+      kernel, not the recipe.  Shuffled-adjacency and full-kernel variants are
+      separate recipes added after this arm shows a candidate advantage.
+
+  - id: operator_reference_logit
+    config: data/configs/mts_revision2_reference_logit.yaml
+    protocol_id: mts-operator-r2-shared-val-v1
+    output_dir: outputs/mts_revision2/operator_reference_logit_s3407
+    budget: {epochs: 5, steps_per_epoch: 200, max_steps: 1000}
+    requires: [tokenizer, token_store, base_transport, frozen_protocol]
+    blocked_on: operator_style_id_logit
+    note: >
+      The paper's main setting, run only after the style-ID sandbox shows the style
+      input carries signal; otherwise it would mix an encoder problem into the
+      kernel question.
+
+evaluation:
+  manifest: built once and reused by every arm
+  build_command: |
+    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python scripts/evaluate_mts_operator.py --build-manifest-only \
+      --token-store data/processed/seed_soma_pruned_v4_ah_tokens \
+      --split test --batches 8 --batch-size 16 --frames 64 \
+      --output outputs/mts_revision2/eval_manifest
+  evaluate_command: |
+    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python scripts/evaluate_mts_operator.py \
+      --checkpoint outputs/mts_revision2/<arm>_s3407/best.pt \
+      --tokenizer-checkpoint outputs/nef_fsq_soma_packed_40x9_ah/best.pt \
+      --token-store data/processed/seed_soma_pruned_v4_ah_tokens \
+      --eval-manifest outputs/mts_revision2/eval_manifest/eval_manifest.json \
+      --split test --batch-size 16 --strength 1.0 --steps 1 \
+      --output outputs/mts_revision2/<arm>_s3407/eval
+  protocol:
+    - one row per sample with its own mask seed; masks fixed per row
+    - source/base/styled physics reported as three separate comparisons
+    - per-sample rows carry target_token_nll_base/_styled/_delta and retrieval rank
+
+approval:
+  status: awaiting_user_budget
+  reason: >
+    GPU training (transport profile/pilot and the operator arms) needs an explicit
+    budget; nothing in this manifest runs by itself.  Preflights, dry runs and the
+    tiny CPU matrix are allowed without one.
+  measurement: |
+    Throughput is measured, not guessed: run the profile recipe (20 steps) on the
+    target device and read `history.jsonl` from its run directory -- every epoch
+    records train_seconds, val_seconds, checkpoint_seconds and total_seconds for
+    the real batch size and window length.  Multiply those by the planned step
+    count of the pilot/arms, and re-measure if the batch size changes.
+    The old "3 minutes per model" figure came from a smaller architecture and a
+    one-batch validation set, so it is not reused.

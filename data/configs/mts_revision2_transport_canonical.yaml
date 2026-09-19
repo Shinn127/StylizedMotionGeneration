@@ -1,0 +1,80 @@
+# N04: the canonical-content base transport.
+#
+# Identical to the round-1 pilot in architecture, loss, masking, batch size and
+# step budget.  The one change is the content map: data/content/schema v1 merges
+# Basic Locomotion Neutral and Basic Locomotion Styles into one canonical class,
+# which removes the label shortcut N02 measured.  A changed content map is a new
+# experiment -- the round-1 transport's condition ids must never be reused with it.
+#
+# Budget is an explicit integer: 10 epochs x 200 steps = 2,000 optimizer steps.
+# The epoch count is structure, not a promise -- `max_steps` is what the run is
+# checked against afterwards (a run that cannot reach it fails loudly).
+# Batch size 16 is the provisional choice until the S0 profile reports throughput;
+# changing it changes this budget's wall-clock cost, not the step count.
+tokenizer:
+  checkpoint: outputs/nef_fsq_soma_packed_40x9_ah/best.pt
+  freeze: true
+
+data:
+  fsq_window_index: data/processed/seed_soma_pruned_v4_ah
+  required_data_schema_version: 4
+  token_store: data/processed/seed_soma_pruned_v4_ah_tokens
+  frames: 64
+  dataset: seed
+  content:
+    kind: action_id         # every arm inherits this frozen action map
+    schema: data/configs/mts_content_schema_v1.yaml
+    strict: true            # an undeclared label stops the run instead of growing the map
+
+transport:
+  dim: 256
+  token_embed_dim: 16
+  position_encoding: sinusoidal
+  depth: 8
+  heads: 8
+  dropout: 0.1
+  graph_mode: local_relational
+  graph_depth: 2
+  temporal_mode: bidirectional
+  content_dim: null
+  content_classes: null
+
+masking:
+  random_coordinate: 0.2
+  stream: 0.25
+  temporal_span: 0.2
+  spatiotemporal_block: 0.2
+  full_generation: 0.15
+  coordinate_ratio: 0.3
+  block_frames: 8
+  block_coordinates: 8
+  span_ratio: 0.25
+
+# 64 rows per kind = 320 rows, frozen and shared by every downstream arm.
+evaluation:
+  protocol_id: mts-transport-r2-canonical-v1
+  validation_kinds: [random_coordinate, stream, temporal_span, spatiotemporal_block, full_generation]
+  validation_rows_per_kind: 64
+
+training:
+  epochs: 10
+  lr: 0.0003
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  precision: fp32
+  seed: 3407
+  log_every_steps: 50
+  steps_per_epoch: 200
+  max_steps: 2000
+  output_dir: outputs/mts_revision2/transport_canonical_s3407
+
+sampling:
+  strategy: clip_uniform
+  target_frames: 64
+  samples_per_epoch: 100000
+  seed: 3407
+
+loader:
+  batch_size: 16
+  num_workers: 0
+  return_metadata: false

@@ -1,0 +1,41 @@
+# N05b-2: the seen-style classification task for the reference encoder.
+#
+# The plan's first controlled step for the reference branch: freeze the tokenizer,
+# the store and the operator; give the encoder one simple objective on the three
+# trained styles and check afterwards whether the descriptor keeps a margin and
+# responds to a real reference swap -- accuracy alone is not the acceptance.
+tokenizer:
+  checkpoint: outputs/nef_fsq_soma_packed_40x9_ah/best.pt
+  freeze: true
+
+data:
+  token_store: data/processed/seed_soma_pruned_v4_ah_tokens
+  required_data_schema_version: 4
+  frames: 64
+  dataset: seed
+
+# The same architecture as the round-1 reference arm's encoder (bundles/heads/depth
+# all identical); nothing is widened to make the task easier.
+style_encoder:
+  dim: 256
+  depth: 4
+  heads: 8
+  dropout: 0.1
+  graph_depth: 1
+  temporal_mode: bidirectional
+  output_dim: 256
+  position_encoding: sinusoidal
+  pooling: mean_std
+
+training:
+  protocol_id: mts-reference-encoder-seen-style-v1
+  # <= 1,000 steps: the plan's first-round budget for this branch.
+  max_steps: 1000
+  batch_size: 48
+  lr: 0.0003
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  seed: 3407
+  log_every_steps: 100
+  eval_per_class: 100
+  output_dir: outputs/mts_revision2/reference_encoder_seen_style_s3407

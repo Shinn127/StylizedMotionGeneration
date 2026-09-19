@@ -1,0 +1,95 @@
+# S3 control arm: the *no-reference* logit operator.
+#
+# It is the same logit operator at the same width and budget, but its style
+# descriptor is one learned constant: the model reads no reference tokens and no
+# style id (style_encoder.kind=constant).  This -- not a shuffled or permuted
+# reference -- is the control for "the style branch does anything".  Its
+# parameter count is reported next to the arms it controls.
+tokenizer:
+  checkpoint: outputs/nef_fsq_soma_packed_40x9_ah/best.pt
+  freeze: true
+transport:
+  checkpoint: outputs/mts_revision2/transport_canonical_s3407/best.pt
+  freeze: true
+  dim: 256
+  depth: 8
+  heads: 8
+  dropout: 0.1
+  graph_mode: local_relational
+  graph_depth: 2
+  temporal_mode: bidirectional
+  position_encoding: sinusoidal
+  token_embed_dim: 16
+style_encoder:
+  kind: constant
+  output_dim: 256
+operator:
+  name: logit_field
+  hidden_dim: 256
+  coordinate_dim: 32
+  strength: 1.0
+data:
+  fsq_window_index: data/processed/seed_soma_pruned_v4_ah
+  required_data_schema_version: 4
+  token_store: data/processed/seed_soma_pruned_v4_ah_tokens
+  frames: 64
+  reference_frames: 64
+  dataset: seed
+  content:
+    kind: action_id
+    schema: data/configs/mts_content_schema_v1.yaml
+    strict: true
+  pairs:
+    mode: same_style
+    stage: train
+    target_sampling: style_uniform
+    held_out_styles: []
+  style_split:
+    val_fraction: 0.2
+    unseen_fraction: 0.2
+masking:
+  random_coordinate: 0.3
+  stream: 0.15
+  temporal_span: 0.1
+  spatiotemporal_block: 0.15
+  full_generation: 0.3
+  coordinate_ratio: 0.8
+  block_frames: 8
+  block_coordinates: 8
+  span_ratio: 0.25
+evaluation:
+  protocol_id: mts-operator-r2-canonical-v1
+  # The frozen rows belong to the experiment, not to the training seed: both seeds
+  # of one recipe score exactly these rows.
+  seed: 3407
+  validation_batches_per_kind: 4
+  validation_kinds:
+  - random_coordinate
+  - stream
+  - temporal_span
+  - spatiotemporal_block
+  - full_generation
+training:
+  epochs: 5
+  lr: 0.0002
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  precision: fp32
+  seed: 3407
+  log_every_steps: 50
+  steps_per_epoch: 200
+  max_steps: 1000
+  content_weight: 0.0
+  strength_range:
+  - 0.5
+  - 1.5
+  output_dir: outputs/mts_revision2/operator_noref_logit_canonical_s3407
+sampling:
+  strategy: clip_uniform
+  target_frames: 64
+  samples_per_epoch: 100000
+  seed: 3407
+  mirror_probability: 0.5
+loader:
+  batch_size: 16
+  num_workers: 0

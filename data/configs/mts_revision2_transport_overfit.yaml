@@ -1,0 +1,85 @@
+# E02 / S1: small-data learnability diagnostic (overfit), derived from the profile.
+#
+# Purpose: confirm the training path *can* optimise before 2,000 steps are spent.
+# It is not a benchmark, and it is not a quality claim.
+#
+# Same architecture, data, content conditioning and mask mixture as
+# `mts_revision2_transport_profile.yaml` (a config test asserts the four blocks are
+# equal).  Only the budget and the monitor are different, and the run is started
+# with `--overfit-clips 8`, which freezes eight training windows, repeats them and
+# monitors on them: this mode writes `monitor_*` numbers and `overfit_last.pt`
+# only, never a validation-best.
+#
+# Budget: 10 epochs x 20 steps = 200 optimizer steps, `max_steps` is what the run
+# is checked against.  The plan's E02.3 asks for fixed-mask monitor points at
+# steps 20/50/100/200; a 4 x 50 shape would only give 50/100/150/200, so the steps
+# per epoch are 20 and the monitor lands at 20/40/.../200 (same total budget).
+# Pass `--epochs 4 --steps-per-epoch 50` to run the literal 4 x 50 shape instead.
+tokenizer:
+  checkpoint: outputs/nef_fsq_soma_packed_40x9_ah/best.pt
+  freeze: true
+
+data:
+  fsq_window_index: data/processed/seed_soma_pruned_v4_ah
+  required_data_schema_version: 4
+  token_store: data/processed/seed_soma_pruned_v4_ah_tokens
+  frames: 64
+  dataset: seed
+  content:
+    kind: action_id
+
+transport:
+  dim: 256
+  token_embed_dim: 16
+  position_encoding: sinusoidal
+  depth: 8
+  heads: 8
+  dropout: 0.1
+  graph_mode: local_relational
+  graph_depth: 2
+  temporal_mode: bidirectional
+  content_dim: null
+  content_classes: null
+
+masking:
+  random_coordinate: 0.2
+  stream: 0.25
+  temporal_span: 0.2
+  spatiotemporal_block: 0.2
+  full_generation: 0.15
+  coordinate_ratio: 0.3
+  block_frames: 8
+  block_coordinates: 8
+  span_ratio: 0.25
+
+# The monitor protocol is named apart from the profile/pilot protocols.  In overfit
+# mode no validation set is built from it (there is no validation-best); the name
+# keeps a diagnostic run from being mistaken for a scored one, and the kinds are
+# the ones with visible context -- E02.3 does not judge full_generation.
+evaluation:
+  protocol_id: mts-transport-r2-overfit-monitor-v1
+  validation_kinds: [random_coordinate, stream, temporal_span, spatiotemporal_block]
+  validation_rows_per_kind: 2
+
+training:
+  epochs: 10
+  lr: 0.0003
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  precision: fp32
+  seed: 3407
+  log_every_steps: 10
+  steps_per_epoch: 20
+  max_steps: 200
+  output_dir: outputs/mts_revision2/transport_overfit_s3407
+
+sampling:
+  strategy: clip_uniform
+  target_frames: 64
+  samples_per_epoch: 100000
+  seed: 3407
+
+loader:
+  batch_size: 8
+  num_workers: 0
+  return_metadata: false

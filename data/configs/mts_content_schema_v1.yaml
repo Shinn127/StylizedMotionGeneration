@@ -1,0 +1,33 @@
+# N02: the first canonical content map (version 1).
+#
+# Only the two labels whose names encode the style switch are merged.  Everything
+# else keeps its raw label; an unmapped label is never folded into a known class,
+# and a label the schema was not built on is reported instead of guessed.
+content_schema:
+  version: 1
+  merge:
+    Basic Locomotion Neutral: Basic Locomotion
+    Basic Locomotion Styles: Basic Locomotion
+  declared:
+  - Advanced Locomotion
+  - Baseline
+  - Basic Locomotion Neutral
+  - Basic Locomotion Styles
+  - Communication
+  - Complex Actions
+  - Consuming
+  - Dancing
+  - Environments
+  - Gestures
+  - Household
+  - Looking and Pointing
+  - Magic
+  - Object Interaction
+  - Object Manipulation
+  - Stunts
+  - Unusual Locomotion
+  note: >-
+    v1 merges only Basic Locomotion Neutral and Basic Locomotion Styles into
+    'Basic Locomotion', because 'Styles' vs 'Neutral' told the model which side of
+    the style split a clip came from.  It does not claim the walk/run/turn mix, the
+    speed range or the contact phases inside one label are matched.

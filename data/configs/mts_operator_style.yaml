@@ -19,6 +19,7 @@ style_encoder:
   heads: 8
   graph_depth: 1
   temporal_mode: bidirectional
+  position_encoding: sinusoidal
   output_dim: 256
   num_styles:                # required for kind=style_id
 
@@ -32,12 +33,17 @@ operator:
 data:
   fsq_window_index: data/processed/100style_pruned_90/fsq_window_index
   required_data_schema_version: 3
+  # Content conditioning: 'none' means the model is unconditional (an output
+  # claiming a specified action needs kind=action_id and a matching vocabulary).
+  content:
+    kind: none
   token_store:
   frames: 64
   pairs:
     mode: same_style
     stage: train
     reference_frames: 64
+    target_sampling: style_uniform
   style_split:
     val_fraction: 0.2
     unseen_fraction: 0.2

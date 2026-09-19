@@ -13,6 +13,8 @@ transport:
   dropout: 0.1
   graph_mode: local_relational
   graph_depth: 2
+  token_embed_dim: 16
+  position_encoding: sinusoidal
   temporal_mode: bidirectional
   content_dim: null
   content_classes: null
