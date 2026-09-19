@@ -18,7 +18,11 @@ from stylized_motion.learning.mts_operator.checkpoint import (
 )
 from stylized_motion.learning.mts_operator.contract import masked_cross_entropy
 from stylized_motion.learning.mts_operator.masking import MaskGenerator
-from stylized_motion.learning.mts_operator.training import TrainerConfig, TransportTrainer
+from stylized_motion.learning.mts_operator.training import (
+    TrainerConfig,
+    TransportMetrics,
+    TransportTrainer,
+)
 from stylized_motion.learning.mts_operator.transport import MotionTransportTransformer
 from stylized_motion.learning.nef_layout import GENO_SKELETON, NEFLayout
 
@@ -127,7 +131,7 @@ def test_fit_reports_history_and_stops_at_max_steps():
         assert name in history["history"][0]
 
 
-def test_evaluate_averages_over_masks_and_handles_empty_input():
+def test_evaluate_aggregates_exactly_and_handles_empty_input():
     view = adapter()
     trainer = TransportTrainer(
         model(view), adapter=view, mask_generator=MaskGenerator({"stream": 1.0}), device="cpu"
@@ -137,8 +141,74 @@ def test_evaluate_averages_over_masks_and_handles_empty_input():
     assert metrics["supervised_tokens"] > 0
     assert 0.0 <= metrics["accuracy"] <= 1.0
     assert torch.isfinite(torch.tensor(metrics["loss"]))
+    # loss is total NLL over total supervised tokens, not a mean of batch means.
+    assert metrics["loss"] == pytest.approx(metrics["nll_sum"] / metrics["supervised_tokens"])
+    assert metrics["accuracy"] == pytest.approx(metrics["correct_tokens"] / metrics["supervised_tokens"])
+    assert metrics["batches"] == 2
+    # An empty input reports counts, never a NaN that compares false to everything.
     empty = trainer.evaluate([])
-    assert empty["supervised_tokens"] == 0 and empty["loss"] != empty["loss"]  # NaN
+    assert empty["supervised_tokens"] == 0 and empty["loss"] is None
+    assert empty["accuracy"] is None and empty["batches"] == 0
+
+
+def test_evaluate_is_invariant_to_batch_partitioning():
+    """Splitting the same tokens into different batches must not move the metric."""
+    view = adapter()
+    trainer = TransportTrainer(
+        model(view), adapter=view, mask_generator=MaskGenerator({"full_generation": 1.0}),
+        device="cpu",
+    )
+    tokens = fixed_batch(batch=6, frames=12, seed=13)
+    whole = trainer.evaluate([tokens])
+    pieces = trainer.evaluate([tokens[:1], tokens[1:4], tokens[4:]])
+    assert pieces["supervised_tokens"] == whole["supervised_tokens"]
+    assert pieces["loss"] == pytest.approx(whole["loss"], rel=1e-5)
+    assert pieces["accuracy"] == pytest.approx(whole["accuracy"], rel=1e-6)
+
+
+def test_a_low_supervision_fraction_does_not_shrink_the_reported_nll():
+    """Constant per-token NLL 2 under 5% supervision must be reported as 2, not 0.1.
+
+    The model here is an oracle that reports ``nll_sum``/``supervised_tokens``
+    directly, so the assertion is about the trainer's arithmetic alone: the
+    removed implementation multiplied a batch mean by the supervision fraction
+    and divided by the number of batches.
+    """
+    view = adapter()
+    trainer = TransportTrainer(
+        model(view), adapter=view, mask_generator=MaskGenerator({"random_coordinate": 1.0}), device="cpu"
+    )
+    fraction = 0.05
+    per_batch_tokens = 4000
+
+    class OracleModel:
+        def eval(self):
+            return self
+
+        def state_dict(self):  # pragma: no cover - not used here
+            return {}
+
+    trainer.model = OracleModel()
+
+    def fake_loss(tokens, mask, *, valid_mask=None, content_condition=None):
+        supervised = int(round(per_batch_tokens * fraction))
+        return torch.tensor(2.0 * supervised), TransportMetrics(
+            loss=2.0,
+            nll_sum=2.0 * supervised,
+            correct_tokens=supervised // 4,
+            accuracy=0.25,
+            supervised_tokens=supervised,
+            hidden_fraction=fraction,
+            kind="random_coordinate",
+        )
+
+    trainer.loss = fake_loss
+    tokens = fixed_batch(batch=1, frames=4)
+    report = trainer.evaluate([tokens, tokens, tokens])
+    assert report["supervised_tokens"] == 3 * int(round(per_batch_tokens * fraction))
+    assert report["loss"] == pytest.approx(2.0, rel=1e-9)
+    assert report["loss"] != pytest.approx(2.0 * fraction, rel=1e-2)
+    assert report["accuracy"] == pytest.approx(0.25, rel=1e-9)
 
 
 def test_full_mask_generation_produces_legal_tokens_and_respects_support():
@@ -237,9 +307,12 @@ def test_checkpoint_round_trip_binds_the_tokenizer_fingerprint(tmp_path: Path):
     def build(stored):
         return MotionTransportTransformer(view, **stored)
 
+    # No tokenizer artifact exists in this unit fixture: the SHA binding is
+    # exercised in test_mts_checkpoint.py, and a caller that has no file to bind
+    # says so explicitly instead of the loader skipping the check silently.
     checkpoint, restored = load_mts_checkpoint(
         path, kind="transport", build_model=build, token_spec=spec,
-        tokenizer_metadata=tokenizer_metadata,
+        tokenizer_metadata=tokenizer_metadata, require_tokenizer=False,
     )
     assert checkpoint_token_spec(checkpoint) == spec
     assert checkpoint["metrics"]["val_loss"] == 1.0
@@ -251,18 +324,20 @@ def test_checkpoint_round_trip_binds_the_tokenizer_fingerprint(tmp_path: Path):
             restored(tokens, visible).logits, net(tokens, visible).logits, rtol=0.0, atol=0.0
         )
     with pytest.raises(ValueError, match="Expected a 'operator' checkpoint"):
-        load_mts_checkpoint(path, kind="operator", build_model=build)
+        load_mts_checkpoint(path, kind="operator", build_model=build, require_tokenizer=False)
     with pytest.raises(ValueError, match="fingerprint mismatch"):
         load_mts_checkpoint(
             path,
             kind="transport",
             build_model=build,
             tokenizer_metadata={**tokenizer_metadata, "nef_layout_hash": "0" * 64},
+            require_tokenizer=False,
         )
     with pytest.raises(ValueError, match="token_spec"):
         load_mts_checkpoint(
             path, kind="transport", build_model=build,
             token_spec=view.token_spec(representation_id="other"),
+            require_tokenizer=False,
         )
 
 
@@ -280,7 +355,8 @@ def test_checkpoint_helpers_are_json_safe_and_reject_a_bad_schema(tmp_path: Path
     path = save_mts_checkpoint(tmp_path / "broken.pt", {**payload, "schema_version": 99})
     with pytest.raises(ValueError, match="schema_version"):
         load_mts_checkpoint(
-            path, kind="transport", build_model=lambda stored: model(view)
+            path, kind="transport", build_model=lambda stored: model(view),
+            require_tokenizer=False,
         )
     with pytest.raises(ValueError, match="kind must be one of"):
         mts_checkpoint_payload(

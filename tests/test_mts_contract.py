@@ -8,10 +8,12 @@ import torch
 from stylized_motion.learning.mts_operator import (
     MASK_KINDS,
     LayoutAdapter,
+    OperatorBatch,
     TokenSpec,
     TransportOutput,
     masked_cross_entropy,
     masked_mean,
+    masked_nll_from_probs,
     operator_metadata,
     tokenizer_fingerprint,
     validate_operator_metadata,
@@ -156,8 +158,221 @@ def test_masked_cross_entropy_ignores_padding_and_empty_supervision():
     assert float(only_middle) == pytest.approx(float(expected_middle), rel=1e-6)
     empty = masked_cross_entropy(logits, targets, coordinate_mask=torch.zeros_like(coordinate_mask))
     assert float(empty) == 0.0 and torch.isfinite(empty)
+    # An empty selection still connects to the graph, so backward stays defined.
+    grad_logits = logits.detach().clone().requires_grad_(True)
+    empty_grad = masked_cross_entropy(
+        grad_logits, targets, coordinate_mask=torch.zeros_like(coordinate_mask)
+    )
+    assert empty_grad.requires_grad
+    empty_grad.backward()
+    torch.testing.assert_close(grad_logits.grad, torch.zeros_like(grad_logits), rtol=0.0, atol=0.0)
+    # ``sum`` is the accumulation primitive: it must equal mean * count exactly.
+    selected = frame_mask.unsqueeze(-1).expand_as(targets)
+    chosen = logits[selected].reshape(-1, 9)
+    reduced = masked_cross_entropy(
+        logits, targets, valid_mask=frame_mask, coordinate_mask=coordinate_mask, reduction="sum"
+    )
+    picked = coordinate_mask[selected].reshape(-1)
+    expected_sum = torch.nn.functional.cross_entropy(
+        chosen[picked].reshape(-1, 9), targets[selected][picked].reshape(-1), reduction="sum"
+    )
+    assert float(reduced) == pytest.approx(float(expected_sum), rel=1e-6)
+    with pytest.raises(ValueError, match="reduction"):
+        masked_cross_entropy(logits, targets, reduction="none")
     with pytest.raises(ValueError, match="targets must be"):
         masked_cross_entropy(logits, targets[:, :3])
+
+
+def test_masked_nll_from_probs_scores_probabilities_not_logits():
+    """p_target = .99 must give -log(.99); the old probability-as-logits path gave 1.38."""
+    probabilities = torch.full((1, 1, 40, 9), 0.01 / 8, dtype=torch.float32)
+    probabilities[..., 0] = 0.99
+    targets = torch.zeros(1, 1, 40, dtype=torch.long)
+    assert float(probabilities[0, 0, 0].sum()) == pytest.approx(1.0, rel=1e-6)
+    nll = masked_nll_from_probs(probabilities, targets)
+    assert float(nll) == pytest.approx(0.01005033585, rel=1e-5)
+    # Pushing the same distribution through the logits CE recomputed a different
+    # quantity; that mismatch is the audit counterexample pinned down here.
+    as_logits = masked_cross_entropy(probabilities, targets)
+    assert float(as_logits) == pytest.approx(1.3803597688674927, rel=1e-5)
+    assert abs(float(as_logits) - float(nll)) > 1.0
+
+    uniform = torch.full((2, 3, 40, 9), 1.0 / 9.0)
+    uniform_targets = torch.randint(0, 9, (2, 3, 40))
+    assert float(masked_nll_from_probs(uniform, uniform_targets)) == pytest.approx(
+        float(torch.log(torch.tensor(9.0))), rel=1e-6
+    )
+
+
+def test_masked_nll_from_probs_matches_softmax_ce_in_value_and_gradient():
+    torch.manual_seed(17)
+    logits = torch.randn(2, 5, 4, 9, dtype=torch.float64, requires_grad=True)
+    targets = torch.randint(0, 9, (2, 5, 4))
+    coordinate_mask = torch.zeros(2, 5, 4, dtype=torch.bool)
+    coordinate_mask[:, :, 1::2] = True
+    valid_mask = torch.ones(2, 5, dtype=torch.bool)
+    valid_mask[1, 3:] = False
+
+    logits_ce = logits.detach().clone().requires_grad_(True)
+    ce = masked_cross_entropy(
+        logits_ce, targets, valid_mask=valid_mask, coordinate_mask=coordinate_mask
+    )
+    ce.backward()
+    logits_nll = logits.detach().clone().requires_grad_(True)
+    nll = masked_nll_from_probs(
+        torch.softmax(logits_nll, dim=-1),
+        targets,
+        valid_mask=valid_mask,
+        coordinate_mask=coordinate_mask,
+    )
+    nll.backward()
+    assert float(ce.detach()) == pytest.approx(float(nll.detach()), rel=1e-10)
+    torch.testing.assert_close(logits_ce.grad, logits_nll.grad, rtol=1e-9, atol=1e-11)
+    # A zero-probability target is clamped, not turned into +inf.
+    degenerate = torch.zeros(1, 1, 1, 9)
+    degenerate[..., 0] = 1.0
+    clamped = masked_nll_from_probs(
+        degenerate, torch.ones(1, 1, 1, dtype=torch.long), clamp_min=1e-12
+    )
+    assert float(clamped) == pytest.approx(27.6310211159, rel=1e-6)
+    assert torch.isfinite(clamped)
+
+
+def test_masked_nll_padding_and_supervision_are_filtered_before_gather():
+    torch.manual_seed(23)
+    probabilities = torch.softmax(torch.randn(2, 6, 3, 9, dtype=torch.float64), dim=-1)
+    targets = torch.randint(0, 9, (2, 6, 3))
+    # A sentinel far outside the alphabet sits at a position that is never
+    # supervised, so the gather must not see it.
+    targets[1, 4:, :] = 999
+    coordinate_mask = torch.zeros(2, 6, 3, dtype=torch.bool)
+    coordinate_mask[:, :4, 0] = True
+    valid_mask = torch.ones(2, 6, dtype=torch.bool)
+    nll = masked_nll_from_probs(
+        probabilities, targets, valid_mask=valid_mask, coordinate_mask=coordinate_mask
+    )
+    selected = coordinate_mask[:, :4, 0]
+    expected = -torch.log(probabilities[:, :4, 0, :].gather(-1, targets[:, :4, 0, None]))[selected]
+    assert float(nll) == pytest.approx(float(expected.mean()), rel=1e-10)
+    # The same check for the logits path.
+    ce = masked_cross_entropy(
+        probabilities.log(), targets, valid_mask=valid_mask, coordinate_mask=coordinate_mask
+    )
+    assert torch.isfinite(ce)
+    # Supervised targets are still range-checked.
+    bad = targets.clone()
+    bad[0, 0, 0] = 9
+    with pytest.raises(ValueError, match="targets"):
+        masked_nll_from_probs(probabilities, bad, coordinate_mask=coordinate_mask)
+
+
+def test_masked_nll_is_invariant_to_batch_partitioning_and_padding():
+    torch.manual_seed(29)
+    probabilities = torch.softmax(torch.randn(4, 5, 40, 9, dtype=torch.float64), dim=-1)
+    targets = torch.randint(0, 9, (4, 5, 40))
+    valid = torch.ones(4, 5, dtype=torch.bool)
+    valid[0, 3:] = False
+    valid[2, :2] = False
+    supervision = torch.zeros(4, 5, 40, dtype=torch.bool)
+    supervision[:, 1:4, ::3] = True
+
+    def supervised_nll(p, t, v, s):
+        value = masked_nll_from_probs(p, t, valid_mask=v, coordinate_mask=s, reduction="sum")
+        count = int((s & v.unsqueeze(-1)).sum())
+        return float(value), count
+
+    whole, whole_count = supervised_nll(probabilities, targets, valid, supervision)
+    split = 0.0
+    count = 0
+    for start, stop in ((0, 1), (1, 3), (3, 4)):
+        part, part_count = supervised_nll(
+            probabilities[start:stop], targets[start:stop], valid[start:stop], supervision[start:stop]
+        )
+        split += part
+        count += part_count
+    assert count == whole_count and whole_count > 0
+    assert split == pytest.approx(whole, rel=1e-12)
+
+    # Appending an invalid padding frame changes neither total NLL nor count.
+    padded = torch.cat(
+        [probabilities, torch.softmax(torch.randn(4, 2, 40, 9, dtype=torch.float64), dim=-1)], dim=1
+    )
+    padded_targets = torch.cat([targets, torch.randint(0, 9, (4, 2, 40))], dim=1)
+    padded_valid = torch.cat([valid, torch.zeros(4, 2, dtype=torch.bool)], dim=1)
+    padded_supervision = torch.cat([supervision, torch.ones(4, 2, 40, dtype=torch.bool)], dim=1)
+    padded_nll, padded_count = supervised_nll(
+        padded, padded_targets, padded_valid, padded_supervision
+    )
+    assert padded_count == whole_count
+    assert padded_nll == pytest.approx(whole, rel=1e-12)
+
+
+def test_operator_batch_has_one_edit_mask_definition():
+    """``hard & ~visible & valid``, anchors observed, visible_mask never implicit."""
+    spec = TokenSpec.from_layout(geno_layout(), representation_id="nef_fsq_independent_40x9")
+    tokens = torch.randint(0, 9, (2, 4, 40), generator=torch.Generator().manual_seed(2))
+    hard = torch.zeros(4, 40, dtype=torch.bool)
+    hard[1:3, :10] = True
+    visible = torch.zeros_like(tokens, dtype=torch.bool)
+    visible[:, 1:3, :6] = True
+    valid = torch.ones(2, 4, dtype=torch.bool)
+    valid[0, 3] = False
+    batch = OperatorBatch(
+        target_tokens=tokens, visible_mask=visible, hard_mask=hard, target_valid_mask=valid
+    )
+    edit = batch.effective_edit_mask(spec)
+    expected = hard.unsqueeze(0) & ~visible & valid.unsqueeze(-1)
+    assert torch.equal(edit, expected)
+    assert torch.equal(batch.supervision_mask(spec), edit)
+    # An anchor inside the region stays observed.
+    anchor = torch.zeros_like(tokens, dtype=torch.bool)
+    anchor[:, 1, :10] = True
+    anchored = OperatorBatch(
+        target_tokens=tokens,
+        visible_mask=visible,
+        hard_mask=hard,
+        target_valid_mask=valid,
+        anchor_mask=anchor,
+    )
+    anchored_edit = anchored.effective_edit_mask(spec)
+    assert not bool(anchored_edit[:, 1].any())
+    assert torch.equal(anchored_edit[:, 2], edit[:, 2])
+    # A missing visible mask is an error in the loss path...
+    with pytest.raises(ValueError, match="visible_mask"):
+        OperatorBatch(target_tokens=tokens, hard_mask=hard).effective_edit_mask(spec)
+    with pytest.raises(ValueError, match="visible_mask"):
+        OperatorBatch(target_tokens=tokens, hard_mask=hard).supervision_mask(spec)
+    # ... and means "everything outside the hard mask is evidence" in generation.
+    generated = OperatorBatch(target_tokens=tokens, hard_mask=hard).effective_edit_mask(
+        spec, require_visible=False
+    )
+    assert torch.equal(generated, hard.unsqueeze(0).expand_as(tokens))
+    full = OperatorBatch(target_tokens=tokens).effective_edit_mask(spec, require_visible=False)
+    assert torch.equal(full, torch.ones_like(tokens, dtype=torch.bool))
+    # Broadcast and shape rules are stated, not guessed.
+    with pytest.raises(ValueError, match="anchor_mask"):
+        OperatorBatch(
+            target_tokens=tokens,
+            visible_mask=visible,
+            anchor_mask=torch.zeros(1, 4, 40, dtype=torch.bool),
+        ).effective_edit_mask(spec)
+    with pytest.raises(ValueError, match="hard_mask"):
+        OperatorBatch(
+            target_tokens=tokens, visible_mask=visible, hard_mask=torch.zeros(5, 40, dtype=torch.bool)
+        ).effective_edit_mask(spec)
+    with pytest.raises(ValueError, match="target_valid_mask"):
+        OperatorBatch(
+            target_tokens=tokens,
+            visible_mask=visible,
+            target_valid_mask=torch.ones(2, 5, dtype=torch.bool),
+        ).effective_edit_mask(spec)
+    # A batch-sized hard mask is allowed and is not silently broadcast away.
+    per_sample = OperatorBatch(
+        target_tokens=tokens,
+        visible_mask=visible,
+        hard_mask=hard.unsqueeze(0).expand_as(tokens).clone(),
+    ).effective_edit_mask(spec)
+    assert torch.equal(per_sample, hard.unsqueeze(0) & ~visible)
 
 
 def test_masked_mean_has_a_zero_safe_denominator():

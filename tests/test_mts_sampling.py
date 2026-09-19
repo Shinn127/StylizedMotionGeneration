@@ -25,13 +25,7 @@ def test_inverse_cdf_selects_the_interval_the_uniform_falls_into():
     uniforms = torch.tensor([0.0, 0.24, 0.26, 0.51, 0.99])
     drawn = inverse_cdf_sample(probabilities.expand(len(uniforms), -1), uniforms)
     assert drawn.tolist() == [0, 0, 1, 2, 3]
-    # A degenerate distribution always draws its only level.
-    deterministic = one_hot_probabilities(7, 7, 7)
-    uniform = torch.tensor([0.0, 0.5, 0.999999])
-    # u = 0 lands on the first index by definition; every draw above zero picks
-    # the degenerate level.
-    assert inverse_cdf_sample(deterministic, uniform).tolist() == [0, 7, 7]
-    # A uniform draw of exactly 1.0 still lands in range.
+    # A uniform draw of exactly 1.0 is canonicalised into [0, 1) and stays in range.
     assert int(inverse_cdf_sample(probabilities, torch.tensor([1.0])).item()) == 3
     with pytest.raises(ValueError, match="num_levels"):
         inverse_cdf_sample(probabilities, torch.tensor([0.5]), num_levels=3)
@@ -39,11 +33,29 @@ def test_inverse_cdf_selects_the_interval_the_uniform_falls_into():
         inverse_cdf_sample(probabilities, torch.zeros(2, 2))
 
 
-def test_common_random_numbers_are_stable_and_per_shape():
+def test_inverse_cdf_never_selects_a_zero_mass_bin():
+    """The search is for the first level whose CDF exceeds u, not ``cdf < u``."""
+    deterministic = one_hot_probabilities(7, 7, 7, 7)
+    uniform = torch.tensor([0.0, 0.5, 0.999999, 1.0])
+    # u = 0 must not land on level 0 any more: level 0 has no mass at all.
+    assert inverse_cdf_sample(deterministic, uniform).tolist() == [7, 7, 7, 7]
+    holes = torch.tensor([[0.0, 0.5, 0.0, 0.5]])
+    draws = inverse_cdf_sample(
+        holes.expand(4, -1), torch.tensor([0.0, 0.49, 0.51, 0.9999999])
+    )
+    assert draws.tolist() == [1, 1, 3, 3]
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        inverse_cdf_sample(deterministic, torch.tensor([1.5]))
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        inverse_cdf_sample(deterministic, torch.tensor([-1e-6]))
+
+
+def test_common_random_numbers_are_stable_and_keyed_by_sample_and_step():
     crn = CommonRandomNumbers(seed=17)
     first = crn.uniforms((2, 3))
     second = crn.uniforms((2, 3))
-    assert torch.equal(first, second)  # same shape, same uniforms
+    assert torch.equal(first, second)  # same key, same uniforms
+    assert len(crn.uniforms_cache) == 1
     other = crn.uniforms((3, 2))
     assert other.shape == (3, 2) and not torch.equal(first.flatten(), other.flatten())
     values = crn.uniforms((2, 3))
@@ -53,6 +65,64 @@ def test_common_random_numbers_are_stable_and_per_shape():
     assert not torch.equal(fresh.uniforms((2, 3)), first)
     crn.clear()
     assert crn.draws == 0 and crn.uniforms_cache == {}
+
+
+def test_common_random_numbers_do_not_depend_on_call_order_or_device_object():
+    """The old cache key used ``id(device)`` and a seed from the insertion order."""
+    shape = (2, 5, 3)
+    ordered = CommonRandomNumbers(seed=23)
+    sample_one_first = ordered.uniforms(shape, sample_id=1)
+    sample_zero_second = ordered.uniforms(shape, sample_id=0)
+    reversed_order = CommonRandomNumbers(seed=23)
+    sample_zero_first = reversed_order.uniforms(shape, sample_id=0)
+    sample_one_second = reversed_order.uniforms(shape, sample_id=1)
+    assert torch.equal(sample_zero_first, sample_zero_second)
+    assert torch.equal(sample_one_first, sample_one_second)
+    assert not torch.equal(sample_zero_first, sample_one_first)
+    # Passing a device (even a freshly constructed one) must not change the values.
+    with_device = CommonRandomNumbers(seed=23)
+    assert torch.equal(
+        with_device.uniforms(shape, sample_id=0, device=torch.device("cpu")),
+        with_device.uniforms(shape, sample_id=0, device="cpu"),
+    )
+    assert len(with_device.uniforms_cache) == 1
+    # Steps are independent cells of the same sample.
+    stepped = CommonRandomNumbers(seed=23)
+    assert not torch.equal(
+        stepped.uniforms(shape, sample_id=0, step_id=0),
+        stepped.uniforms(shape, sample_id=0, step_id=1),
+    )
+
+
+def test_common_random_numbers_couple_identical_distributions_exactly():
+    probabilities = torch.full((2, 6, 40, 9), 1.0 / 9.0)
+    crn = CommonRandomNumbers(seed=12)
+    first = crn.sample(probabilities)
+    second = crn.sample(probabilities)
+    assert torch.equal(first, second)
+    assert len(crn.uniforms_cache) == 1
+    # Four samples of one condition are four distinct draws with distinct keys.
+    crn_four = CommonRandomNumbers(seed=12)
+    draws = [crn_four.sample(probabilities, sample_id=index) for index in range(4)]
+    assert len(crn_four.uniforms_cache) == 4
+    assert len({tuple(draw.flatten().tolist()) for draw in draws}) > 1
+    # ... and the same four are reproducible in a fresh instance.
+    again = CommonRandomNumbers(seed=12)
+    for index, draw in enumerate(draws):
+        assert torch.equal(again.sample(probabilities, sample_id=index), draw)
+
+
+def test_cpu_generator_with_fresh_randomness_is_reproducible_across_instances():
+    probabilities = torch.full((2, 3, 4, 9), 1.0 / 9.0)
+    first = sample_tokens(probabilities, generator=torch.Generator(device="cpu").manual_seed(5))
+    second = sample_tokens(probabilities, generator=torch.Generator(device="cpu").manual_seed(5))
+    assert torch.equal(first, second)
+    # The CRN path keys the draw by sample/step, so the pairs stay coupled.
+    crn = CommonRandomNumbers(seed=5)
+    assert torch.equal(
+        sample_tokens(probabilities, crn=crn, sample_id=2),
+        sample_tokens(probabilities, crn=crn, sample_id=2),
+    )
 
 
 def test_paired_sampling_makes_identical_distributions_agree_exactly():
@@ -153,3 +223,83 @@ def test_sampling_works_with_a_cpu_generator_on_cuda_tensors():
         "random_coordinate", 2, 8, generator=torch.Generator(device="cpu").manual_seed(1), device=torch.device("cuda")
     )
     assert batch.visible_mask.device.type == "cuda" and not bool(batch.visible_mask.all())
+
+
+def test_generation_cli_region_contract():
+    """``--no-locked-edit`` is only meaningful for a whole-body region."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).parents[1] / "scripts" / "generate_mts_operator.py"
+    spec = importlib.util.spec_from_file_location("generate_mts_operator", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    frames, coordinates = 5, 40
+    partial = torch.zeros(frames, coordinates, dtype=torch.bool)
+    partial[:2, :6] = True
+    region, visible, whole_body = module.resolve_generation_region(
+        partial, locked_edit=True, frames=frames
+    )
+    assert region.shape == (1, frames, coordinates)
+    assert not whole_body
+    assert torch.equal(region[0], partial)
+    assert torch.equal(visible[0], ~partial)
+    with pytest.raises(ValueError, match="whole_body"):
+        module.resolve_generation_region(partial, locked_edit=False, frames=frames)
+    full = torch.ones(frames, coordinates, dtype=torch.bool)
+    _, visible_full, whole_body = module.resolve_generation_region(
+        full, locked_edit=False, frames=frames
+    )
+    assert whole_body and not bool(visible_full.any())
+
+
+# ---------------------------------------------------------------------------
+# C06: monotonic filling
+
+
+def test_monotonic_fill_commits_every_position_exactly_once():
+    from stylized_motion.learning.mts_operator.sampling import monotonic_fill_steps
+
+    remaining = torch.zeros(2, 4, 5, dtype=torch.bool)
+    remaining[0, :, :3] = True
+    remaining[0, 1, 3] = True
+    remaining[1, 3, 4] = True
+    for steps in (1, 2, 3, 5, 40):
+        commits = monotonic_fill_steps(remaining, steps)
+        stacked = torch.stack(commits)
+        assert int(stacked.sum(dim=0).max()) <= 1, steps
+        assert torch.equal(stacked.any(dim=0), remaining), steps
+        # Later commits never take more than earlier ones, per sample.
+        counts = stacked.flatten(2).sum(dim=2)
+        for row in range(2):
+            per_step = counts[:, row].tolist()
+            assert all(a >= b for a, b in zip(per_step, per_step[1:])), per_step
+    with pytest.raises(ValueError, match="positive"):
+        monotonic_fill_steps(remaining, 0)
+    with pytest.raises(ValueError, match=r"\[B, T, K\]"):
+        monotonic_fill_steps(remaining[0], 2)
+
+
+def test_monotonic_fill_draws_are_shared_per_step_and_ordered():
+    from stylized_motion.learning.mts_operator.sampling import (
+        CommonRandomNumbers,
+        fill_remaining,
+    )
+
+    probabilities = torch.full((1, 3, 4, 9), 1.0 / 9.0)
+    remaining = torch.ones(1, 3, 4, dtype=torch.bool)
+    crn = CommonRandomNumbers(seed=3)
+    first, commits_first = fill_remaining(
+        probabilities, remaining, steps=3, crn=crn, sample_id=1
+    )
+    again, commits_again = fill_remaining(
+        probabilities, remaining, steps=3, crn=crn, sample_id=1
+    )
+    assert torch.equal(first, again)
+    assert all(torch.equal(a, b) for a, b in zip(commits_first, commits_again))
+    assert len(crn.uniforms_cache) == 3, "one CRN cell per step"
+    # A different sample id is a different draw.
+    other, _ = fill_remaining(probabilities, remaining, steps=3, crn=crn, sample_id=2)
+    assert not torch.equal(first, other)

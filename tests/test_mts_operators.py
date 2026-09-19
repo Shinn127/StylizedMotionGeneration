@@ -41,6 +41,7 @@ def inputs_for(
     hard_mask: torch.Tensor | None = None,
     visible_mask: torch.Tensor | None = None,
     edit_mask: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None,
     style_dim: int = 16,
     seed: int = 1,
 ) -> OperatorInputs:
@@ -52,6 +53,7 @@ def inputs_for(
         hard_mask=hard_mask,
         visible_mask=visible_mask,
         edit_mask=edit_mask,
+        valid_mask=valid_mask,
     )
 
 
@@ -154,25 +156,180 @@ def test_logit_field_strength_scales_the_deviation():
         )
 
 
-def test_arbitrary_kernel_is_a_stochastic_mixture_without_an_identity_anchor():
+def logits_to_double_probs(shape: tuple[int, ...] = (1, 3, 1)) -> torch.Tensor:
+    return torch.rand(*shape, LEVELS, dtype=torch.float64, generator=torch.Generator().manual_seed(3)).softmax(-1)
+
+
+def partial_region() -> torch.Tensor:
+    support = torch.zeros(FRAMES, COORDINATES, dtype=torch.bool)
+    support[:, :8] = True
+    return support
+
+
+def test_every_family_keeps_the_base_where_it_may_not_edit():
+    """Empty region, empty edit set or an invalid frame: bit-exact base output."""
+    logits = base_logits()
+    base_probs = logits.softmax(-1)
+    nothing = torch.zeros(FRAMES, COORDINATES, dtype=torch.bool)
+    valid = torch.ones(BATCH, FRAMES, dtype=torch.bool)
+    valid[:, 2:] = False
+    for cls in (AdditiveLogitField, ArbitraryKernelOperator, BirthDeathCTMCOperator):
+        operator = trained(cls(num_levels=LEVELS, hidden_dim=16, style_dim=16))
+        empty_region = operator(inputs_for(logits, strength=1.0, hard_mask=nothing))
+        torch.testing.assert_close(empty_region.probabilities, base_probs, rtol=0.0, atol=0.0)
+        empty_edit = operator(
+            inputs_for(
+                logits,
+                strength=1.0,
+                hard_mask=full_mask(),
+                edit_mask=torch.zeros(BATCH, FRAMES, COORDINATES, dtype=torch.bool),
+            )
+        )
+        torch.testing.assert_close(empty_edit.probabilities, base_probs, rtol=0.0, atol=0.0)
+        invalid = operator(inputs_for(logits, strength=1.0, hard_mask=full_mask(), valid_mask=valid))
+        torch.testing.assert_close(invalid.probabilities[:, 2:], base_probs[:, 2:], rtol=0.0, atol=0.0)
+        # The region survives: the loss is not a no-op everywhere in that batch.
+        assert float((invalid.probabilities[:, :2] - base_probs[:, :2]).abs().max().detach()) >= 0.0
+
+
+def test_arbitrary_kernel_has_no_identity_anchor_but_respects_its_region():
     operator = trained(ArbitraryKernelOperator(num_levels=LEVELS, hidden_dim=16, style_dim=16))
     logits = base_logits()
-    output = operator(inputs_for(logits, strength=1.0, hard_mask=full_mask()))
-    assert output.probabilities.shape == logits.shape
-    assert float(output.probabilities.sum(-1).sub(1).abs().max()) < 1e-5
-    # strength=0 makes the kernel uniform, which is the honest failure mode of an
-    # unconstrained family: no identity anchor, so the base distribution is lost.
-    zero = operator(inputs_for(logits, strength=0.0, hard_mask=full_mask()))
+    base_probs = logits.softmax(-1)
+    support = partial_region()
+    # Strength 0 means uniform *inside the region*: the honest failure mode of an
+    # unconstrained family, which is why it is the control condition.
+    zero = operator(inputs_for(logits, strength=0.0, hard_mask=support))
     uniform = torch.full_like(zero.probabilities, 1.0 / LEVELS)
-    torch.testing.assert_close(zero.probabilities, uniform, rtol=1e-5, atol=1e-6)
-    assert float((zero.probabilities - logits.softmax(-1)).abs().max()) > 1e-3
-    # Hard mask 0 means no transition at all: the identity kernel keeps the base.
-    masked = operator(inputs_for(logits, strength=1.0, hard_mask=torch.zeros(FRAMES, COORDINATES, dtype=torch.bool)))
-    uniform_masked = torch.full_like(masked.probabilities, 1.0 / LEVELS)
-    torch.testing.assert_close(masked.probabilities, uniform_masked, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(zero.probabilities[:, :, :8], uniform[:, :, :8], rtol=1e-5, atol=1e-6)
+    # ... and exactly the base outside it.
+    torch.testing.assert_close(
+        zero.probabilities[:, :, 8:], base_probs[:, :, 8:], rtol=0.0, atol=0.0
+    )
+    assert float((zero.probabilities[:, :, :8] - base_probs[:, :, :8]).abs().max()) > 1e-3
+    # An empty region is base, not uniform (the audit counterexample).
+    empty = operator(inputs_for(logits, strength=1.0, hard_mask=torch.zeros(FRAMES, COORDINATES, dtype=torch.bool)))
+    torch.testing.assert_close(empty.probabilities, base_probs, rtol=0.0, atol=0.0)
+    # An empty edit set is base too, even with a full hard mask.
+    empty_edit = operator(
+        inputs_for(
+            logits,
+            strength=1.0,
+            hard_mask=full_mask(),
+            edit_mask=torch.zeros(BATCH, FRAMES, COORDINATES, dtype=torch.bool),
+        )
+    )
+    torch.testing.assert_close(empty_edit.probabilities, base_probs, rtol=0.0, atol=0.0)
+    # Outside the region the base is untouched even when the kernel is trained.
+    styled = operator(inputs_for(logits, strength=1.0, hard_mask=support))
+    torch.testing.assert_close(
+        styled.probabilities[:, :, 8:], base_probs[:, :, 8:], rtol=0.0, atol=0.0
+    )
+    assert float((styled.probabilities[:, :, :8] - base_probs[:, :, :8]).abs().max()) > 1e-3
     # A uniform kernel maps any base onto the uniform distribution.
-    uniform_output = operator(inputs_for(torch.zeros_like(logits), strength=0.0, hard_mask=full_mask()))
-    torch.testing.assert_close(uniform_output.probabilities, uniform, rtol=1e-5, atol=1e-6)
+    uniform_output = operator(inputs_for(torch.zeros_like(logits), strength=0.0, hard_mask=support))
+    torch.testing.assert_close(
+        uniform_output.probabilities[:, :, :8], uniform[:, :, :8], rtol=1e-5, atol=1e-6
+    )
+
+
+def test_arbitrary_kernel_identity_mix_needs_strength_in_the_unit_interval():
+    operator = trained(
+        ArbitraryKernelOperator(num_levels=LEVELS, hidden_dim=16, style_dim=16, identity_mix=True)
+    )
+    logits = base_logits()
+    base_probs = logits.softmax(-1)
+    support = partial_region()
+    # lambda = 0 is the identity kernel: base inside and outside the region.
+    zero = operator(inputs_for(logits, strength=0.0, hard_mask=support))
+    torch.testing.assert_close(zero.probabilities, base_probs, rtol=1e-6, atol=1e-7)
+    # lambda = 1 applies the learned kernel unchanged inside the region and still
+    # leaves everything outside it at the base distribution.
+    full = operator(inputs_for(logits, strength=1.0, hard_mask=support))
+    torch.testing.assert_close(
+        full.probabilities[:, :, 8:], base_probs[:, :, 8:], rtol=0.0, atol=0.0
+    )
+    assert float((full.probabilities[:, :, :8] - base_probs[:, :, :8]).abs().max()) > 1e-3
+    # The mixture is exactly linear: total variation from the base grows with lambda.
+    def deviation(strength: float) -> float:
+        styled = operator(inputs_for(logits, strength=strength, hard_mask=support))
+        return float((styled.probabilities - base_probs).abs().sum(-1).mean())
+
+    deviations = [deviation(value) for value in (0.0, 0.25, 0.5, 1.0)]
+    assert deviations[0] == pytest.approx(0.0, abs=1e-8)
+    assert deviations[0] < deviations[1] < deviations[2] < deviations[3]
+    assert deviations[1] == pytest.approx(deviations[3] / 4.0, rel=1e-4)
+    assert deviations[2] == pytest.approx(deviations[3] / 2.0, rel=1e-4)
+    with pytest.raises(ValueError, match="strength"):
+        operator(inputs_for(logits, strength=1.5, hard_mask=support))
+    with pytest.raises(ValueError, match="strength"):
+        operator(inputs_for(logits, strength=torch.tensor([1.0, 1.25]), hard_mask=support))
+    with pytest.raises(ValueError, match="non-negative"):
+        operator(inputs_for(logits, strength=-0.1, hard_mask=support))
+
+
+def test_arbitrary_kernel_offdiagonal_mass_is_a_true_offdiagonal_sum():
+    operator = trained(ArbitraryKernelOperator(num_levels=LEVELS, hidden_dim=16, style_dim=16))
+    logits = base_logits()
+    inputs = inputs_for(logits, strength=1.0, hard_mask=full_mask())
+    with torch.no_grad():
+        output = operator(inputs)
+        kernel_logits = operator.kernel_head(operator.condition(inputs)).reshape(
+            BATCH, FRAMES, COORDINATES, LEVELS, LEVELS
+        )
+        kernel = kernel_logits.softmax(dim=-1)
+        diagonal = torch.diag_embed(kernel.diagonal(dim1=-2, dim2=-1))
+        expected = (kernel - diagonal).sum(dim=(-1, -2)).mean()
+    assert float(output.diagnostics["kernel_offdiagonal_mass"]) == pytest.approx(
+        float(expected), rel=1e-5
+    )
+    # An identity kernel puts nothing off-diagonal; a uniform kernel puts
+    # levels - 1 (i.e. every entry except one per row) there.
+    identity_kernel = torch.eye(LEVELS).expand(BATCH, FRAMES, COORDINATES, LEVELS, LEVELS)
+    uniform_kernel = torch.full_like(identity_kernel, 1.0 / LEVELS)
+    assert float(operator._offdiagonal_mass(identity_kernel).mean()) == pytest.approx(0.0)
+    assert float(operator._offdiagonal_mass(uniform_kernel).mean()) == pytest.approx(
+        float(LEVELS) - 1.0, rel=1e-6
+    )
+    with torch.no_grad():
+        uniform_output = operator(
+            inputs_for(logits, strength=0.0, hard_mask=full_mask())
+        )
+    assert float(uniform_output.diagnostics["kernel_offdiagonal_ratio"]) == pytest.approx(
+        1.0 - 1.0 / LEVELS, rel=1e-5
+    )
+
+
+def test_level_order_is_a_chain_in_level_space_via_the_inverse_permutation():
+    order = [2, 0, 3, 1, 4, 6, 5, 8, 7]
+    operator = BirthDeathCTMCOperator(
+        num_levels=LEVELS, hidden_dim=16, style_dim=16, level_order=order
+    )
+    up = torch.arange(1.0, LEVELS + 1.0).view(1, 1, 1, LEVELS).expand(1, 1, 1, LEVELS)
+    down = torch.full((1, 1, 1, LEVELS), 0.25)
+    generator = operator._level_generator(up.clone(), down.clone())
+    # Edge order[i] -> order[i + 1] carries up_rate[i]; the reverse carries down.
+    for index in range(LEVELS - 1):
+        assert float(generator[0, 0, 0, order[index], order[index + 1]]) == pytest.approx(float(up[0, 0, 0, index]))
+        assert float(generator[0, 0, 0, order[index + 1], order[index]]) == pytest.approx(float(down[0, 0, 0, index + 1]))
+    # Only those edges exist: the level-space graph is the permuted chain.
+    allowed = {(order[i], order[i + 1]) for i in range(LEVELS - 1)} | {
+        (order[i + 1], order[i]) for i in range(LEVELS - 1)
+    }
+    for a in range(LEVELS):
+        for b in range(LEVELS):
+            if a != b and (a, b) not in allowed:
+                assert float(generator[0, 0, 0, a, b]) == 0.0
+    assert float(generator.sum(dim=-1).abs().max()) < 1e-6
+    # The permuted chain is still identity-clean at lambda = 0 and matches exp(Q).
+    logits = base_logits()
+    inputs = inputs_for(logits, strength=1.0, hard_mask=full_mask())
+    zero = operator(inputs_for(logits, strength=0.0, hard_mask=full_mask()))
+    torch.testing.assert_close(zero.probabilities, logits.softmax(-1), rtol=0.0, atol=0.0)
+    with torch.no_grad():
+        torch.testing.assert_close(
+            operator(inputs).probabilities, operator.reference_expm(inputs), rtol=1e-4, atol=1e-5
+        )
 
 
 def test_birth_death_generator_has_adjacent_rates_only():
@@ -274,6 +431,11 @@ def test_birth_death_operator_identity_support_and_reference_agreement():
 def test_operator_output_rejects_invalid_distributions():
     with pytest.raises(ValueError, match="negative"):
         OperatorOutput(probabilities=torch.full((1, 1, 2, 3), -0.1))
+    # NaN fails every comparison, so it needs its own finiteness check.
+    with pytest.raises(ValueError, match="finite"):
+        OperatorOutput(probabilities=torch.full((1, 1, 2, 3), float("nan")))
+    with pytest.raises(ValueError, match="finite"):
+        OperatorOutput(probabilities=torch.full((1, 1, 2, 3), float("inf")))
     with pytest.raises(ValueError, match="sum to one"):
         OperatorOutput(probabilities=torch.full((1, 1, 2, 3), 0.5))
     logits = base_logits()
@@ -334,6 +496,118 @@ def test_operators_can_use_stream_hidden_context_and_accept_valid_masks():
         AdditiveLogitField(style_dim=8)(
             OperatorInputs(base_logits=logits, style_embedding=torch.zeros(BATCH, 8), stream_hidden=hidden)
         )
+
+def test_ctmc_matches_matrix_exp_in_value_and_gradient():
+    """``p @ exp(Q)`` in float64: the oracle the uniformization must reproduce."""
+    torch.manual_seed(21)
+    up = torch.rand(1, 3, 1, LEVELS, dtype=torch.float64, generator=torch.Generator().manual_seed(21)) * 2.0
+    down = torch.rand(1, 3, 1, LEVELS, dtype=torch.float64, generator=torch.Generator().manual_seed(22)) * 2.0
+    up[..., -1] = 0.0
+    down[..., 0] = 0.0
+    # One element has no rate at all: an absorbing row must stay exactly put.
+    up[0, 1, 0, :] = 0.0
+    down[0, 1, 0, :] = 0.0
+    generator = birth_death_generator(up, down)
+    base = logits_to_double_probs()
+
+    applied, diagnostics = uniformization_expm_apply(generator, base.detach().clone())
+    reference = (base.detach().unsqueeze(-2) @ torch.matrix_exp(generator)).squeeze(-2)
+    torch.testing.assert_close(applied, reference, rtol=1e-9, atol=1e-12)
+    torch.testing.assert_close(applied[0, 1, 0], base.detach()[0, 1, 0], rtol=0.0, atol=0.0)
+    assert float(diagnostics["mass_error"]) <= float(diagnostics["mass_tolerance"])
+    assert float(diagnostics["poisson_tail"]) <= 1e-10
+
+    # Gradients with respect to the *rates*, which is the direction the operator
+    # actually trains in.  Perturbing a raw generator entry breaks the row-sum
+    # zero property and leaves the truncated series with cancelling terms of order
+    # 1e-1 whose truncation error dominates the derivative; the rate directions
+    # keep Q a generator.  The cotangent is random because the sum of a
+    # mass-conserving map is constant in Q.
+    torch.manual_seed(31)
+    base_p = logits_to_double_probs()
+    cotangent = torch.randn(
+        1, 3, 1, LEVELS, dtype=torch.float64, generator=torch.Generator().manual_seed(31)
+    )
+    rate_up = up.detach().clone().requires_grad_(True)
+    rate_down = down.detach().clone().requires_grad_(True)
+    rate_generator = birth_death_generator(rate_up, rate_down)
+    (uniformization_expm_apply(rate_generator, base_p.detach().clone())[0] * cotangent).sum().backward()
+    oracle_up = up.detach().clone().requires_grad_(True)
+    oracle_down = down.detach().clone().requires_grad_(True)
+    oracle_generator = birth_death_generator(oracle_up, oracle_down)
+    (
+        (base_p.detach().unsqueeze(-2) @ torch.matrix_exp(oracle_generator)).squeeze(-2) * cotangent
+    ).sum().backward()
+    # The absorbing element stays out of the comparison: a row scale of exactly
+    # zero is the identity branch, deliberately flat in the rates so a fully
+    # masked token is bit-for-bit the base (checked bit-exactly above).
+    acting = torch.ones_like(rate_up, dtype=torch.bool)
+    acting[0, 1, 0, :] = False
+    torch.testing.assert_close(
+        rate_up.grad[acting], oracle_up.grad[acting], rtol=1e-8, atol=1e-10
+    )
+    torch.testing.assert_close(
+        rate_down.grad[acting], oracle_down.grad[acting], rtol=1e-8, atol=1e-10
+    )
+    assert float(rate_up.grad[0, 1, 0].abs().max()) == 0.0
+    assert float(oracle_up.grad[0, 1, 0].abs().max()) > 0.0
+
+
+def test_uniformization_rejects_truncation_and_non_finite_inputs():
+    up = torch.full((1, 1, 1, LEVELS), 2.0)
+    down = torch.full((1, 1, 1, LEVELS), 2.0)
+    up[..., -1] = 0.0
+    down[..., 0] = 0.0
+    generator = birth_death_generator(up, down)
+    base = base_logits()[:1, :1, :1].softmax(-1)
+    # A truncated series loses a large share of the Poisson mass; renormalizing
+    # would hide that, so it has to fail loudly instead.
+    with pytest.raises(ValueError, match="max_terms"):
+        uniformization_expm_apply(generator, base, tolerance=1e-14, max_terms=3)
+    broken = generator.clone()
+    broken[0, 0, 0, 0, 0] = float("nan")
+    with pytest.raises(ValueError, match="non-finite"):
+        uniformization_expm_apply(broken, base)
+    nan_base = base.clone()
+    nan_base[0, 0, 0, 0] = float("nan")
+    with pytest.raises(ValueError, match="non-finite"):
+        uniformization_expm_apply(generator, nan_base)
+    with pytest.raises(ValueError, match="share leading shape"):
+        uniformization_expm_apply(generator, base[:, :, :0, :])
+
+
+def test_birth_death_operator_can_be_configured_to_fail_on_truncation():
+    operator = trained(
+        BirthDeathCTMCOperator(
+            num_levels=LEVELS, hidden_dim=16, style_dim=16,
+            uniformization_tolerance=1e-14, max_terms=2,
+        )
+    )
+    with pytest.raises(ValueError, match="max_terms"):
+        operator(inputs_for(base_logits(), strength=1.0, hard_mask=full_mask()))
+
+
+def test_strength_is_per_sample_and_never_moves_the_region():
+    logits = base_logits()
+    base_probs = logits.softmax(-1)
+    support = partial_region()
+    for cls in (AdditiveLogitField, BirthDeathCTMCOperator):
+        operator = trained(cls(num_levels=LEVELS, hidden_dim=16, style_dim=16))
+        mixed = operator(
+            inputs_for(
+                logits,
+                strength=torch.tensor([0.0, 1.0]),
+                hard_mask=support,
+            )
+        )
+        # Row 0 has strength 0 and must be exactly the base...
+        torch.testing.assert_close(mixed.probabilities[0], base_probs[0], rtol=0.0, atol=0.0)
+        # ... while row 1 moves inside the region only.
+        assert float((mixed.probabilities[1, :, :8] - base_probs[1, :, :8]).abs().max()) > 1e-4
+        torch.testing.assert_close(
+            mixed.probabilities[1, :, 8:], base_probs[1, :, 8:], rtol=0.0, atol=0.0
+        )
+
 
 def test_shuffled_adjacency_is_the_geometry_control():
     """A permuted level order must stay a valid, identity-clean CTMC."""

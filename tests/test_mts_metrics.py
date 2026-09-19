@@ -10,6 +10,7 @@ from stylized_motion.learning.mts_operator.masking import MaskGenerator
 from stylized_motion.learning.mts_operator.metrics import (
     aggregate,
     content_preservation,
+    token_likelihood_diagnostics,
     physics_metrics,
     reference_sensitivity,
     representation_metrics,
@@ -135,7 +136,8 @@ def test_reference_sensitivity_reports_correct_wrong_and_random():
     assert plain["nll_correct"] == pytest.approx(report["nll_correct"])
 
 
-def test_content_preservation_is_exact_when_nothing_was_edited():
+def test_token_likelihood_diagnostics_are_exact_when_nothing_was_edited():
+    """The renamed proxy: target-token NLL, not a content-recognition score."""
     view = adapter()
     model = build_model(view, trained=True)
     batch = fixed_batch(view, seed=7)
@@ -146,21 +148,32 @@ def test_content_preservation_is_exact_when_nothing_was_edited():
         content_condition=batch.content_condition,
         strength=0.0,
     )
-    report = content_preservation(model, zero)
-    assert report["styled_nll"] == pytest.approx(report["base_nll"], rel=1e-6)
+    report = token_likelihood_diagnostics(model, zero)
+    assert report["target_token_nll_styled"] == pytest.approx(
+        report["target_token_nll_base"], rel=1e-6
+    )
     assert report["argmax_change_ratio"] == 0.0
-    edited = content_preservation(model, batch)
-    assert edited["nll_increase"] >= -1e-6
+    assert "not an independent content-recognition score" in report["note"]
+    edited = token_likelihood_diagnostics(model, batch)
+    assert edited["target_token_nll_delta"] >= -1e-6
     assert 0.0 <= edited["argmax_change_ratio"] <= 1.0
+    # The old name still resolves (no call site breaks), but the keys are the new ones.
+    assert set(content_preservation(model, zero)) == set(report)
 
 
 def test_support_locality_separates_inside_from_outside():
     view = adapter()
     model = build_model(view, trained=True)
     support = view.hard_mask(["left_arm"], graph_radius=1, length=FRAMES)
+    targets = torch.randint(
+        0, LEVELS, (2, FRAMES, 40), generator=torch.Generator().manual_seed(8)
+    )
     batch = OperatorBatch(
-        target_tokens=torch.randint(0, LEVELS, (2, FRAMES, 40), generator=torch.Generator().manual_seed(8)),
+        target_tokens=targets,
         style_ids=torch.zeros(2, dtype=torch.long),
+        # Locked-edit batch: the edit region is stated outright, so the loss and
+        # generation paths agree on which positions are evidence.
+        visible_mask=~support.expand_as(targets),
         hard_mask=support,
         strength=1.0,
     )
@@ -169,34 +182,87 @@ def test_support_locality_separates_inside_from_outside():
     assert report["leakage"] == 0.0  # locked edit: outside the support nothing changes
     assert report["leaked_tokens"] == 0
     assert report["changed_token_ratio_inside"] >= 0.0
-    assert "note" in support_locality(model, OperatorBatch(target_tokens=batch.target_tokens, style_ids=batch.style_ids))
+    # Without a hard mask there is no region to be local to; the report says so.
+    note = support_locality(
+        model,
+        OperatorBatch(
+            target_tokens=batch.target_tokens,
+            style_ids=batch.style_ids,
+            visible_mask=batch.visible_mask,
+        ),
+    )
+    assert "note" in note
 
 
-def test_style_retrieval_ranks_the_matching_reference():
+def _retrieval_batch(view, *, targets: int = 2, frames: int = FRAMES) -> OperatorBatch:
+    return OperatorBatch(
+        target_tokens=torch.randint(
+            0, LEVELS, (targets, frames, 40), generator=torch.Generator().manual_seed(9)
+        ),
+        style_ids=torch.zeros(targets, dtype=torch.long),
+        visible_mask=torch.zeros(targets, frames, 40, dtype=torch.bool),
+    )
+
+
+def test_style_retrieval_counts_every_same_style_candidate_as_correct():
     view = adapter()
     model = build_model(view, trained=True)
     generator = torch.Generator().manual_seed(9)
-    targets = torch.randint(0, LEVELS, (2, FRAMES, 40), generator=generator)
-    references = [torch.randint(0, LEVELS, (FRAMES, 40), generator=generator) for _ in range(2)]
-    batch = OperatorBatch(
-        target_tokens=targets,
-        style_ids=torch.zeros(2, dtype=torch.long),
-        visible_mask=torch.zeros_like(targets, dtype=torch.bool),
-    )
+    references = [
+        torch.randint(0, LEVELS, (FRAMES, 40), generator=generator) for _ in range(4)
+    ]
+    batch = _retrieval_batch(view)
+    # Two candidates share the target's style: either of them ranking first is a hit.
     report = style_retrieval(
         model,
         batch,
-        candidate_sets=[references, references],
-        correct_index=[0, 1],
+        candidate_sets=[references[:2], references],
+        positive_indices=[[0, 1], [1]],
     )
-    assert report["candidates"] == 2.0 and report["targets"] == 2.0
-    assert report["chance"] == pytest.approx(0.5)
-    assert 0.0 <= report["top1_accuracy"] <= 1.0
-    # A degenerate candidate set (only the correct one) always succeeds.
-    single = style_retrieval(model, batch, candidate_sets=[[references[0]], [references[1]]], correct_index=[0, 0])
-    assert single["top1_accuracy"] == 1.0
+    assert report["count"] == 2 and report["unavailable"] == 0
+    assert report["hits"] in (0, 1, 2)
+    assert report["top1_accuracy"] == pytest.approx(report["hits"] / report["count"])
+    assert report["candidates_min"] == 2 and report["candidates_max"] == 4
+    # Chance is the mean positive fraction per target: (2/2 + 1/4) / 2.
+    assert report["chance"] == pytest.approx((1.0 + 0.25) / 2)
+    # A target with no candidates is unavailable, never counted as a miss.
+    empty = style_retrieval(model, batch, candidate_sets=[[], references], positive_indices=[[], [1]])
+    assert empty["unavailable"] == 1 and empty["count"] == 1
     with pytest.raises(ValueError, match="one candidate set"):
-        style_retrieval(model, batch, candidate_sets=[references], correct_index=[0, 1])
+        style_retrieval(model, batch, candidate_sets=[references], positive_indices=[[0], [0]])
+
+
+def test_retrieval_hits_are_partition_invariant():
+    """2/8 must read .25 whatever the batch partition is."""
+    from stylized_motion.learning.mts_operator.eval_protocol import retrieval_report
+
+    # 8 targets, 2 hits (rows 0 and 3), one tie that goes to the first candidate.
+    scores = [
+        [0.1, 0.5],   # hit: candidate 0 is lowest and positive
+        [0.5, 0.1],   # miss
+        [0.9, 0.2],   # miss
+        [0.7, 0.2],   # hit: the second candidate is lowest and positive
+        [0.4, 0.1],   # miss
+        [0.3, 0.3],   # tie -> first candidate, which is not a positive here
+        [0.8, 0.2],   # miss
+        [0.6, 0.1],   # miss
+    ]
+    positives = [[0], [0], [0], [1], [0], [1], [0], [0]]
+    whole = retrieval_report(scores, positives)
+    assert whole["hits"] == 2 and whole["count"] == 8
+    assert whole["top1_accuracy"] == pytest.approx(0.25)
+    pieces = [
+        retrieval_report(scores[:1], positives[:1]),
+        retrieval_report(scores[1:5], positives[1:5]),
+        retrieval_report(scores[5:], positives[5:]),
+    ]
+    assert sum(piece["hits"] for piece in pieces) == whole["hits"]
+    assert sum(piece["count"] for piece in pieces) == whole["count"]
+    # Ties go to the first candidate in the fixed order, as documented.
+    tie = retrieval_report([[0.3, 0.3]], [[1]])
+    assert tie["hits"] == 0
+    assert tie["top1_accuracy"] == 0.0
+    assert retrieval_report([[0.3, 0.3]], [[0]])["hits"] == 1
 
 
 def test_physics_metrics_are_zero_for_an_unchanged_motion_and_positive_otherwise():
@@ -207,12 +273,15 @@ def test_physics_metrics_are_zero_for_an_unchanged_motion_and_positive_otherwise
     identical = physics_metrics(baseline_motion=motion, edited_motion=motion.clone(), kinematic=kinematic)
     for key in (
         "fk_change_mean", "fk_change_max", "root_position_change", "root_rotation_change",
-        "contact_flip_rate", "foot_slide_edited", "foot_slide_baseline", "foot_skate_ratio",
+        "jerk_mean", "jerk_max", "jerk_mean_baseline", "jerk_change_mean",
+        "contact_gate_frames", "contact_threshold", "foot_slide_unit",
     ):
         assert key in identical, key
     assert identical["fk_change_mean"] == 0.0
     assert identical["fk_change_max"] == 0.0
-    assert identical["contact_flip_rate"] == 0.0
+    assert identical["jerk_change_mean"] == 0.0
+    # Same motion: the comparison is exactly zero, contact or no contact.
+    assert identical["contact_flip_rate"] in (0.0, None)
 
     changed = motion.clone()
     changed[:, :, 9:15] += 0.4
@@ -221,12 +290,40 @@ def test_physics_metrics_are_zero_for_an_unchanged_motion_and_positive_otherwise
     )
     assert report["fk_change_mean"] > 0.0
     assert report["fk_change_max"] >= report["fk_change_mean"]
-    assert "boundary_jerk_max" in report
-    assert report["boundary_jerk_max"] > 0.0
+    assert report["jerk_change_mean"] > 0.0
+    # The renamed first-difference proxy keeps its own name and unit.
+    assert report["feature_delta_change_max"] > 0.0
+    assert "boundary_jerk_max" not in report
+    # The boundary neighbourhood is reported separately from the region.
+    assert "jerk_max_boundary" in report and "jerk_mean_inside" in report
     with pytest.raises(ValueError, match="share a shape"):
         physics_metrics(
             baseline_motion=motion, edited_motion=changed[:, :4], kinematic=kinematic
         )
+
+
+def test_jerk_matches_the_analytic_third_derivative():
+    """Constant velocity: jerk 0.  Cubic: jerk = 6a in m/s^3."""
+    from stylized_motion.learning.mts_operator.metrics import third_difference_jerk
+
+    dt = 1.0 / 60.0
+    times = torch.arange(30, dtype=torch.float64) * dt
+    # 1. Constant velocity -> jerk exactly zero.
+    constant = torch.stack((times, 2.0 * times, -0.5 * times), dim=-1).view(1, -1, 1, 3)
+    # float32 positions put the roundoff floor around 1e-8 m/s^3, which is still
+    # 6a * 1e-10 relative to the cubic case below.
+    assert float(third_difference_jerk(constant, dt).abs().max()) == pytest.approx(0.0, abs=1e-7)
+    # 2. Cubic a t^3 -> the third difference is exactly 6a (per axis).
+    a = 0.7
+    cubic = torch.stack((a * times**3, torch.zeros_like(times), 2.0 * a * times**3), dim=-1).view(1, -1, 1, 3)
+    jerk = third_difference_jerk(cubic, dt)
+    assert float(jerk[:, :, 0, 0].mean()) == pytest.approx(6.0 * a, rel=1e-9)
+    assert float(jerk[:, :, 0, 2].mean()) == pytest.approx(12.0 * a, rel=1e-9)
+    assert float(jerk[:, :, 0, 1].abs().max()) == pytest.approx(0.0, abs=1e-12)
+    with pytest.raises(ValueError, match="at least four frames"):
+        third_difference_jerk(constant[:, :3], dt)
+    with pytest.raises(ValueError, match="dt"):
+        third_difference_jerk(constant, 0.0)
 
 
 def test_aggregate_summarizes_rows():

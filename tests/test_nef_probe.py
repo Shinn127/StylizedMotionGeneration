@@ -25,6 +25,10 @@ from stylized_motion.learning.nef_probe import (
     locality_report,
     probe_csv_rows,
     read_probe_window,
+    shared_legal_support,
+    signed_pulse_perturbations,
+    signed_span_perturbations,
+    stratified_span_probe,
     temporal_influence_width,
     write_probe_csv,
 )
@@ -175,7 +179,12 @@ def test_level_probe_reports_kinematics_and_rejects_bad_inputs():
     arm = report["per_coordinate"][1]
     assert arm["stream"] == "left_arm_node"
     assert arm["adjacent"]["owns_joints"] == 1.0
-    assert arm["adjacent"]["fk_offtarget_max"] == pytest.approx(0.0, abs=0.0)
+    # World-space FK is a float32 pipeline, so "off-target" magnitudes have a
+    # measured floor around 1e-6 m (0.001 mm) rather than being exactly zero.  The
+    # tolerance is stated in metres and stays four orders below any motion the
+    # probe reports; the *feature-level* identity below keeps its exact check.
+    assert arm["adjacent"]["fk_offtarget_max"] == pytest.approx(0.0, abs=1e-4)
+    assert arm["adjacent"]["fk_offtarget_max"] < 1e-3 * arm["adjacent"]["fk_owned_mean"]
     assert arm["adjacent"]["fk_owned_mean"] > 0.0
     # The global stream owns no bones: a root/contact edit moves the whole body,
     # so its influence is reported over every joint and no leakage is claimed.
@@ -364,3 +373,299 @@ def test_read_probe_window_pads_at_the_clip_start_and_rejects_overruns(tmp_path:
         read_probe_window(store, bad, history=3)
     with pytest.raises(IndexError, match="Invalid clip index"):
         read_probe_window(store, types.SimpleNamespace(variant_idx=5, target_start=4, target_frames=4), history=0)
+
+
+# ---------------------------------------------------------------------------
+# C08 / protocol revision 2: single pulse, fixed signed span, stratified support
+
+
+class _CausalToyDecoder(nn.Module):
+    """A causal decoder with a known influence width: ``out[t] = mean(x[t-k..t])``.
+
+    The feature at frame ``t`` depends on the level at frames ``t-k..t`` and on
+    nothing later, so an edit at frame ``f`` may change features at ``[f, f+k]`` and
+    no further.  That makes the measured tail checkable against ``k`` instead of
+    "small enough".
+    """
+
+    def __init__(self, layout: NEFLayout, motion_dim: int, *, width: int) -> None:
+        super().__init__()
+        self.layout = layout
+        self.num_levels = 9
+        self.motion_dim = int(motion_dim)
+        self.receptive_field = int(width) + 1
+        self.lookahead_frames = 0
+        self.width = int(width)
+
+    def decode_from_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        values = indices.float().mean(dim=-1)  # [B, T], one scalar per frame
+        frames = values.shape[1]
+        out = values.clone()
+        for lag in range(1, self.width + 1):
+            shifted = torch.zeros_like(values)
+            if frames > lag:
+                shifted[:, lag:] = values[:, : frames - lag]
+            out = out + shifted
+        return out.unsqueeze(-1).repeat(1, 1, self.motion_dim) / float(self.width + 1)
+
+
+def test_a_signed_pulse_and_span_share_their_support_and_are_stratified():
+    layout = geno_layout()
+    model = _AnalyticDecoder(layout, 9 * layout.num_joints + 5)
+    indices = torch.full((1, 12, 40), 4, dtype=torch.long)
+    pulse = signed_pulse_perturbations(indices, 3, frame=5, num_levels=9, magnitude=1, sign=1)
+    assert int(pulse.offsets[0].sum()) == 1 and bool(pulse.valid.all())
+    assert pulse.tokens[0, 5, 3].item() == 5
+    assert bool((pulse.tokens[0, 6] == indices[0, 6]).all())
+    span = signed_span_perturbations(
+        indices, 3, num_levels=9, magnitude=1, sign=1, start=4, stop=8
+    )
+    assert int(span.offsets[0].sum()) == 4
+    assert bool(span.tokens[0, 8].eq(indices[0, 8]).all())
+    assert bool(span.tokens[0, 9].eq(indices[0, 9]).all())
+    far = signed_span_perturbations(
+        indices, 3, num_levels=9, magnitude=3, sign=1, start=4, stop=8
+    )
+    # Legality is "the applied shift stayed in range"; untouched frames are legal
+    # for every move, so the shared support is the whole window here.
+    assert bool(shared_legal_support(pulse, span, far).all())
+    # Boundary levels are flagged, and the intersection excludes them.
+    low = torch.full((1, 4, 6), 0, dtype=torch.long)
+    minus = signed_span_perturbations(low, 0, num_levels=9, magnitude=1, sign=-1, start=0, stop=3)
+    assert bool(minus.valid[0, :3].logical_not().all())
+    assert bool(minus.valid[0, 3].item())
+    with pytest.raises(ValueError, match="magnitude"):
+        signed_span_perturbations(low, 0, num_levels=9, magnitude=9)
+    with pytest.raises(ValueError, match="sign"):
+        signed_span_perturbations(low, 0, num_levels=9, sign=0)
+    with pytest.raises(ValueError, match="span"):
+        signed_span_perturbations(low, 0, num_levels=9, start=3, stop=3)
+
+
+def test_stratified_span_probe_measures_the_known_decoder_tail():
+    layout = geno_layout()
+    width = 4
+    model = _CausalToyDecoder(layout, 9 * layout.num_joints + 5, width=width)
+    indices = torch.full((1, 32, 40), 4, dtype=torch.long)
+    report = stratified_span_probe(
+        model, indices, coordinate=7, frame=8, span=4, magnitudes=(1, 3), signs=(1,)
+    )
+    assert report["protocol_revision"] == 2
+    assert report["decoder_receptive_field"] == width + 1
+    assert report["frame_range"] == [8, 12]
+    # 32 frames, the span ends at 12, so 20 frames of tail remain: enough for the
+    # four-frame influence of this decoder.
+    assert report["tail_frames_required"] == width
+    assert report["temporal_probe_complete"] is True
+    assert report["legal_frames_in_span"] == 4
+    assert report["excluded_by_level_range"] == 0
+    assert report["outside_span_frames"] == 32 - 4
+    rows = {(row["sign"], row["magnitude"]): row for row in report["rows"]}
+    near, far = rows[(1, 1)], rows[(1, 3)]
+    assert near["kind"] == "near" and far["kind"] == "far"
+    # Analytic value: a +1 shift on one coordinate changes that frame's coordinate
+    # mean by 1/40, and the width+1 moving average spreads it over five frames.  On
+    # the support (frames 8..11) the window covers 1, 2, 3 and 4 edited frames, so
+    # the mean over the support is (1+2+3+4) / (4 * 40 * (width + 1)) per level.
+    per_level = (1 + 2 + 3 + 4) / (4.0 * 40.0 * float(width + 1))
+    assert near["feature_l1_inside_support"] == pytest.approx(per_level, rel=1e-4)
+    assert far["feature_l1_inside_support"] == pytest.approx(3 * per_level, rel=1e-4)
+    # The influence stops exactly `width` frames after the last edited frame.
+    assert near["feature_first_changed_frame"] == 8
+    assert near["feature_last_changed_frame"] == 11 + width
+    assert near["feature_l1_mean"] < near["feature_l1_inside_support"]
+    assert report["units"]["world"] == "metres"
+
+
+def test_a_truncated_window_is_marked_incomplete():
+    layout = geno_layout()
+    model = _CausalToyDecoder(layout, 9 * layout.num_joints + 5, width=8)
+    indices = torch.full((1, 12, 40), 4, dtype=torch.long)
+    # The edit starts at frame 8 of a 12-frame window: only 4 frames follow, while
+    # the decoder's influence needs 8.  The probe must say so.
+    report = stratified_span_probe(
+        model, indices, coordinate=1, frame=8, span=2, magnitudes=(1, 2)
+    )
+    assert report["tail_frames_available"] == 2
+    assert report["tail_frames_required"] == 8
+    assert report["temporal_probe_complete"] is False
+    # The measured tail is still reported, but it is a lower bound, not a stop.
+    row = report["rows"][0]
+    assert row["feature_last_changed_frame"] == 11
+
+
+def test_the_stratified_probe_reports_world_space_tail_with_kinematics():
+    torch.manual_seed(17)
+    model = geno_model()
+    kinematic = KinematicContext.from_feature_stats(feature_stats(model))
+    indices = torch.randint(0, 9, (1, 64, 40), generator=torch.Generator().manual_seed(23))
+    report = stratified_span_probe(
+        model,
+        indices,
+        coordinate=0,
+        frame=16,
+        span=8,
+        magnitudes=(1, 3),
+        kinematic=kinematic,
+    )
+    assert report["kinematics"] is True
+    for row in report["rows"]:
+        assert row["world_fk_max"] is not None and row["world_fk_max"] >= 0.0
+        assert row["unit_world_fk"] == "metres"
+        # The root-integrated tail is measured separately from the decoder's own
+        # influence, because integration has no receptive-field bound.
+        assert "world_root_tail_max" in row
+    far = next(row for row in report["rows"] if row["magnitude"] == 3)
+    near = next(row for row in report["rows"] if row["magnitude"] == 1)
+    assert far["world_fk_max"] > near["world_fk_max"]
+
+
+# ---------------------------------------------------------------------------
+# The reference skeleton: a store's ref_pos is a mean, not a skeleton
+
+
+def test_bind_skeleton_replaces_the_mirror_averaged_reference():
+    """A store's ref_pos is the dataset mean of the local positions.
+
+    With mirror augmentation every constant axis-aligned offset cancels in that
+    mean, so FK on it collapses the spine and hides joint motion.  The bind
+    contract is the skeleton the mesh is skinned against; using it must restore
+    the chain lengths.
+    """
+    import numpy as np
+
+    from stylized_motion.anim.features import (
+        MotionFeatureStats,
+        bind_reference_positions,
+        build_motion_feature_components,
+        reconstruct_motion_state_from_features,
+        stats_with_reference_skeleton,
+    )
+
+    names = [
+        "Simulation", "Hips", "Spine1", "Spine2", "Chest", "Neck1", "Neck2", "Head",
+        "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
+        "LeftLeg", "LeftShin", "LeftFoot", "LeftToeBase",
+        "RightLeg", "RightShin", "RightFoot", "RightToeBase",
+    ]
+    num_joints = len(names)
+    parents = _chain_parents(names)
+
+    bind = bind_reference_positions(names)
+    assert bind is not None, "the SOMA bind BVH is part of the repository"
+    spine_chain = ("Spine1", "Spine2", "Chest", "Neck1", "Neck2", "Head")
+    spine_length = float(sum(bind[names.index(joint)][0] for joint in spine_chain))
+    assert spine_length == pytest.approx(0.605, abs=5e-3)  # the authored skeleton
+    assert float(bind[names.index("LeftShin")][0]) == pytest.approx(0.4323, abs=1e-3)
+
+    # An identity pose, built through the same feature builder the pipeline uses so
+    # the feature layout cannot be hand-rolled wrong.
+    frames = 4
+    identity_q = np.zeros((frames, num_joints, 4), dtype=np.float32)
+    identity_q[..., 0] = 1.0
+    database = {
+        "names": names,
+        "positions": np.repeat(np.asarray(bind)[None], frames, axis=0).astype(np.float32),
+        "rotations": identity_q,
+        "velocities": np.zeros((frames, num_joints, 3), dtype=np.float32),
+        "angular_velocities": np.zeros((frames, num_joints, 3), dtype=np.float32),
+        "contacts": np.zeros((frames, 2), dtype=np.uint8),  # left/right toe, like the pipeline
+    }
+    features = np.ascontiguousarray(
+        build_motion_feature_components(database).x, dtype=np.float32
+    )
+
+    # The reference payload is a mirror-averaged mean: the spine chain cancels to
+    # ~0, exactly as the SEED store's ref_pos does for those joints.
+    averaged = np.asarray(bind, dtype=np.float32).copy()
+    for joint in spine_chain:
+        averaged[names.index(joint)] = 0.0
+    stats = MotionFeatureStats(
+        offset=np.zeros(features.shape[1], dtype=np.float32),
+        scale=np.ones(features.shape[1], dtype=np.float32),
+        dist=np.ones(features.shape[1], dtype=np.float32),
+        weights=np.ones(features.shape[1], dtype=np.float32),
+        ref_pos=averaged,
+    )
+
+    def hips_to_head(state) -> float:
+        global_positions = np.asarray(state.global_positions)[0]
+        return float(
+            np.linalg.norm(
+                global_positions[names.index("Head")] - global_positions[names.index("Hips")]
+            )
+        )
+
+    collapsed = reconstruct_motion_state_from_features(
+        features, stats, parents, normalized=False
+    )
+    restored = reconstruct_motion_state_from_features(
+        features, stats_with_reference_skeleton(stats, names), parents, normalized=False
+    )
+    # The zero-length spine puts every chain joint at the hips, so the head sits
+    # on the hips and the character loses its torso; the bind skeleton restores
+    # the authored chain length.
+    assert np.linalg.norm(np.asarray(collapsed.local_positions)[0][names.index("Spine1")]) == 0.0
+    assert hips_to_head(collapsed) == pytest.approx(0.0, abs=1e-6)
+    assert hips_to_head(restored) == pytest.approx(spine_length, abs=5e-3)
+
+
+def _chain_parents(names: list[str]) -> np.ndarray:
+    """A parent array matching the joint order used by the test above."""
+    parents = []
+    for index, name in enumerate(names):
+        if name == "Simulation":
+            parents.append(-1)
+        elif name == "Hips":
+            parents.append(0)
+        elif name.startswith("Left") or name.startswith("Right"):
+            side = "Left" if name.startswith("Left") else "Right"
+            chain = {
+                f"{side}Shoulder": "Chest",
+                f"{side}Arm": f"{side}Shoulder",
+                f"{side}ForeArm": f"{side}Arm",
+                f"{side}Hand": f"{side}ForeArm",
+                f"{side}Leg": "Hips",
+                f"{side}Shin": f"{side}Leg",
+                f"{side}Foot": f"{side}Shin",
+                f"{side}ToeBase": f"{side}Foot",
+            }
+            parents.append(names.index(chain[name]))
+        else:
+            parents.append(max(index - 1, 0))
+    return np.asarray(parents, dtype=np.int32)
+
+
+def test_mirrored_clips_need_the_mirrored_reference_skeleton():
+    """The store's mirrored clips (`_M`) are reflected, and the feature vector
+    carries rotations but not chain offsets.
+
+    The pipeline's own mirror step is "swap the left/right names, negate the
+    lateral axis".  A consumer that poses a mirrored window on the plain
+    reference gets an upside-down body; the mirrored reference must be the
+    *partner joint's* offset with x negated, not a blanket x flip (the limb
+    chains keep their sign because their names already swapped).
+    """
+    import numpy as np
+
+    from stylized_motion.anim.features import (
+        bind_reference_positions,
+        mirror_partner,
+        reconstruct_motion_state_from_features,
+        stats_with_reference_skeleton,
+    )
+
+    assert mirror_partner("LeftArm") == "RightArm"
+    assert mirror_partner("RightFoot") == "LeftFoot"
+    assert mirror_partner("Spine1") == "Spine1"
+
+    names = ["Simulation", "Hips", "Spine1", "Head", "LeftArm", "LeftShin", "RightArm", "RightShin"]
+    bind = bind_reference_positions(names)
+    mirrored = bind_reference_positions(names, mirror=True)
+    assert bind is not None and mirrored is not None
+    # The sagittal chain flips; the limb chains keep their sign (their names swapped).
+    assert float(mirrored[names.index("Spine1")][0]) == pytest.approx(-float(bind[names.index("Spine1")][0]))
+    assert float(mirrored[names.index("LeftArm")][0]) == pytest.approx(-float(bind[names.index("RightArm")][0]))
+    assert float(mirrored[names.index("LeftShin")][0]) == pytest.approx(-float(bind[names.index("RightShin")][0]))
+    assert float(mirrored[names.index("LeftArm")][0]) > 0.0  # not a blanket x flip
+    assert float(mirrored[names.index("LeftShin")][0]) > 0.0

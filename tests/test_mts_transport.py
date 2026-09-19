@@ -7,7 +7,11 @@ import torch
 
 from stylized_motion.learning.mts_operator import LayoutAdapter
 from stylized_motion.learning.mts_operator.contract import TokenSpec
-from stylized_motion.learning.mts_operator.embeddings import StreamTokenEmbedding
+from stylized_motion.learning.mts_operator.embeddings import (
+    StreamLevelHead,
+    StreamTokenEmbedding,
+)
+from stylized_motion.learning.mts_operator.style_encoder import GlobalStyleEncoder
 from stylized_motion.learning.mts_operator.graph import StreamGraphBlock, StreamGraphNetwork
 from stylized_motion.learning.mts_operator.masking import (
     MaskBatch,
@@ -71,12 +75,14 @@ def test_stream_embedding_pools_coordinates_into_their_own_stream():
     stream = view.stream_index("left_arm_node")
     touched = torch.nonzero(changed.amax(dim=-1) > 0).flatten().tolist()
     assert touched == [stream]
-    # Pooling is a mean over the stream's own coordinates plus its embedding.
-    stream_ids = view.coordinate_stream_ids()
-    selected = stream_ids == stream
-    level = module.level_embedding(tokens[..., selected])
-    identity = module.coordinate_embedding.weight[selected]
-    expected = (level + identity).mean(dim=2) + module.stream_embedding.weight[stream]
+    # The stream state is its own coordinates flattened in layout order, mapped by
+    # the stream's own projection, plus the stream embedding.
+    indices = module.coordinate_indices(stream)
+    chunk = (module.level_embedding(tokens.index_select(-1, indices))
+             + module.coordinate_embedding.weight[indices])
+    expected = module.stream_projection[stream](
+        chunk.reshape(tokens.shape[0], tokens.shape[1], -1)
+    ) + module.stream_embedding.weight[stream]
     torch.testing.assert_close(hidden[:, :, stream], expected, rtol=1e-5, atol=1e-5)
 
 
@@ -216,6 +222,19 @@ def test_hard_support_restricts_and_expands_supervision():
     everything = MaskBatch(visible_mask=torch.ones(1, 4, 40, dtype=torch.bool), kind="full_generation")
     with pytest.raises(ValueError, match="covers every position"):
         apply_hard_support(everything, torch.ones(4, 40, dtype=torch.bool), mode="expand")
+
+    # The fallback position must come from the region the mode supervises: the old
+    # code always hid a position outside the support, so ``restrict`` could
+    # supervise exactly the token it promised not to touch.
+    outside_only = torch.zeros(1, 16, 40, dtype=torch.bool)
+    outside_only[0, 0, 0] = True  # the single supervised position lies outside
+    support = view.hard_mask(["left_arm"], graph_radius=1, length=16)
+    rescued = apply_hard_support(
+        MaskBatch(visible_mask=~outside_only, kind="random_coordinate"), support, mode="restrict"
+    )
+    assert bool(rescued.supervision_mask.any())
+    assert not bool(rescued.supervision_mask[:, ~support].any())
+    assert bool(rescued.supervision_mask[:, support].any())
 
 
 # ---------------------------------------------------------------------------
@@ -426,3 +445,301 @@ def test_transport_rejects_invalid_configuration():
         transport(view, graph_depth=-1)
     spec = TokenSpec()
     assert spec.validate_tokens(torch.zeros(1, 2, 40, dtype=torch.long)).shape == (1, 2, 40)
+
+
+# ---------------------------------------------------------------------------
+# R06: coordinate information must survive embedding and head
+
+
+class _TwoStreamAdapter:
+    """A minimal duck-typed adapter: 2 streams, 2+2 coordinates, 9 levels.
+
+    Going through the adapter API (not a hand-written 40-coordinate grouping) is
+    what keeps the test honest about "which coordinate belongs to which stream".
+    """
+
+    num_levels = 9
+    num_coordinates = 4
+    num_streams = 2
+    stream_names = ("a_node", "b_node")
+
+    def coordinate_stream_ids(self, *, device=None) -> torch.Tensor:
+        return torch.tensor([0, 0, 1, 1], dtype=torch.long, device=device)
+
+    def stream_coordinate_indices(self, *, device=None) -> tuple[torch.Tensor, ...]:
+        return (
+            torch.tensor([0, 1], dtype=torch.long, device=device),
+            torch.tensor([2, 3], dtype=torch.long, device=device),
+        )
+
+    def token_spec(self):
+        from stylized_motion.learning.mts_operator.contract import TokenSpec
+
+        return TokenSpec(num_coordinates=4, num_levels=9, num_streams=2)
+
+
+def test_within_stream_coordinates_are_distinguishable_by_construction():
+    """Deterministic weights: the pooled stream state is an exact flatten+project."""
+    adapter = _TwoStreamAdapter()
+    embed_dim = 4
+    module = StreamTokenEmbedding(adapter, embed_dim, token_embed_dim=2).eval()
+    with torch.no_grad():
+        # level 0 -> e0, level 1 -> e1, everything else 0; coordinates identified
+        # by their own one-hot so a swap cannot cancel.
+        module.level_embedding.weight.zero_()
+        module.level_embedding.weight[0, 0] = 1.0
+        module.level_embedding.weight[1, 1] = 1.0
+        module.coordinate_embedding.weight.zero_()
+        module.mask_embedding.zero_()
+        for projection in module.stream_projection:
+            projection.weight.zero_()
+            projection.bias.zero_()
+        # Identity on the flattened stream block: the state *is* the flattened input.
+        module.stream_projection[0].weight[:] = torch.eye(2 * 2)
+        module.stream_embedding.weight.zero_()
+    tokens = torch.zeros(1, 1, 4, dtype=torch.long)
+    tokens[0, 0, 0] = 0
+    tokens[0, 0, 1] = 1
+    visible = torch.ones(1, 1, 4, dtype=torch.bool)
+    with torch.no_grad():
+        state = module(tokens, visible)
+        expected = torch.tensor([1.0, 0.0, 0.0, 1.0])  # [level0+e0, level1+e0] flattened
+        torch.testing.assert_close(state[0, 0, 0], expected)
+        # Swapping the two levels swaps the two 2-vectors: a *different* state.
+        swapped = tokens.clone()
+        swapped[0, 0, 0], swapped[0, 0, 1] = 1, 0
+        swapped_state = module(swapped, visible)
+        torch.testing.assert_close(
+            swapped_state[0, 0, 0], torch.tensor([0.0, 1.0, 1.0, 0.0])
+        )
+    assert not torch.equal(state[0, 0, 0], swapped_state[0, 0, 0])
+    # The other stream is untouched by a swap inside stream 0.
+    assert torch.equal(state[0, 0, 1], swapped_state[0, 0, 1])
+
+
+def test_hidden_levels_are_invisible_but_the_mask_position_is_not():
+    adapter = _TwoStreamAdapter()
+    module = StreamTokenEmbedding(adapter, 4, token_embed_dim=2).eval()
+    with torch.no_grad():
+        module.mask_embedding.fill_(0.5)
+        module.coordinate_embedding.weight.zero_()
+        module.coordinate_embedding.weight[1, 1] = 1.0  # coordinate 1 has identity e1
+    tokens = torch.zeros(1, 1, 4, dtype=torch.long)
+    visible = torch.ones(1, 1, 4, dtype=torch.bool)
+    visible[0, 0, 0] = False
+    other = tokens.clone()
+    other[0, 0, 0] = 8  # the hidden coordinate's level changes
+    with torch.no_grad():
+        first = module(tokens, visible)
+        second = module(other, visible)
+    # A hidden coordinate contributes the mask vector + its identity: its level is
+    # unreadable, and that is exactly what "hidden" has to mean.
+    assert torch.equal(first, second)
+    # Hiding a *different* coordinate is distinguishable (identity survives masking).
+    visible_other = torch.ones(1, 1, 4, dtype=torch.bool)
+    visible_other[0, 0, 1] = False
+    with torch.no_grad():
+        third = module(tokens, visible_other)
+    assert not torch.equal(first, third)
+
+
+def test_per_stream_head_makes_coordinate_logits_context_dependent():
+    """The a-b logit difference must move with the context, not only with the bias."""
+    adapter = _TwoStreamAdapter()
+    embed_dim = 4
+    module = StreamTokenEmbedding(adapter, embed_dim, token_embed_dim=2).eval()
+    head = StreamLevelHead(adapter, embed_dim, 9).eval()
+    with torch.no_grad():
+        module.level_embedding.weight.normal_(std=0.5, generator=torch.Generator().manual_seed(3))
+        module.coordinate_embedding.weight.normal_(std=0.5, generator=torch.Generator().manual_seed(4))
+        head.stream_heads[0].weight.normal_(std=0.5, generator=torch.Generator().manual_seed(5))
+        head.stream_heads[0].bias.zero_()
+        head.coordinate_bias.weight.zero_()
+    tokens = torch.randint(0, 9, (1, 3, 4), generator=torch.Generator().manual_seed(6))
+    full = torch.ones(1, 3, 4, dtype=torch.bool)
+    masked = full.clone()
+    masked[0, :, 3] = False  # hide a coordinate of the *other* stream
+    with torch.no_grad():
+        first = head(module(tokens, full))
+        second = head(module(tokens, masked))
+    assert torch.equal(head.coordinate_bias.weight, torch.zeros_like(head.coordinate_bias.weight))
+    # With a zero static bias, any per-coordinate logit difference is dynamic.
+    gap_first = (first[0, :, 0] - first[0, :, 1]).abs().max()
+    gap_second = (second[0, :, 0] - second[0, :, 1]).abs().max()
+    assert float(gap_first) > 1e-6 and float(gap_second) > 1e-6
+    assert not torch.equal(first[0, :, 0], first[0, :, 1]), "coordinates must differ at all"
+
+
+def test_transport_config_records_token_embed_dim_and_revision():
+    view = adapter()
+    model = MotionTransportTransformer(view, dim=32, depth=1, heads=2, graph_depth=0)
+    config = model.config()
+    assert config["architecture_revision"] == 2
+    assert config["token_embed_dim"] == 16
+    rebuilt = MotionTransportTransformer(view, **config)
+    assert rebuilt.token_embed_dim == 16
+    with pytest.raises(ValueError, match="architecture revision"):
+        MotionTransportTransformer(view, dim=32, depth=1, heads=2, architecture_revision=1)
+    # An old config (revision 1, no token_embed_dim) must not load silently.
+    legacy = dict(config)
+    legacy["architecture_revision"] = 1
+    with pytest.raises(ValueError, match="architecture revision"):
+        MotionTransportTransformer(view, **legacy)
+    # Replaying a stored config is the path that must never mis-load: it carries
+    # both fields, so a revision mismatch is caught before any state dict is read.
+    stored = dict(config)
+    stored["architecture_revision"] = 1
+    with pytest.raises(ValueError, match="architecture revision"):
+        MotionTransportTransformer(view, **stored)
+    # The state dict of another revision cannot load either (and load_state_dict is
+    # never called with strict=False anywhere in this code base).
+    other = MotionTransportTransformer(view, dim=32, depth=1, heads=2, token_embed_dim=8)
+    with pytest.raises(RuntimeError):
+        MotionTransportTransformer(view, **config).load_state_dict(other.state_dict())
+
+
+def test_per_stream_parameters_are_reported():
+    view = adapter()
+    model = MotionTransportTransformer(view, dim=32, depth=1, heads=2, graph_depth=0)
+    embedding_params = sum(parameter.numel() for parameter in model.embedding.parameters())
+    head_params = sum(parameter.numel() for parameter in model.head.parameters())
+    # One projection per stream and one head per stream, each sized from the
+    # layout's own stream slices.
+    sizes = view.stream_sizes()
+    token_embed_dim = model.token_embed_dim
+    expected_embedding = (
+        view.num_levels * token_embed_dim
+        + view.num_coordinates * token_embed_dim
+        + view.num_streams * 32
+        + token_embed_dim
+        + sum(size * token_embed_dim * 32 + 32 for size in sizes)
+    )
+    expected_head = sum(32 * size * 9 + size * 9 for size in sizes) + view.num_coordinates * 9
+    assert embedding_params == expected_embedding
+    assert head_params == expected_head
+    assert token_embed_dim == 16 and len(sizes) == 13
+
+
+# ---------------------------------------------------------------------------
+# R07: explicit temporal position
+
+
+def test_position_table_is_positional_long_and_dtype_exact():
+    from stylized_motion.learning.mts_operator.temporal import (
+        SinusoidalPositionEncoding,
+        sinusoidal_positions,
+    )
+
+    table = sinusoidal_positions(8, 32)
+    assert table.shape == (1, 8, 1, 32)
+    # Different positions, and the same position always encodes the same way.
+    assert not torch.allclose(table[0, 0, 0], table[0, 1, 0])
+    torch.testing.assert_close(sinusoidal_positions(8, 32), table)
+    # Longer than any training window: no fixed table to overflow.
+    long_table = sinusoidal_positions(4096, 32)
+    assert long_table.shape == (1, 4096, 1, 32)
+    # dtype/device follow the caller, and the values are bounded.
+    half = sinusoidal_positions(4, 32, dtype=torch.float16)
+    assert half.dtype == torch.float16 and float(half.abs().max()) <= 1.0 + 1e-3
+    module = SinusoidalPositionEncoding(32)
+    hidden = torch.zeros(2, 5, 3, 32)
+    torch.testing.assert_close(module(hidden), sinusoidal_positions(5, 32).expand_as(hidden))
+    with pytest.raises(ValueError, match=r"\[B, T, S, 32\]"):
+        module(torch.zeros(2, 5, 32))
+    with pytest.raises(ValueError, match="position encoding"):
+        SinusoidalPositionEncoding(32, kind="rope")
+    with pytest.raises(ValueError, match="positive"):
+        sinusoidal_positions(0, 32)
+
+
+def test_all_hidden_frames_are_no_longer_structurally_equal():
+    """Full masking used to make every frame's logits identical."""
+    view = adapter()
+    model = transport(view, graph_depth=0)
+    tokens = torch.randint(0, 9, (1, 6, 40), generator=torch.Generator().manual_seed(2))
+    hidden = torch.zeros(1, 6, 40, dtype=torch.bool)
+    with torch.no_grad():
+        logits = model(tokens, hidden).logits
+        pairwise = max(
+            float((logits[0, i] - logits[0, j]).abs().max()) for i in range(6) for j in range(6)
+        )
+        spread = float(logits[0].std(dim=0).mean())
+    assert pairwise > 1e-3 and spread > 1e-4, "frames must differ by construction, not by noise"
+    # ... while the hidden token values still cannot influence anything.
+    with torch.no_grad():
+        other = model(torch.zeros_like(tokens), hidden).logits
+    torch.testing.assert_close(logits, other, rtol=0.0, atol=0.0)
+
+
+def test_transport_is_no_longer_time_permutation_equivariant():
+    view = adapter()
+    model = transport(view, graph_depth=0)
+    tokens = torch.randint(0, 9, (2, 6, 40), generator=torch.Generator().manual_seed(7))
+    visible = torch.ones(2, 6, 40, dtype=torch.bool)
+    permutation = torch.randperm(6, generator=torch.Generator().manual_seed(8))
+    with torch.no_grad():
+        direct = model(tokens[:, permutation], visible).logits
+        moved = model(tokens, visible).logits[:, permutation]
+    assert float((direct - moved).abs().max()) > 1e-3
+
+
+def test_positions_never_let_padding_into_valid_outputs():
+    view = adapter()
+    model = transport(view, graph_depth=0)
+    tokens = torch.randint(0, 9, (2, 5, 40), generator=torch.Generator().manual_seed(11))
+    visible = torch.ones(2, 5, 40, dtype=torch.bool)
+    valid = torch.ones(2, 5, dtype=torch.bool)
+    padded = torch.cat([tokens, torch.randint(0, 9, (2, 4, 40))], dim=1)
+    padded_visible = torch.cat([visible, torch.ones(2, 4, 40, dtype=torch.bool)], dim=1)
+    padded_valid = torch.cat([valid, torch.zeros(2, 4, dtype=torch.bool)], dim=1)
+    with torch.no_grad():
+        base = model(tokens, visible, valid_mask=valid).logits
+        extended = model(padded, padded_visible, valid_mask=padded_valid).logits
+    torch.testing.assert_close(extended[:, :5], base, rtol=0.0, atol=1e-5)
+
+
+def test_causal_prefix_ignores_future_tokens_with_positions():
+    view = adapter()
+    model = transport(view, graph_depth=0, temporal_mode="causal")
+    tokens = torch.randint(0, 9, (1, 8, 40), generator=torch.Generator().manual_seed(12))
+    visible = torch.ones(1, 8, 40, dtype=torch.bool)
+    edited = tokens.clone()
+    edited[:, 4:] = (tokens[:, 4:] + 3) % 9
+    with torch.no_grad():
+        before = model(tokens, visible).logits
+        after = model(edited, visible).logits
+    torch.testing.assert_close(before[:, :4], after[:, :4], rtol=0.0, atol=1e-6)
+    assert float((before[:, 4:] - after[:, 4:]).abs().max()) > 1e-6
+
+
+def test_reference_descriptor_sees_temporal_order():
+    """Reordering distinct frames must change the descriptor; equal frames may not."""
+    view = adapter()
+    torch.manual_seed(21)
+    encoder = GlobalStyleEncoder(view, dim=32, depth=1, heads=2, dropout=0.0, output_dim=32).eval()
+    with torch.no_grad():
+        for parameter in encoder.parameters():
+            parameter.add_(torch.randn(parameter.shape, generator=torch.Generator().manual_seed(4)) * 0.1)
+    tokens = torch.randint(0, 9, (2, 8, 40), generator=torch.Generator().manual_seed(13))
+    valid = torch.ones(2, 8, dtype=torch.bool)
+    permutation = torch.randperm(8, generator=torch.Generator().manual_seed(14))
+    with torch.no_grad():
+        base = encoder(tokens, valid_mask=valid)
+        permuted = encoder(tokens[:, permutation], valid_mask=valid)
+        reordered_original = encoder(tokens[:, permutation][:, permutation.argsort()], valid_mask=valid)
+    # The relative change is what matters: the descriptor's own scale is small.
+    relative = float((base - permuted).abs().max()) / float(base.abs().mean())
+    assert relative > 1e-3
+    torch.testing.assert_close(base, reordered_original, rtol=1e-6, atol=1e-5)
+    # Identical frames are the legal exception: no reordering can matter.
+    flat = tokens[:, :1].expand(-1, 8, -1).contiguous()
+    with torch.no_grad():
+        flat_base = encoder(flat, valid_mask=valid)
+        flat_permuted = encoder(flat[:, permutation], valid_mask=valid)
+    torch.testing.assert_close(flat_base, flat_permuted, rtol=0.0, atol=1e-6)
+    # Padding frames are excluded from the pooled descriptor.
+    padded = torch.cat([tokens, torch.randint(0, 9, (2, 4, 40))], dim=1)
+    padded_valid = torch.cat([valid, torch.zeros(2, 4, dtype=torch.bool)], dim=1)
+    with torch.no_grad():
+        padded_descriptor = encoder(padded, valid_mask=padded_valid)
+    torch.testing.assert_close(padded_descriptor, base, rtol=0.0, atol=1e-5)
