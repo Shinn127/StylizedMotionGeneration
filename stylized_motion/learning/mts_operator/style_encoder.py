@@ -26,6 +26,7 @@ from .contract import TokenSpec
 from .embeddings import StreamTokenEmbedding
 from .graph import StreamGraphNetwork
 from .layout_adapter import LayoutAdapter
+from .temporal import SinusoidalPositionEncoding
 from .transport import TEMPORAL_MODES
 
 
@@ -42,6 +43,7 @@ class GlobalStyleEncoder(nn.Module):
         dropout: float = 0.1,
         graph_depth: int = 1,
         temporal_mode: str = "bidirectional",
+        position_encoding: str = "sinusoidal",
         output_dim: int | None = None,
         pooling: str = "mean_std",
     ) -> None:
@@ -72,6 +74,9 @@ class GlobalStyleEncoder(nn.Module):
             norm_first=True,
         )
         self.temporal = nn.TransformerEncoder(layer, num_layers=int(depth), enable_nested_tensor=False)
+        # The reference descriptor must see the reference's temporal order; without
+        # this the encoder was nearly invariant to a frame permutation.
+        self.position_encoding = SinusoidalPositionEncoding(self.dim, kind=str(position_encoding))
         self.temporal_norm = nn.LayerNorm(self.dim)
         self.graph = StreamGraphNetwork(adapter, self.dim, depth=int(graph_depth), dropout=float(dropout))
         # Pooling keeps the 13 stream slots (a global descriptor is still built
@@ -117,6 +122,7 @@ class GlobalStyleEncoder(nn.Module):
         }
 
     def _temporal(self, hidden: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        hidden = self.position_encoding(hidden)
         batch, frames, streams, dim = hidden.shape
         flat = hidden.permute(0, 2, 1, 3).reshape(batch * streams, frames, dim)
         padding = (~valid_mask).unsqueeze(1).expand(batch, streams, frames).reshape(
@@ -154,7 +160,11 @@ class GlobalStyleEncoder(nn.Module):
         return torch.cat((flattened_mean, deviation), dim=-1)
 
     def config(self) -> dict[str, Any]:
+        # ``kind`` travels with the config: the bundle loader rebuilds the encoder
+        # from this block, and a checkpoint that does not say which encoder it has
+        # would be restored as the wrong one.
         return {
+            "kind": "reference",
             "dim": self.dim,
             "depth": len(self.temporal.layers),
             "heads": self.temporal.layers[0].self_attn.num_heads,
@@ -162,6 +172,7 @@ class GlobalStyleEncoder(nn.Module):
             "temporal_mode": self.temporal_mode,
             "output_dim": self.output_dim,
             "pooling": self.pooling,
+            "position_encoding": self.position_encoding.kind,
         }
 
 
@@ -189,4 +200,37 @@ class StyleIDEncoder(nn.Module):
         return {"num_styles": self.num_styles, "output_dim": self.output_dim, "kind": "style_id"}
 
 
-__all__ = ["GlobalStyleEncoder", "StyleIDEncoder"]
+class ConstantStyleEncoder(nn.Module):
+    """The no-reference control: one learned descriptor, no style input at all.
+
+    "Does the style branch do anything?" needs a control that cannot see style:
+    this encoder reads neither the reference tokens nor a style id nor an action
+    label, only a learned constant.  It is not a *smaller* model either: the
+    descriptor has the same width as the arm it controls, and the parameter count
+    difference (one vector versus a full encoder) is reported, not hidden.
+
+    A shuffled or permuted reference is not this control: those still feed a
+    reference-dependent input, so a difference could come from the encoder reading
+    order rather than from style.
+    """
+
+    def __init__(self, *, output_dim: int) -> None:
+        super().__init__()
+        if int(output_dim) <= 0:
+            raise ValueError("output_dim must be positive")
+        self.output_dim = int(output_dim)
+        self.descriptor = nn.Parameter(torch.zeros(1, self.output_dim))
+        nn.init.normal_(self.descriptor, std=0.02)
+
+    def forward(self, batch_size: int) -> torch.Tensor:
+        """One row per batch item; the only input is how many items there are."""
+        count = int(batch_size)
+        if count <= 0:
+            raise ValueError("ConstantStyleEncoder needs a positive batch size")
+        return self.descriptor.expand(count, self.output_dim)
+
+    def config(self) -> dict[str, Any]:
+        return {"kind": "constant", "output_dim": self.output_dim}
+
+
+__all__ = ["ConstantStyleEncoder", "GlobalStyleEncoder", "StyleIDEncoder"]

@@ -88,6 +88,21 @@ class LayoutAdapter:
     def stream_of_coordinate(self, coordinate: int) -> str:
         return str(self._metadata[int(coordinate)]["stream"])
 
+    def stream_coordinate_indices(self, *, device: torch.device | None = None) -> tuple[torch.Tensor, ...]:
+        """``[K_s]`` coordinate indices per stream, in canonical layout order.
+
+        This is the read-only index a per-stream pooling/head needs: the stream
+        slices are contiguous and already fixed by the layout, so the same order
+        used to flatten a stream is the order used to scatter its logits back.
+        """
+        return tuple(
+            torch.arange(self._slices[stream].start, self._slices[stream].stop, device=device)
+            for stream in self.stream_names
+        )
+
+    def stream_sizes(self) -> tuple[int, ...]:
+        return tuple(self._slices[stream].stop - self._slices[stream].start for stream in self.stream_names)
+
     def coordinate_indices(self, streams: Sequence[str]) -> torch.Tensor:
         """Long indices of every coordinate owned by ``streams``, sorted."""
         indices = [

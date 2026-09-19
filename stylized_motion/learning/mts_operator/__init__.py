@@ -23,11 +23,17 @@ from __future__ import annotations
 
 from .checkpoint import (
     CHECKPOINT_KINDS,
+    METRICS_SCHEMA_VERSION,
     MTS_CHECKPOINT_SCHEMA_VERSION,
+    build_provenance,
+    checkpoint_action_vocabulary,
+    checkpoint_style_index,
     checkpoint_token_spec,
     load_mts_checkpoint,
+    load_operator_bundle,
     mts_checkpoint_payload,
     save_mts_checkpoint,
+    validate_store_binding,
 )
 from .contract import (
     MASK_KINDS,
@@ -36,6 +42,7 @@ from .contract import (
     TransportOutput,
     masked_cross_entropy,
     masked_mean,
+    masked_nll_from_probs,
     operator_metadata,
     tokenizer_fingerprint,
     validate_operator_metadata,
@@ -63,7 +70,14 @@ from .sampling import (
 from .training import OperatorTrainer, TrainerConfig, TransportMetrics, TransportTrainer
 from .style_encoder import GlobalStyleEncoder, StyleIDEncoder
 from .transport import GRAPH_MODES, TEMPORAL_MODES, ContentConditioner, MotionTransportTransformer
-from .windows import read_window_tokens, windows_by_clip
+from .windows import (
+    ContentVocabulary,
+    PairedBatchSource,
+    TokenSource,
+    WindowSample,
+    read_window_tokens,
+    windows_by_clip,
+)
 
 __all__ = [
     "CHECKPOINT_KINDS",
@@ -99,13 +113,18 @@ __all__ = [
     "TransportTrainer",
     "apply_hard_support",
     "build_operator",
+    "checkpoint_action_vocabulary",
+    "checkpoint_style_index",
     "checkpoint_token_spec",
     "inverse_cdf_sample",
     "layout_adapter",
     "load_mts_checkpoint",
+    "load_operator_bundle",
     "masked_cross_entropy",
     "masked_mean",
+    "masked_nll_from_probs",
     "mts_checkpoint_payload",
+    "build_provenance",
     "operator_metadata",
     "paired_comparison",
     "read_window_tokens",
@@ -114,5 +133,9 @@ __all__ = [
     "save_mts_checkpoint",
     "tokenizer_fingerprint",
     "validate_operator_metadata",
+    "ContentVocabulary",
+    "PairedBatchSource",
+    "TokenSource",
+    "WindowSample",
     "windows_by_clip",
 ]

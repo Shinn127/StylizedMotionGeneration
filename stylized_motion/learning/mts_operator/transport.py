@@ -23,18 +23,25 @@ graph, which is an explicit, ablatable choice.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
 import torch.nn as nn
 
 from .contract import TransportOutput
-from .embeddings import StreamTokenEmbedding
+from .embeddings import DEFAULT_TOKEN_EMBED_DIM, StreamLevelHead, StreamTokenEmbedding
 from .graph import StreamGraphNetwork
 from .layout_adapter import LayoutAdapter
+from .temporal import POSITION_ENCODINGS, SinusoidalPositionEncoding
 
 GRAPH_MODES = ("local_relational", "none")
 TEMPORAL_MODES = ("bidirectional", "causal")
+
+
+#: Bumped whenever the parameter shapes change.  A checkpoint whose revision does
+#: not match must be retrained, not loaded with ``strict=False``.
+ARCHITECTURE_REVISION = 2
 
 
 class ContentConditioner(nn.Module):
@@ -52,6 +59,7 @@ class ContentConditioner(nn.Module):
         *,
         content_dim: int | None = None,
         content_classes: int | None = None,
+        content_vocabulary: Mapping[str, Any] | Any | None = None,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -134,9 +142,25 @@ class MotionTransportTransformer(nn.Module):
         temporal_mode: str = "bidirectional",
         content_dim: int | None = None,
         content_classes: int | None = None,
+        content_vocabulary: Any | None = None,
+        token_embed_dim: int = DEFAULT_TOKEN_EMBED_DIM,
+        position_encoding: str = "sinusoidal",
+        architecture_revision: int | None = None,
         feedforward_multiplier: int = 4,
     ) -> None:
         super().__init__()
+        # ``config()`` always emits ``architecture_revision`` and the checkpoint
+        # loader replays it, so a *stored* config is checked here; a model built
+        # from scratch just states the current revision.
+        if architecture_revision is not None and int(architecture_revision) != ARCHITECTURE_REVISION:
+            # A stored config from another revision describes different parameter
+            # shapes; failing here names the reason instead of leaving a
+            # load_state_dict shape error (and never loads with strict=False).
+            raise ValueError(
+                f"Stored transport architecture revision {int(architecture_revision)} != "
+                f"{ARCHITECTURE_REVISION} (per-stream embedding and head); retrain instead of "
+                "loading the old weights"
+            )
         if graph_mode not in GRAPH_MODES:
             raise ValueError(f"graph_mode must be one of {GRAPH_MODES}, got {graph_mode!r}")
         if temporal_mode not in TEMPORAL_MODES:
@@ -158,7 +182,10 @@ class MotionTransportTransformer(nn.Module):
         self.spec = adapter.token_spec()
         self.num_levels = self.spec.num_levels
 
-        self.embedding = StreamTokenEmbedding(adapter, self.dim, dropout=dropout)
+        self.token_embed_dim = int(token_embed_dim)
+        self.embedding = StreamTokenEmbedding(
+            adapter, self.dim, token_embed_dim=self.token_embed_dim, dropout=dropout
+        )
         layer = nn.TransformerEncoderLayer(
             d_model=self.dim,
             nhead=self.heads,
@@ -169,6 +196,9 @@ class MotionTransportTransformer(nn.Module):
             norm_first=True,
         )
         self.temporal = nn.TransformerEncoder(layer, num_layers=self.depth, enable_nested_tensor=False)
+        # Where a frame sits in the window; see temporal.py for why both models
+        # need it before their attention.
+        self.position_encoding = SinusoidalPositionEncoding(self.dim, kind=str(position_encoding))
         self.temporal_norm = nn.LayerNorm(self.dim)
         self.graph = StreamGraphNetwork(
             adapter,
@@ -176,8 +206,26 @@ class MotionTransportTransformer(nn.Module):
             depth=0 if self.graph_mode == "none" else int(graph_depth),
             dropout=float(dropout),
         )
-        self.output_head = nn.Linear(self.dim, self.num_levels)
-        self.coordinate_bias = nn.Embedding(self.spec.num_coordinates, self.num_levels)
+        # Per-stream heads: a stream predicts its own coordinates' levels instead of
+        # all 40 sharing one linear map over one pooled stream state.
+        self.head = StreamLevelHead(adapter, self.dim, self.num_levels)
+        # The action vocabulary travels with the model: the operator and every
+        # evaluation script inherit it from the frozen transport instead of
+        # rebuilding a map from whatever split happens to be loaded.
+        from .windows import ContentVocabulary
+
+        vocabulary = ContentVocabulary.from_dict(content_vocabulary) if isinstance(
+            content_vocabulary, Mapping
+        ) else content_vocabulary
+        self.content_vocabulary = vocabulary
+        if vocabulary is not None and content_classes is None:
+            content_classes = len(vocabulary.classes)
+        if vocabulary is not None and content_classes is not None:
+            if len(vocabulary.classes) != int(content_classes):
+                raise ValueError(
+                    f"content_vocabulary has {len(vocabulary.classes)} actions but "
+                    f"content_classes={int(content_classes)}"
+                )
         self.conditioner = (
             ContentConditioner(
                 self.dim,
@@ -191,7 +239,6 @@ class MotionTransportTransformer(nn.Module):
         self.register_buffer(
             "coordinate_stream_ids", adapter.coordinate_stream_ids(), persistent=False
         )
-        nn.init.zeros_(self.coordinate_bias.weight)
 
     def forward(
         self,
@@ -240,6 +287,7 @@ class MotionTransportTransformer(nn.Module):
         )
 
     def _temporal(self, hidden: torch.Tensor, valid_mask: torch.Tensor | None) -> torch.Tensor:
+        hidden = self.position_encoding(hidden)
         batch, frames, streams, dim = hidden.shape
         flat = hidden.permute(0, 2, 1, 3).reshape(batch * streams, frames, dim)
         padding = None
@@ -270,14 +318,8 @@ class MotionTransportTransformer(nn.Module):
         return mask
 
     def _head(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Per-coordinate logits from the owning stream's hidden state."""
-        per_stream = self.output_head(hidden)  # [B, T, 13, levels]
-        batch, frames, streams, levels = per_stream.shape
-        index = self.coordinate_stream_ids.view(1, 1, self.spec.num_coordinates, 1).expand(
-            batch, frames, self.spec.num_coordinates, levels
-        )
-        logits = per_stream.gather(2, index)
-        return logits + self.coordinate_bias.weight.view(1, 1, self.spec.num_coordinates, levels)
+        """Per-coordinate logits from the owning stream's per-stream head."""
+        return self.head(hidden)
 
     def config(self) -> dict[str, Any]:
         return {
@@ -289,10 +331,16 @@ class MotionTransportTransformer(nn.Module):
             "graph_mode": self.graph_mode,
             "graph_depth": len(self.graph.blocks),
             "temporal_mode": self.temporal_mode,
+            "architecture_revision": ARCHITECTURE_REVISION,
+            "token_embed_dim": self.token_embed_dim,
+            "position_encoding": self.position_encoding.kind,
             "content_dim": None if self.conditioner is None else self.conditioner.content_dim,
             "content_classes": None
             if self.conditioner is None
             else self.conditioner.content_classes,
+            "content_vocabulary": None
+            if self.content_vocabulary is None
+            else self.content_vocabulary.as_dict(),
         }
 
 

@@ -30,6 +30,42 @@ import numpy as np
 
 SPLIT_NAMES = ("train", "val", "test")
 PAIR_MODES = ("same_style", "different_style", "same_content")
+TARGET_SAMPLING_MODES = ("clip_uniform", "style_uniform")
+
+#: The ten 100STYLE clip suffixes.  They are **actions** (``Flapping_FW`` is the
+#: FW clip of the Flapping style), not performers: the dataset was recorded by one
+#: actor, and the ten suffixes are what the audit must not turn into ten actors.
+STYLE100_ACTIONS: tuple[str, ...] = (
+    "BR", "BW", "FR", "FW", "ID", "SR", "SW", "TR1", "TR2", "TR3",
+)
+STYLE100_PACKAGE = "100style"
+#: Dataset-level marker for the single 100STYLE actor, with its provenance.
+STYLE100_ACTOR = "100style_actor_0"
+STYLE100_ACTOR_SOURCE = "100style_single_actor_marker"
+
+
+def style100_action_family(action: str) -> str:
+    """``(BR, BW, FR, FW, ID, SR, SW, TR1, TR2, TR3)`` -> a family label.
+
+    The three transition clips belong to one family, so a per-family count does
+    not fragment into TR1/TR2/TR3.
+    """
+    text = str(action).strip().upper()
+    return "TR" if text in {"TR1", "TR2", "TR3"} else text
+
+
+def split_style100_action(name: str) -> tuple[str, str] | None:
+    """``Flapping_FW`` -> ``("Flapping", "FW")`` when the suffix is a 100STYLE action."""
+    head, separator, suffix = str(name).strip().rpartition("_")
+    if separator and head and suffix.upper() in STYLE100_ACTIONS:
+        return head, suffix.upper()
+    return None
+
+
+def is_style100_name(name: str) -> bool:
+    """True for names that carry the 100STYLE package explicitly."""
+    package, separator, tail = str(name).partition("/")
+    return bool(separator and tail) and package.lower() == STYLE100_PACKAGE
 
 
 @dataclass(frozen=True)
@@ -184,6 +220,10 @@ def build_pair_audit(
     sample_pairs: int = 512,
     seed: int = 3407,
     held_out_styles: Sequence[str] = (),
+    target_sampling: str = "clip_uniform",
+    window_frames: int | None = None,
+    dataset: str | None = None,
+    label_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The ``style_pair_audit.json`` payload of plan Phase 1.
 
@@ -195,6 +235,10 @@ def build_pair_audit(
     """
     if not records:
         raise ValueError("Pair audit needs at least one clip record")
+    if target_sampling not in TARGET_SAMPLING_MODES:
+        raise ValueError(
+            f"Unknown target_sampling {target_sampling!r}; expected {list(TARGET_SAMPLING_MODES)}"
+        )
     split = style_split or split_styles_by_performer(records, seed=seed)
     clips_per_style: Counter[str] = Counter()
     contents_per_style: dict[str, set[str]] = defaultdict(set)
@@ -224,6 +268,38 @@ def build_pair_audit(
         if performers_known
         else {}
     )
+    # The axes are computed before the warnings that read them: the earlier
+    # version referenced ``performer_axis`` 30 lines before assigning it, so the
+    # overlap warning raised UnboundLocalError instead of warning.
+    split_styles: dict[str, set[str]] = defaultdict(set)
+    split_actors: dict[str, set[str]] = defaultdict(set)
+    for record in records:
+        split_styles[record.split].add(record.style)
+        if record.performer:
+            split_actors[record.split].add(record.performer)
+    held_out = {str(style) for style in held_out_styles}
+    test_only_styles = sorted(split_styles["test"] - split_styles["train"] - split_styles["val"])
+    performer_axis = {
+        "train_actors": len(split_actors["train"]),
+        "val_actors": len(split_actors["val"]),
+        "test_actors": len(split_actors["test"]),
+        "train_test_actor_overlap": len(split_actors["train"] & split_actors["test"]),
+        "test_actor_examples": sorted(split_actors["test"])[:5],
+        "zero_shot_performer_supported": len(split_actors["train"] & split_actors["test"]) == 0
+        and len(split_actors["test"]) > 0,
+    }
+    if not performers_known:
+        performer_axis["zero_shot_performer_supported"] = False
+        performer_axis["note"] = (
+            "no actor labels were available, so no performer split can be claimed"
+        )
+    style_axis = {
+        "train_styles": sorted(split_styles["train"]),
+        "styles_in_test_only": test_only_styles,
+        "held_out_styles": sorted(held_out),
+        "zero_shot_style_supported": bool(test_only_styles or held_out),
+    }
+
     warnings: list[str] = []
     if not performers_known:
         warnings.append(
@@ -263,40 +339,55 @@ def build_pair_audit(
             "style transfer."
         )
 
-    sampler = StylePairSampler(records, style_split=split, seed=seed)
+    sampler = StylePairSampler(
+        records,
+        style_split=split,
+        seed=seed,
+        held_out_styles=sorted(held_out),
+        window_frames=window_frames,
+        target_sampling=target_sampling,
+    )
     leakage = {"same_clip": 0, "same_take": 0, "pairs": 0, "verified": 0}
-    for pair in sampler.sample(count=sample_pairs, mode="same_style"):
+    for pair in sampler.sample(count=sample_pairs, mode="same_style", target_sampling=target_sampling):
         leakage["pairs"] += 1
         leakage["verified"] += 1 if pair.same_style and not pair.same_content else 0
         leakage["same_clip"] += int(pair.same_clip)
         leakage["same_take"] += int(pair.same_take)
+    pair_report = sampler.pair_report(
+        count=sample_pairs, mode="same_style", target_sampling=target_sampling
+    )
+    configured_styles = sorted({record.style for record in records})
+    eligible_targets = sampler.eligible_targets(stage="train")
+    eligible_styles = sorted({record.style for record in eligible_targets})
+    sampled_styles = sorted(pair_report["pairs_per_style"])
+    style_vocabulary = {
+        # configured: what the run declared; eligible: what the stage could have
+        # used; sampled: what the draws actually touched.  ``len(style_split)``
+        # was previously reported as if it were the sampled vocabulary.
+        "configured": configured_styles,
+        "eligible": eligible_styles,
+        "sampled": sampled_styles,
+        "configured_count": len(configured_styles),
+        "eligible_count": len(eligible_styles),
+        "sampled_count": len(sampled_styles),
+        "eligible_target_clips": len(eligible_targets),
+        "excluded_by_window": int(pair_report["excluded_clips"].get("window_unavailable", 0)),
+        "excluded_by_holdout": int(pair_report["excluded_clips"].get("heldout_style", 0)),
+    }
+    same_style_evidence = {
+        "styles_with_evidence": sorted(
+            style for style, contents in contents_per_style.items() if len(contents) > 1
+        ),
+        "styles_without_evidence": [
+            {"style": style, "reason": "single_content_label"}
+            for style, contents in sorted(contents_per_style.items())
+            if len(contents) <= 1
+        ],
+    }
 
     styles_train = [
         style for style in split.train_styles if clips_per_style.get(style, 0) > 0
     ]
-    split_styles: dict[str, set[str]] = defaultdict(set)
-    split_actors: dict[str, set[str]] = defaultdict(set)
-    for record in records:
-        split_styles[record.split].add(record.style)
-        if record.performer:
-            split_actors[record.split].add(record.performer)
-    held_out = {str(style) for style in held_out_styles}
-    test_only_styles = sorted(split_styles["test"] - split_styles["train"] - split_styles["val"])
-    performer_axis = {
-        "train_actors": len(split_actors["train"]),
-        "val_actors": len(split_actors["val"]),
-        "test_actors": len(split_actors["test"]),
-        "train_test_actor_overlap": len(split_actors["train"] & split_actors["test"]),
-        "test_actor_examples": sorted(split_actors["test"])[:5],
-        "zero_shot_performer_supported": len(split_actors["train"] & split_actors["test"]) == 0
-        and len(split_actors["test"]) > 0,
-    }
-    style_axis = {
-        "train_styles": sorted(split_styles["train"]),
-        "styles_in_test_only": test_only_styles,
-        "held_out_styles": sorted(held_out),
-        "zero_shot_style_supported": bool(test_only_styles or held_out),
-    }
     if not style_axis["zero_shot_style_supported"]:
         warnings.append(
             "No style is exclusive to the held-out actors, so this split supports the "
@@ -318,6 +409,14 @@ def build_pair_audit(
         "performer_overlap": performer_overlap,
         "performer_axis": performer_axis,
         "style_axis": style_axis,
+        "style_vocabulary": style_vocabulary,
+        "same_style_evidence": same_style_evidence,
+        "pair_report": pair_report,
+        "label_provenance": dict(label_provenance or {}),
+        "target_sampling": target_sampling,
+        "window_frames": None if window_frames is None else int(window_frames),
+        "dataset": None if dataset is None else str(dataset),
+        "held_out_styles": sorted(held_out),
         "style_balance": {
             "dominant_style": dominant_style,
             "dominant_share": float(dominant_share),
@@ -366,9 +465,17 @@ class StylePairSampler:
         allow_same_take: bool = False,
         held_out_styles: Sequence[str] = (),
         use_data_splits: bool = True,
+        window_frames: int | None = None,
+        target_sampling: str = "clip_uniform",
     ) -> None:
         if not records:
             raise ValueError("StylePairSampler needs at least one clip record")
+        if target_sampling not in TARGET_SAMPLING_MODES:
+            raise ValueError(
+                f"Unknown target_sampling {target_sampling!r}; expected {list(TARGET_SAMPLING_MODES)}"
+            )
+        if window_frames is not None and int(window_frames) <= 0:
+            raise ValueError("window_frames must be positive when given")
         self.records = list(records)
         self.style_split = style_split or split_styles_by_performer(self.records, seed=seed)
         self.seed = int(seed)
@@ -377,6 +484,14 @@ class StylePairSampler:
         self.held_out_styles = {str(style) for style in held_out_styles}
         #: When records carry a real split (an actor holdout), stage follows it.
         self.use_data_splits = bool(use_data_splits)
+        #: Clips shorter than this cannot provide a training window and are never
+        #: paired; ``None`` means the caller already filtered them.
+        self.window_frames = None if window_frames is None else int(window_frames)
+        self.target_sampling = str(target_sampling)
+        #: Why a candidate was rejected, counted over the sampler's lifetime.
+        self.rejections: Counter[str] = Counter()
+        self.targets_skipped: Counter[str] = Counter()
+        self.draw_attempts = 0
         self._by_style: dict[str, list[ClipRecord]] = defaultdict(list)
         for record in self.records:
             self._by_style[record.style].append(record)
@@ -441,6 +556,55 @@ class StylePairSampler:
             ]
         return self.records
 
+    def has_window(self, record: ClipRecord) -> bool:
+        """Whether the clip can supply a training window at all."""
+        return self.window_frames is None or int(record.frames) >= self.window_frames
+
+    def _reject_reason(
+        self,
+        record: ClipRecord,
+        target: ClipRecord,
+        *,
+        mode: str,
+        split: str | None,
+        allowed: set[str] | None,
+        stage: str,
+    ) -> str | None:
+        """Why ``record`` may not be ``target``'s reference, or ``None``."""
+        if not self.has_window(record):
+            return "window_unavailable"
+        if record.clip_id == target.clip_id:
+            return "same_clip"
+        if not self.allow_same_take and record.source_group >= 0 and record.source_group == target.source_group:
+            return "same_take"
+        if record.split != target.split:
+            # A held-out actor's clip must never be a training reference, even
+            # when the stage selects by style vocabulary rather than by split.
+            return "cross_split"
+        if allowed is not None and record.style not in allowed:
+            return "style_not_in_stage"
+        if stage == "train" and record.style in self.held_out_styles:
+            # The held-out filter used to apply only when the stage resolved to a
+            # data split, so a style held out for the unseen-style axis was still
+            # sampled in the vocabulary-only path.
+            return "heldout_style"
+        # The evidence each mode is supposed to carry.
+        if mode == "same_style":
+            if record.style != target.style:
+                return "not_same_style"
+            if record.content == target.content:
+                return "same_content"
+            return None
+        if mode == "same_content":
+            if record.content != target.content:
+                return "not_same_content"
+            if record.style == target.style:
+                return "same_style"
+            return None
+        if record.style == target.style:
+            return "not_different_style"
+        return None
+
     def _accepts(
         self,
         record: ClipRecord,
@@ -449,21 +613,14 @@ class StylePairSampler:
         mode: str,
         split: str | None,
         allowed: set[str] | None,
+        stage: str = "train",
     ) -> bool:
-        if record.clip_id == target.clip_id:
-            return False
-        if not self.allow_same_take and record.source_group >= 0 and record.source_group == target.source_group:
-            return False
-        if allowed is not None and record.style not in allowed:
-            return False
-        if split == "train" and record.style in self.held_out_styles:
-            return False
-        # The evidence each mode is supposed to carry.
-        if mode == "same_style":
-            return record.style == target.style and record.content != target.content
-        if mode == "same_content":
-            return record.content == target.content and record.style != target.style
-        return record.style != target.style
+        return (
+            self._reject_reason(
+                record, target, mode=mode, split=split, allowed=allowed, stage=stage
+            )
+            is None
+        )
 
     def draw_candidate(
         self,
@@ -485,11 +642,18 @@ class StylePairSampler:
         allowed = set(self.styles_for_stage(stage)) if split is None and stage != "all" else None
         bucket = self._bucket(target, mode=mode, split=split, allowed=allowed)
         if not bucket:
+            self.rejections["empty_bucket"] += 1
             return None
         for _ in range(int(attempts)):
+            self.draw_attempts += 1
             record = bucket[int(rng.integers(len(bucket)))]
-            if self._accepts(record, target, mode=mode, split=split, allowed=allowed):
+            reason = self._reject_reason(
+                record, target, mode=mode, split=split, allowed=allowed, stage=stage
+            )
+            if reason is None:
                 return record
+            self.rejections[reason] += 1
+        self.rejections["attempts_exhausted"] += 1
         return None
 
     def candidates(
@@ -514,7 +678,10 @@ class StylePairSampler:
         return [
             record
             for record in bucket
-            if self._accepts(record, target, mode=mode, split=split, allowed=allowed)
+            if self._reject_reason(
+                record, target, mode=mode, split=split, allowed=allowed, stage=stage
+            )
+            is None
         ]
 
     def pairs_for(
@@ -540,6 +707,32 @@ class StylePairSampler:
             pairs.append(StylePair(target=target, reference=reference, mode=mode))
         return pairs
 
+    def _target_reason(self, target: ClipRecord, *, stage: str) -> str | None:
+        """Why ``target`` cannot be used as a target in this stage, or ``None``."""
+        if not self.has_window(target):
+            return "window_unavailable"
+        split = self._stage_split(stage)
+        if split is not None and target.split != split:
+            return "cross_split"
+        if stage == "train" and target.style in self.held_out_styles:
+            return "heldout_style"
+        if split is None and stage != "all":
+            allowed = set(self.styles_for_stage(stage))
+            if target.style not in allowed:
+                return "style_not_in_stage"
+        return None
+
+    def eligible_targets(
+        self, *, stage: str = "train", targets: Sequence[ClipRecord] | None = None
+    ) -> list[ClipRecord]:
+        """Targets the stage may use at all (window, split, holdout filters).
+
+        Exposed so an audit can report the *eligible* vocabulary instead of
+        quoting the configured one as if it had been sampled.
+        """
+        pool = list(self.records) if targets is None else list(targets)
+        return [record for record in pool if self._target_reason(record, stage=stage) is None]
+
     def sample(
         self,
         *,
@@ -548,8 +741,16 @@ class StylePairSampler:
         stage: str = "train",
         targets: Sequence[ClipRecord] | None = None,
         generator: np.random.Generator | None = None,
+        target_sampling: str | None = None,
     ) -> list[StylePair]:
         """Draws ``count`` pairs, preferring targets that have references.
+
+        ``target_sampling`` is ``clip_uniform`` (every eligible clip is equally
+        likely to be a target) or ``style_uniform`` (every eligible style is
+        equally likely, then a clip of that style) — the latter is what keeps a
+        majority style from dominating the objective.  Explicit ``targets`` are
+        validated, not trusted: a target from another split or a held-out style is
+        rejected with a reason instead of being paired.
 
         ``generator`` is a ``numpy.random.Generator``; the pairing logic is index
         arithmetic over clip records, not tensor sampling.
@@ -558,6 +759,11 @@ class StylePairSampler:
             raise TypeError(
                 "StylePairSampler needs a numpy.random.Generator, got "
                 f"{type(generator).__name__}"
+            )
+        strategy = str(target_sampling or self.target_sampling)
+        if strategy not in TARGET_SAMPLING_MODES:
+            raise ValueError(
+                f"Unknown target_sampling {strategy!r}; expected {list(TARGET_SAMPLING_MODES)}"
             )
         rng = generator or np.random.default_rng(self.seed)
         split = self._stage_split(stage)
@@ -568,24 +774,137 @@ class StylePairSampler:
         else:
             allowed = set(self.styles_for_stage(stage))
             pool = [record for style in allowed for record in self._by_style_all.get(style, [])]
-        if not pool:
+        eligible: list[ClipRecord] = []
+        for record in pool:
+            reason = self._target_reason(record, stage=stage)
+            if reason is None:
+                eligible.append(record)
+            else:
+                self.targets_skipped[reason] += 1
+        if not eligible:
             return []
-        order = rng.permutation(len(pool))
+        order = self._target_order(eligible, strategy=strategy, rng=rng)
         pairs: list[StylePair] = []
-        for index in order:
-            target = pool[int(index)]
-            drawn = self.pairs_for(
-                target, mode=mode, count=1, stage=stage, generator=rng
-            )
+        for target in order:
+            drawn = self.pairs_for(target, mode=mode, count=1, stage=stage, generator=rng)
             if drawn:
                 pairs.append(drawn[0])
             if len(pairs) >= int(count):
                 break
         return pairs
 
-    def write_audit(self, path: str | Path, *, sample_pairs: int = 512) -> dict[str, Any]:
+    def _target_order(
+        self, eligible: Sequence[ClipRecord], *, strategy: str, rng: np.random.Generator
+    ) -> list[ClipRecord]:
+        """The order targets are tried in, drawn without duplicating clips.
+
+        ``style_uniform`` draws a style first and then a clip of that style, so a
+        style with 10% of the clips is not 10x less likely to be trained on.  Rare
+        clips are never copied to balance anything: the pool is the real catalogue.
+        """
+        if strategy == "clip_uniform":
+            order = rng.permutation(len(eligible))
+            return [eligible[int(index)] for index in order]
+        by_style: dict[str, list[ClipRecord]] = defaultdict(list)
+        for record in eligible:
+            by_style[record.style].append(record)
+        styles = sorted(by_style)
+        style_order = [styles[int(index)] for index in rng.permutation(len(styles))]
+        queues = {
+            style: [by_style[style][int(position)] for position in rng.permutation(len(by_style[style]))]
+            for style in styles
+        }
+        # Round robin: every round offers each style its next clip, so a style with
+        # 100k clips does not take the whole draw.  Exhausting one style before
+        # moving on looked like a style-uniform schedule but sampled a single style
+        # for as long as that style had clips left (on SEED: 256/256 pairs).
+        clips: list[ClipRecord] = []
+        remaining = [style for style in style_order]
+        while remaining:
+            for style in list(remaining):
+                queue = queues[style]
+                if not queue:
+                    remaining.remove(style)
+                    continue
+                clips.append(queue.pop())
+        return clips
+
+    def pair_report(
+        self,
+        *,
+        count: int,
+        mode: str = "same_style",
+        stage: str = "train",
+        target_sampling: str | None = None,
+        targets: Sequence[ClipRecord] | None = None,
+    ) -> dict[str, Any]:
+        """Draws ``count`` pairs and reports what was used and what was rejected."""
+        before = Counter(self.rejections)
+        skipped_before = Counter(self.targets_skipped)
+        pairs = self.sample(
+            count=count,
+            mode=mode,
+            stage=stage,
+            targets=targets,
+            target_sampling=target_sampling,
+        )
+        per_style: Counter[str] = Counter(pair.target.style for pair in pairs)
+        per_action: Counter[str] = Counter(pair.target.content for pair in pairs)
+        per_action_family: Counter[str] = Counter(
+            style100_action_family(pair.target.content) for pair in pairs
+        )
+        per_actor: Counter[str] = Counter(
+            pair.target.performer or "unknown" for pair in pairs
+        )
+        return {
+            "mode": mode,
+            "stage": stage,
+            "target_sampling": str(target_sampling or self.target_sampling),
+            "pairs": len(pairs),
+            "pairs_per_style": {style: int(per_style[style]) for style in sorted(per_style)},
+            "pairs_per_action": {action: int(per_action[action]) for action in sorted(per_action)},
+            "pairs_per_action_family": {
+                family: int(per_action_family[family]) for family in sorted(per_action_family)
+            },
+            "pairs_per_actor": {actor: int(per_actor[actor]) for actor in sorted(per_actor)},
+            "rejections": {
+                reason: int(self.rejections[reason] - before[reason])
+                for reason in sorted(self.rejections)
+            },
+            "targets_skipped": {
+                reason: int(self.targets_skipped[reason] - skipped_before[reason])
+                for reason in sorted(self.targets_skipped)
+            },
+            "excluded_clips": {
+                "window_unavailable": sum(
+                    1 for record in self.records if not self.has_window(record)
+                ),
+                "heldout_style": sum(
+                    1 for record in self.records if record.style in self.held_out_styles
+                ),
+            },
+            "unique_targets": len({pair.target.clip_id for pair in pairs}),
+            "unique_references": len({pair.reference.clip_id for pair in pairs}),
+        }
+
+    def write_audit(
+        self,
+        path: str | Path,
+        *,
+        sample_pairs: int = 512,
+        dataset: str | None = None,
+        label_provenance: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         audit = build_pair_audit(
-            self.records, style_split=self.style_split, sample_pairs=sample_pairs, seed=self.seed
+            self.records,
+            style_split=self.style_split,
+            sample_pairs=sample_pairs,
+            seed=self.seed,
+            held_out_styles=sorted(self.held_out_styles),
+            target_sampling=self.target_sampling,
+            window_frames=self.window_frames,
+            dataset=dataset,
+            label_provenance=label_provenance,
         )
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -605,39 +924,105 @@ def split_style_name(name: str) -> tuple[str, str]:
     return str(name), ""
 
 
-def labels_from_name(name: str) -> tuple[str, str, str]:
+def labels_from_name(name: str, *, dataset: str | None = None) -> tuple[str, str, str]:
     """``(style, content, performer)`` derived from one clip name.
 
-    Covers the naming conventions in this repo:
+    The 100STYLE rule applies **only** to an explicitly 100STYLE source (the
+    ``100style/`` package prefix, or ``dataset="100style"``): the suffix is the
+    action and the performer is the dataset-level single-actor marker.
 
-    * ``100style/Flapping_TR1`` -> ``("Flapping", "100style/Flapping_TR1", "TR1")``;
+    * ``100style/Flapping_FW`` -> ``("Flapping", "FW", "100style_actor_0")``;
     * ``lafan/aiming1_subject1`` -> ``("lafan", "lafan/aiming1_subject1", "subject1")``;
-    * ``Aeroplane_BR`` -> ``("Aeroplane", "Aeroplane_BR", "BR")``.
+    * ``Aeroplane_BR`` with no dataset -> ``("Aeroplane", "Aeroplane_BR", "")``:
+      the suffix still groups the style, but it is never claimed as a performer
+      (``BR``/``FW``/... are actions, and an unknown dataset must not borrow
+      100STYLE's conventions).
 
-    ``content`` is the clip identity, so two references of the same style with
-    different performers count as different content — which is exactly the
-    same-style / different-content evidence the operator needs.  Style labels
-    that the dataset provides itself always override this derivation.
+    ``content`` is the clip identity, so two clips of the same style count as
+    different content — the same-style / different-content evidence the operator
+    needs.  Style labels the dataset provides itself always override this.
     """
     text = str(name)
     package, separator, tail = text.partition("/")
+    style100 = str(dataset or "").lower() == STYLE100_PACKAGE or (
+        bool(separator and tail) and package.lower() == STYLE100_PACKAGE
+    )
+    if style100:
+        body = tail if separator and tail else text
+        action = split_style100_action(body)
+        if action is not None:
+            style, action_name = action
+            return style, action_name, STYLE100_ACTOR
+        # Not a 100STYLE clip name: fall through to the generic reading instead of
+        # flattening the label, so a mixed store keeps its packages and explicit
+        # ``..._subjectN`` labels intact.
     if separator and tail:
         head, underscore, suffix = tail.rpartition("_")
-        if underscore and head and suffix.startswith("subject"):
+        if underscore and head and suffix.lower().startswith("subject"):
             return package, text, suffix
-        style, performer = split_style_name(tail)
-        if performer:
-            return style, text, performer
         return package, text, ""
-    style, performer = split_style_name(text)
-    return style, text, performer
+    style, _suffix = split_style_name(text)
+    return style, text, ""
 
 
-def clip_records_from_store(store: Any) -> list[ClipRecord]:
+def clip_label_from_tables(
+    store: Any, row: int, *, dataset: str | None = None
+) -> dict[str, str]:
+    """``(style, content, performer)`` of one range/clip row, table first.
+
+    The single-row version of :func:`clip_records_from_store`, with the same
+    conventions: explicit store columns win over name parsing, the 100STYLE suffix
+    rule applies only to an explicitly 100STYLE source, and ``performer`` is empty
+    ("unknown") rather than invented when the store has no actor information.  The
+    data loaders attach this to a batch so a conditioned model reads the same
+    labels the vocabulary was built from.
+    """
+    row = int(row)
+    if hasattr(store, "clip_label"):
+        label = store.clip_label(row)
+        return {
+            "style": str(label.get("style") or f"style_{label.get('source_id')}"),
+            "action": str(
+                label.get("action") or label.get("package") or f"content_{label.get('source_id')}"
+            ),
+            "performer": _performer_from_store(store, row, int(label.get("source_group", -1))),
+        }
+    style_names = tuple(getattr(store, "style_names", ()))
+    action_names = tuple(getattr(store, "action_names", ()))
+    style100 = str(dataset or "").lower() == STYLE100_PACKAGE
+    style, content, performer = labels_from_name(store.range_names[row], dataset=dataset)
+    if style_names:
+        style_id = int(np.asarray(store.style_ids)[row])
+        if 0 <= style_id < len(style_names):
+            style = str(style_names[style_id])
+            if style100:
+                # Explicit style column, with a 100STYLE suffix still split off as
+                # the action; no performer is read out of the style label.
+                action = split_style100_action(style)
+                if action is not None:
+                    style, action_name = action
+                    performer = performer or STYLE100_ACTOR
+                    if not action_names:
+                        content = action_name
+    if action_names:
+        action_id = int(np.asarray(store.action_ids)[row])
+        if 0 <= action_id < len(action_names):
+            content = str(action_names[action_id])
+    return {"style": style, "action": content, "performer": performer}
+
+
+def clip_records_from_store(store: Any, *, dataset: str | None = None) -> list[ClipRecord]:
     """Builds clip records from a v3 feature store or a v4 packed store.
 
     Splits come from the store's own table (``split_ids`` / ``clip_split``), so a
     pair audit can never disagree with the data pipeline about what is held out.
+
+    Explicit store metadata wins over name parsing: the style/action columns and
+    the actor table are used as they are.  The name fallback only reports what it
+    can support — a style group, plus a performer when the name really carries an
+    actor label (``..._subjectN``) — and it never re-parses a style label to
+    invent an actor, which is how the old code turned ``Flapping_FW`` into an
+    "actor FW".  Pass ``dataset="100style"`` to opt into the 100STYLE suffix rule.
     """
     records: list[ClipRecord] = []
     if hasattr(store, "clip_label"):
@@ -668,16 +1053,8 @@ def clip_records_from_store(store: Any) -> list[ClipRecord]:
     style_names = tuple(getattr(store, "style_names", ()))
     action_names = tuple(getattr(store, "action_names", ()))
     for row, name in enumerate(tuple(store.range_names)):
-        style, content, performer = labels_from_name(name)
-        if style_names:
-            style_id = int(np.asarray(store.style_ids)[row])
-            if 0 <= style_id < len(style_names):
-                style, named_performer = split_style_name(style_names[style_id])
-                performer = performer or named_performer
-        if action_names:
-            action_id = int(np.asarray(store.action_ids)[row])
-            if 0 <= action_id < len(action_names):
-                content = str(action_names[action_id])
+        labels = clip_label_from_tables(store, row, dataset=dataset)
+        style, content, performer = labels["style"], labels["action"], labels["performer"]
         split_id = int(np.asarray(store.split_ids)[row])
         start = int(np.asarray(store.range_starts)[row])
         stop = int(np.asarray(store.range_stops)[row])
@@ -712,26 +1089,36 @@ def _performer_from_store(store: Any, row: int, group: int) -> str:
         index = int(ids[int(row)])
         if 0 <= index < len(names):
             return str(names[index])
-    for attribute in ("source_actor_names", "actor_names", "source_group_names"):
+    # An actor column, not a group id: ``source_group_names`` is deliberately not
+    # consulted, because a group is a take identity, and calling it a performer
+    # would make the overlap analysis look measured when it only reported groups.
+    for attribute in ("source_actor_names", "actor_names"):
         labels = getattr(store, attribute, None)
         if not labels:
             continue
-        index = int(group) if attribute == "source_group_names" else int(row)
-        if 0 <= index < len(labels):
-            return str(labels[index])
+        if 0 <= int(row) < len(labels):
+            return str(labels[int(row)])
     return ""
 
 
 __all__ = [
     "PAIR_MODES",
     "SPLIT_NAMES",
+    "STYLE100_ACTIONS",
+    "STYLE100_ACTOR",
+    "STYLE100_ACTOR_SOURCE",
+    "TARGET_SAMPLING_MODES",
     "ClipRecord",
     "StylePair",
     "StylePairSampler",
     "StyleSplit",
     "build_pair_audit",
+    "clip_label_from_tables",
     "clip_records_from_store",
+    "is_style100_name",
     "labels_from_name",
+    "split_style100_action",
     "split_style_name",
+    "style100_action_family",
     "split_styles_by_performer",
 ]

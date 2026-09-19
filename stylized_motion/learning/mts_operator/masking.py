@@ -265,7 +265,10 @@ def apply_hard_support(
 
     ``restrict`` supervises only inside the support (style authoring inside a
     region); ``expand`` hides everything outside it (content must be preserved
-    there).  Both keep at least one supervised position per sample.
+    there).  Both keep at least one supervised position per sample, and the
+    fallback position is drawn from *the region that mode supervises*: the old
+    code always hid a position outside the support, so ``restrict`` could quietly
+    supervise a token it had promised not to touch.
     """
     if mode not in {"restrict", "expand"}:
         raise ValueError(f"Unsupported support mode {mode!r}")
@@ -278,13 +281,15 @@ def apply_hard_support(
     region = support.view(1, *support.shape)
     visible = (visible | ~region) if mode == "restrict" else (visible & region)
     supervision = ~visible
-    unsupported = torch.nonzero(~support)
+    allowed = torch.nonzero(support if mode == "restrict" else ~support)
+    if allowed.numel() == 0:
+        raise ValueError(
+            f"A support mask that covers every position cannot supervise anything in {mode!r} mode"
+        )
     missing = torch.nonzero(~supervision.any(dim=(1, 2))).flatten().tolist()
     if missing:
-        if unsupported.numel() == 0:
-            raise ValueError("A support mask that covers every position cannot supervise anything")
         visible = visible.clone()
-        pick = unsupported[0]
+        pick = allowed[0]
         for row in missing:
             # Hide a position the caller asked to supervise; deterministic so
             # the same mask always yields the same batch.

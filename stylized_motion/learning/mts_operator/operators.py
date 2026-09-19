@@ -8,20 +8,28 @@ Three families, in the order the plan wants them compared (plan §6):
 ``arbitrary_kernel``
     A learned row-stochastic kernel applied to the base probabilities.  It has
     the most freedom and none of the structure — no generator, no semigroup, and
-    therefore no identity anchor at ``strength=0``, which is exactly why it is
-    the control condition rather than the proposal.
+    therefore no identity anchor at ``strength=0`` (the kernel becomes uniform
+    inside its region), which is exactly why it is the control condition rather
+    than the proposal.  ``identity_mix=True`` is the variant where ``strength`` is
+    a mixture weight in ``[0, 1]`` instead: ``0`` is the base, ``1`` the learned
+    kernel.
 ``birth_death``
     A birth-death CTMC on the level axis.  Rates live only on adjacent levels,
     the generator is built from them, and the styled distribution is
     ``exp(Q) p0`` computed by adaptive uniformization.
 
-Every operator shares one support rule (plan §6.4)::
+Every operator shares one region rule (plan §1.1)::
 
-    effective = strength * hard_mask * visibility
+    eligible  = hard_mask & editability & valid_mask[..., None]      (bool)
+    strength  = how far the operator moves *inside* that region      (float)
 
-where ``visibility`` can only *reduce* an already-visible position and never
-escape ``hard_mask``.  ``hard_mask == 0`` therefore implies ``Q == 0`` and
-``styled == base`` for every family.
+``editability`` can only reduce the region and never escapes ``hard_mask``, so
+``eligible == 0`` implies ``styled == base`` bit for bit in every family — the
+final blend is ``where(eligible, transformed, base)``, not a side effect of
+``strength`` being zero.  Keeping the bool region and the float strength apart is
+what makes ``lambda = 0`` comparability work: the arbitrary kernel has no
+identity anchor, so at ``lambda = 0`` it *is* uniform inside its region and the
+base outside it, while the logit field and the CTMC are exactly the base.
 """
 
 from __future__ import annotations
@@ -121,6 +129,10 @@ class OperatorOutput:
     def __post_init__(self) -> None:
         if self.probabilities.ndim != 4:
             raise ValueError("operator probabilities must be [B, T, 40, L]")
+        # Finiteness first: a NaN fails every ``<``/``>`` comparison, so the
+        # negative and mass checks below would wave it through.
+        if not bool(torch.isfinite(self.probabilities).all()):
+            raise ValueError("operator probabilities must be finite")
         if bool((self.probabilities < 0).any()):
             raise ValueError("operator returned negative probabilities")
         if bool((self.probabilities.sum(dim=-1) - 1.0).abs().max() > 1e-4):
@@ -187,22 +199,54 @@ class StyleOperator(nn.Module):
             device=inputs.base_logits.device,
         )
 
-    def support(self, inputs: OperatorInputs) -> torch.Tensor:
-        """``[B, T, 40]`` float support: strength x hard mask x editability."""
-        strength = self._strength_tensor(inputs)
-        allowed = self.editability(inputs)
-        support = allowed.to(inputs.base_logits.dtype)
+    def eligible(self, inputs: OperatorInputs) -> torch.Tensor:
+        """``[B, T, 40]`` bool region the operator may act on at all.
+
+        ``hard_mask & editability & valid_mask[..., None]``: the plan's
+        ``effective_edit``.  Deliberately independent of ``strength`` — a region
+        is a set, ``lambda`` is a magnitude, and conflating them made an empty
+        region indistinguishable from ``lambda = 0``.
+        """
+        eligible = self.editability(inputs)
         hard = inputs.hard_mask
         if hard is not None:
             hard_tensor = hard.to(inputs.base_logits.device).bool()
             if hard_tensor.ndim == 2:
                 hard_tensor = hard_tensor.unsqueeze(0)
+            if hard_tensor.shape[0] not in (1, inputs.batch):
+                raise ValueError(
+                    f"hard_mask batch {hard_tensor.shape[0]} matches neither 1 nor {inputs.batch}"
+                )
             # The hard region can only narrow the edit set, never widen it.
-            support = support * hard_tensor.to(support.dtype)
+            eligible = eligible & hard_tensor
         if inputs.valid_mask is not None:
             valid = inputs.valid_mask.to(inputs.base_logits.device).bool().unsqueeze(-1)
-            support = support * valid.to(support.dtype)
-        return support * strength
+            eligible = eligible & valid
+        return eligible
+
+    def support(self, inputs: OperatorInputs) -> torch.Tensor:
+        """``[B, T, 40]`` float support: eligibility scaled by ``strength``."""
+        return self.eligible(inputs).to(inputs.base_logits.dtype) * self._strength_tensor(inputs)
+
+    def region_identity(
+        self, inputs: OperatorInputs, transformed: torch.Tensor
+    ) -> torch.Tensor:
+        """Keeps ``transformed`` inside the region and the base distribution outside."""
+        return torch.where(
+            self.eligible(inputs).unsqueeze(-1), transformed, inputs.base_probabilities()
+        )
+
+    @staticmethod
+    def _offdiagonal_mass(kernel: torch.Tensor) -> torch.Tensor:
+        """Sum of the off-diagonal kernel entries, ``[...]`` per position.
+
+        Subtracting the diagonal *value* from every entry of its row (the old
+        formula) is not an off-diagonal sum; it measured a different number.  For
+        a row-stochastic kernel this is ``levels - trace`` per position, so divide
+        by ``levels`` to read it as a fraction of the moved mass.
+        """
+        diagonal = kernel.diagonal(dim1=-2, dim2=-1)
+        return kernel.sum(dim=(-1, -2)) - diagonal.sum(dim=-1)
 
     @property
     def context_width(self) -> int:
@@ -329,14 +373,20 @@ class AdditiveLogitField(StyleOperator):
         nn.init.zeros_(self.delta_head[-1].bias)
 
     def forward(self, inputs: OperatorInputs) -> OperatorOutput:
+        eligible = self.eligible(inputs)
         support = self.support(inputs)
         delta = self.delta_head(self.condition(inputs))
         styled_logits = inputs.base_logits + support.unsqueeze(-1) * delta
+        # Outside the region the logits are the base logits, whatever the delta
+        # head produced there (including a non-finite value); inside, lambda = 0
+        # still leaves the base logits untouched.
+        styled_logits = torch.where(eligible.unsqueeze(-1), styled_logits, inputs.base_logits)
         return OperatorOutput(
             probabilities=styled_logits.softmax(dim=-1),
             logits=styled_logits,
             diagnostics={
-                "support_fraction": support.mean(),
+                "support_fraction": eligible.float().mean(),
+                "strength_mean": self._strength_tensor(inputs).mean(),
                 "delta_abs_mean": delta.abs().mean(),
             },
         )
@@ -371,30 +421,45 @@ class ArbitraryKernelOperator(StyleOperator):
         nn.init.zeros_(self.kernel_head[-1].bias)
 
     def forward(self, inputs: OperatorInputs) -> OperatorOutput:
-        support = self.support(inputs)
+        eligible = self.eligible(inputs)
+        strength = self._strength_tensor(inputs)
+        if self.identity_mix and bool((strength > 1.0).any()):
+            raise ValueError(
+                "identity_mix=True requires 0 <= strength <= 1 so the kernel stays a "
+                f"mixture, got up to {float(strength.max()):.3f}"
+            )
         levels = self.num_levels
         kernel_logits = self.kernel_head(self.condition(inputs)).reshape(
             inputs.batch, inputs.frames, inputs.coordinates, levels, levels
         )
-        # strength scales how far the kernel may move away from uniform.
-        kernel = (kernel_logits * support.unsqueeze(-1).unsqueeze(-1)).softmax(dim=-1)
         if self.identity_mix:
-            identity = torch.eye(levels, device=kernel.device, dtype=kernel.dtype)
-            kernel = (1.0 - support).unsqueeze(-1).unsqueeze(-1) * identity + support.unsqueeze(
-                -1
-            ).unsqueeze(-1) * kernel
+            # Mixture semantics: the learned kernel is the target and strength is
+            # the weight of identity, so lambda = 0 is exactly the base and
+            # lambda = 1 the learned kernel (validated to [0, 1] above).
+            learned = kernel_logits.softmax(dim=-1)
+            identity = torch.eye(levels, device=kernel_logits.device, dtype=kernel_logits.dtype)
+            mix = strength.unsqueeze(-1).unsqueeze(-1)
+            kernel = (1.0 - mix) * identity + mix * learned
+        else:
+            # No identity anchor: strength scales how far the kernel may move away
+            # from uniform, and the region is applied by the final blend, never by
+            # zeroing the logits.
+            kernel = (kernel_logits * strength.unsqueeze(-1).unsqueeze(-1)).softmax(dim=-1)
         base = inputs.base_probabilities()
-        styled = torch.einsum("btki,btkij->btkj", base, kernel)
+        transformed = torch.einsum("btki,btkij->btkj", base, kernel)
+        styled = self.region_identity(inputs, transformed)
+        offdiagonal = self._offdiagonal_mass(kernel)
         return OperatorOutput(
             probabilities=styled,
             diagnostics={
-                "support_fraction": support.mean(),
+                "support_fraction": eligible.float().mean(),
+                "strength_mean": strength.mean(),
                 "kernel_offdiagonal_mass": (
-                    kernel - kernel.diagonal(dim1=-2, dim2=-1).unsqueeze(-1)
-                )
-                .clamp_min(0.0)
-                .sum(dim=(-1, -2))
-                .mean(),
+                    offdiagonal * eligible
+                ).sum()
+                / eligible.sum().clamp_min(1),
+                "kernel_offdiagonal_mass_all": offdiagonal.mean(),
+                "kernel_offdiagonal_ratio": offdiagonal.mean() / levels,
             },
         )
 
@@ -467,6 +532,10 @@ def uniformization_expm_apply(
     levels = probabilities.shape[-1]
     if generator.shape[-2:] != (levels, levels):
         raise ValueError("generator must be square over the level axis")
+    if not bool(torch.isfinite(generator).all()):
+        raise ValueError("generator contains non-finite rates")
+    if not bool(torch.isfinite(probabilities).all()):
+        raise ValueError("probabilities contain non-finite values")
     # p -> p^T exp(Q) == exp(Q^T) p: transpose once so the series acts on the
     # column convention this operator uses.
     transposed = generator.transpose(-1, -2)
@@ -475,6 +544,15 @@ def uniformization_expm_apply(
     terms, tail = poisson_term_count(
         float(nu.detach().max()), tolerance=tolerance, max_terms=max_terms
     )
+    if tail > tolerance:
+        # A truncated series that keeps only part of the Poisson mass cannot be
+        # repaired by renormalizing: that would hide how much of the operator was
+        # dropped.  Fail with the numbers instead.
+        raise ValueError(
+            f"uniformization truncated: Poisson tail {tail:.3e} still exceeds tolerance "
+            f"{tolerance:.3e} after max_terms={max_terms} at row scale "
+            f"{float(nu.max()):.3f}; raise max_terms or the tolerance"
+        )
     active = nu > 0.0
     scale = torch.where(active, nu, torch.ones_like(nu))
     # Poisson(k; nu) per element: the series is elementwise, so a shared weight
@@ -486,7 +564,15 @@ def uniformization_expm_apply(
         if index > 0:
             log_factorial += math.log(index)
         log_weights.append(-nu + index * log_nu - log_factorial)
-    weights = torch.stack(log_weights, dim=-1).exp().unsqueeze(-1)  # [..., terms, 1]
+    weights = torch.stack(log_weights, dim=-1).exp()
+    if not bool(active.all()):
+        # An inactive element has row scale zero: its Poisson weight vector is
+        # (1, 0, ..., 0) exactly.  Leaving 1/k! there inflated the accumulated
+        # mass by ~e and made the mass-error diagnostic meaningless.
+        first_only = torch.zeros_like(weights)
+        first_only[..., 0] = 1.0
+        weights = torch.where(active.unsqueeze(-1), weights, first_only)
+    weights = weights.unsqueeze(-1)  # [..., terms, 1]
 
     step = probabilities
     accumulated = weights[..., 0, :] * probabilities
@@ -500,12 +586,23 @@ def uniformization_expm_apply(
             "uniformization_terms": generator.new_tensor(0.0),
             "poisson_tail": generator.new_tensor(0.0),
             "mass_error": generator.new_tensor(0.0),
+            "mass_tolerance": generator.new_tensor(
+                float(1e-9 if probabilities.dtype == torch.float64 else 1e-5)
+            ),
             "min_probability_before_clamp": generator.new_tensor(float(probabilities.min())),
         }
     # A truncated series can leave a small negative or a mass error; both are
-    # reported instead of claiming an exact semigroup application.
+    # checked against a dtype-aware tolerance and reported separately from the
+    # theoretical Poisson tail instead of claiming an exact semigroup.
     mass_error = (accumulated.sum(dim=-1) - 1.0).abs().amax()
     negative_before = float(accumulated.detach().min())
+    mass_tolerance = 1e-9 if probabilities.dtype == torch.float64 else 1e-5
+    if float(mass_error.detach()) > mass_tolerance or negative_before < -mass_tolerance:
+        raise ValueError(
+            f"uniformization error exceeds the {mass_tolerance:.0e} tolerance for "
+            f"{probabilities.dtype}: mass error {float(mass_error):.3e}, "
+            f"most negative entry {negative_before:.3e}"
+        )
     clamped = accumulated.clamp_min(0.0)
     normalized = clamped / clamped.sum(dim=-1, keepdim=True).clamp_min(1e-12)
     # Only rows that actually moved are renormalized; untouched rows stay exact.
@@ -514,6 +611,7 @@ def uniformization_expm_apply(
         "uniformization_terms": generator.new_tensor(float(terms)),
         "poisson_tail": generator.new_tensor(float(tail)),
         "mass_error": mass_error.detach(),
+        "mass_tolerance": generator.new_tensor(float(mass_tolerance)),
         "min_probability_before_clamp": generator.new_tensor(negative_before),
     }
 
@@ -575,19 +673,24 @@ class BirthDeathCTMCOperator(StyleOperator):
     def _level_generator(self, up_rate: torch.Tensor, down_rate: torch.Tensor) -> torch.Tensor:
         """Generator over FSQ levels, optionally with a permuted adjacency.
 
-        The rates live on the *visit order* (``level_order``); permuting the
-        generator back into level space keeps the object a valid birth-death
-        CTMC on that order, so a shuffled run differs from the design only in
-        which levels are neighbours.
+        ``level_order`` is the chain *in level space*: the edge ``order[i] ->
+        order[i + 1]`` carries ``up_rate[i]``.  ``birth_death_generator`` builds
+        the chain in visit coordinates, so mapping it into level space needs the
+        **inverse** permutation ``order^-1``; indexing with ``order`` itself left
+        the level-space graph unchanged (still ``i -> i + 1``) and only relabelled
+        which rate sat on which edge, so the geometry control was not a geometry
+        control at all.
         """
         generator = birth_death_generator(up_rate, down_rate)
         if not self.shuffled_adjacency:
             return generator
         order = torch.as_tensor(self.level_order, device=generator.device)
-        return generator[..., order][..., order, :]
+        inverse = torch.argsort(order)
+        return generator[..., inverse][..., inverse, :]
 
     def forward(self, inputs: OperatorInputs) -> OperatorOutput:
         up_rate, down_rate, support = self.rates(inputs)
+        eligible = self.eligible(inputs)
         generator = self._level_generator(up_rate, down_rate)
         styled, diagnostics = uniformization_expm_apply(
             generator,
@@ -595,7 +698,9 @@ class BirthDeathCTMCOperator(StyleOperator):
             tolerance=self.uniformization_tolerance,
             max_terms=self.max_terms,
         )
-        diagnostics["support_fraction"] = support.mean()
+        styled = self.region_identity(inputs, styled)
+        diagnostics["support_fraction"] = eligible.float().mean()
+        diagnostics["strength_mean"] = self._strength_tensor(inputs).mean()
         diagnostics["max_up_rate"] = up_rate.max()
         diagnostics["max_down_rate"] = down_rate.max()
         diagnostics["shuffled_adjacency"] = up_rate.new_tensor(
@@ -608,11 +713,15 @@ class BirthDeathCTMCOperator(StyleOperator):
         )
 
     def reference_expm(self, inputs: OperatorInputs) -> torch.Tensor:
-        """``torch.matrix_exp`` reference for tests and spot checks."""
+        """``torch.matrix_exp`` reference for tests and spot checks.
+
+        Returns the same region-blended object as :meth:`forward`, so the two are
+        directly comparable outside the region too.
+        """
         up_rate, down_rate, _ = self.rates(inputs)
         generator = self._level_generator(up_rate, down_rate)
         applied = inputs.base_probabilities().unsqueeze(-2) @ torch.matrix_exp(generator)
-        return applied.squeeze(-2)
+        return self.region_identity(inputs, applied.squeeze(-2))
 
 
 def build_operator(name: str, **kwargs: Any) -> StyleOperator:

@@ -25,7 +25,8 @@ from typing import Any
 import numpy as np
 import torch
 
-from .contract import masked_cross_entropy
+from .contract import masked_nll_from_probs
+from .eval_protocol import retrieval_report
 from .model import MtsStyleOperator, OperatorBatch
 from stylized_motion.learning.losses import (
     integrate_root_trajectory,
@@ -104,18 +105,38 @@ def strength_response(
     """Strength sweep: how far the styled distribution moves from the base."""
     crn = CommonRandomNumbers(seed=3407)
     with torch.no_grad():
-        base_result = model(_with_strength(batch, 0.0))
-    base_probs = base_result.probabilities
+        # The base is the *frozen transport's* distribution.  `strength=0` is only
+        # the base for families with an identity anchor; the arbitrary kernel is
+        # uniform there by design, so using it as the reference would measure the
+        # kernel against itself.
+        base_result = model(batch)
+    base_probs = base_result.base_probabilities
+    base_argmax = base_probs.argmax(dim=-1)
     curve: list[dict[str, float]] = []
     for strength in strengths:
         with torch.no_grad():
             result = model(_with_strength(batch, float(strength)))
+        identity_probs = (
+            result.probabilities
+            if float(strength) == 0.0
+            else model(_with_strength(batch, 0.0)).probabilities
+        )
         comparison = paired_comparison(result.probabilities, base_probs, crn=crn)
+        styled_argmax = result.probabilities.argmax(dim=-1)
         curve.append(
             {
                 "strength": float(strength),
+                "comparison": "base_transport_vs_styled",
                 "total_variation": comparison["total_variation"],
                 "changed_token_ratio": comparison["changed_token_ratio"],
+                # Named for what it is: an argmax-vs-sampled diagnostic, not a
+                # style effect.
+                "base_argmax_vs_styled_argmax_ratio": float(
+                    (styled_argmax != base_argmax).float().mean().detach()
+                ),
+                "refresh_only_tv": float(
+                    (0.5 * (identity_probs - base_probs).abs().sum(dim=-1).mean()).detach()
+                ),
                 "nll": _nll(model, _with_strength(batch, float(strength))),
                 "styled_entropy": float(
                     -(result.probabilities.clamp_min(1e-9).log() * result.probabilities).sum(-1).mean()
@@ -165,70 +186,74 @@ def style_retrieval(
     targets: OperatorBatch,
     *,
     candidate_sets: Sequence[Sequence[torch.Tensor]],
-    correct_index: Sequence[int],
-) -> dict[str, float]:
-    """Top-1 style retrieval: is the correct reference the best explanation?
+    positive_indices: Sequence[Sequence[int]],
+) -> dict[str, Any]:
+    """Multi-positive top-1 style retrieval.
 
     ``candidate_sets[i]`` holds the candidate reference tensors for target ``i``
-    (``[T, 40]`` or ``[1, T, 40]``) and ``correct_index[i]`` marks which one really
-    shares its style.  Each pair is scored by the masked NLL of the target under
-    that reference, so the accuracy needs no external style classifier — the
-    model ranks its own references.
+    and ``positive_indices[i]`` lists *every* candidate that really shares the
+    target's style: with several same-style references, each of them is a correct
+    answer, not just the first.  The score is the masked target-token NLL under
+    that reference, so the accuracy needs no external style classifier.
+
+    The result is ``hits`` and ``count``, never a rounded batch accuracy, so
+    aggregating across batches is exact.
     """
     batch_size = int(targets.target_tokens.shape[0])
-    if len(candidate_sets) != batch_size or len(correct_index) != batch_size:
+    if len(candidate_sets) != batch_size or len(positive_indices) != batch_size:
         raise ValueError(
-            f"one candidate set and one correct index per target are required, "
-            f"got {len(candidate_sets)}/{len(correct_index)} for {batch_size} targets"
+            f"one candidate set and one positive list per target are required, "
+            f"got {len(candidate_sets)}/{len(positive_indices)} for {batch_size} targets"
         )
-    hits = []
+    scores: list[list[float]] = []
+    positives: list[list[int]] = []
     for row in range(batch_size):
         candidates = candidate_sets[row]
+        row_positives = [int(index) for index in positive_indices[row]]
         if not candidates:
+            scores.append([])
+            positives.append([])
             continue
         row_batch = _row(targets, row)
-        scores = [
-            _nll(
-                model,
-                _with_reference(
-                    row_batch, reference if reference.ndim == 3 else reference.unsqueeze(0)
-                ),
-            )
-            for reference in candidates
-        ]
-        hits.append(int(np.argmin(scores)) == int(correct_index[row]))
-    chance = 1.0 / max(len(candidate_sets[0]), 1) if candidate_sets else 0.0
-    return {
-        "top1_accuracy": float(np.mean(hits)) if hits else 0.0,
-        "targets": float(len(hits)),
-        "candidates": float(max((len(candidates) for candidates in candidate_sets), default=0)),
-        "chance": chance,
-    }
+        scores.append(
+            [
+                _nll(
+                    model,
+                    _with_reference(
+                        row_batch, reference if reference.ndim == 3 else reference.unsqueeze(0)
+                    ),
+                )
+                for reference in candidates
+            ]
+        )
+        positives.append([index for index in row_positives if 0 <= index < len(candidates)])
+    return retrieval_report(scores, positives)
 
 
-def content_preservation(
+def token_likelihood_diagnostics(
     model: MtsStyleOperator,
     batch: OperatorBatch,
-) -> dict[str, float]:
-    """How much of the target's content survives the edit.
+) -> dict[str, Any]:
+    """How the styled distribution scores the *target tokens*.
 
-    ``base_nll`` is the frozen transport's own masked likelihood (the content
-    ceiling); ``styled_nll`` is the operator's.  The difference is the content
-    price of the style edit, and it is reported next to the masked change so a
-    reader cannot mistake "changed a lot" for "preserved a lot".
+    This is a token-likelihood proxy, not a content-recognition score: it asks
+    whether the styled model still assigns probability to the tokens the frozen
+    transport was given, and how far it moved from the frozen base.  The keys say
+    so (``target_token_nll_*``), because "content preserved" is a claim this number
+    cannot support on its own.
     """
     with torch.no_grad():
         result = model(batch)
     target = model.spec.validate_tokens(batch.target_tokens)
     supervision = batch.supervision_mask(model.spec).to(target.device)
     base_nll = float(
-        masked_cross_entropy(
+        masked_nll_from_probs(
             result.base_probabilities, target,
             valid_mask=batch.target_valid_mask, coordinate_mask=supervision,
         ).detach()
     )
     styled_nll = float(
-        masked_cross_entropy(
+        masked_nll_from_probs(
             result.probabilities, target,
             valid_mask=batch.target_valid_mask, coordinate_mask=supervision,
         ).detach()
@@ -236,11 +261,171 @@ def content_preservation(
     base_tokens = result.base_probabilities.argmax(dim=-1)
     styled_tokens = result.probabilities.argmax(dim=-1)
     return {
-        "base_nll": base_nll,
-        "styled_nll": styled_nll,
-        "nll_increase": styled_nll - base_nll,
+        "target_token_nll_base": base_nll,
+        "target_token_nll_styled": styled_nll,
+        "target_token_nll_delta": styled_nll - base_nll,
         "argmax_change_ratio": float((base_tokens != styled_tokens).float().mean()),
+        "note": (
+            "token-likelihood proxy against the frozen base transport; not an "
+            "independent content-recognition score"
+        ),
     }
+
+
+#: Kept so old call sites keep working; the name was the misleading part.
+content_preservation = token_likelihood_diagnostics
+
+
+def token_likelihood_per_sample(
+    model: MtsStyleOperator,
+    batch: OperatorBatch,
+) -> list[dict[str, Any]]:
+    """The same proxy as :func:`token_likelihood_diagnostics`, one row per sample.
+
+    A batch mean hides which sample moved, and the per-sample rows are what the
+    evaluator writes to ``eval_rows.jsonl``.  A sample with no supervised
+    position reports ``None`` instead of a zero that would read as "perfect".
+    """
+    with torch.no_grad():
+        result = model(batch)
+    target = model.spec.validate_tokens(batch.target_tokens)
+    supervision = batch.supervision_mask(model.spec).to(target.device)
+    base_nll, counts = _per_sample_nll(
+        result.base_probabilities, target, supervision, valid_mask=batch.target_valid_mask
+    )
+    styled_nll, _ = _per_sample_nll(
+        result.probabilities, target, supervision, valid_mask=batch.target_valid_mask
+    )
+    rows: list[dict[str, Any]] = []
+    for index in range(int(target.shape[0])):
+        count = int(counts[index])
+        rows.append(
+            {
+                "supervised_tokens": count,
+                "target_token_nll_base": None if count == 0 else float(base_nll[index]),
+                "target_token_nll_styled": None if count == 0 else float(styled_nll[index]),
+                "target_token_nll_delta": None
+                if count == 0
+                else float(styled_nll[index] - base_nll[index]),
+            }
+        )
+    return rows
+
+
+def _per_sample_nll(
+    probabilities: torch.Tensor,
+    target: torch.Tensor,
+    coordinate_mask: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor | None = None,
+    clamp_min: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``([B] mean NLL, [B] supervised count)`` over each sample's masked positions."""
+    picked = probabilities.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    nll = -picked.clamp_min(float(clamp_min)).log()
+    mask = coordinate_mask.to(torch.bool)
+    if valid_mask is not None:
+        mask = mask & valid_mask.to(mask.device).bool().unsqueeze(-1)
+    weights = mask.to(nll.dtype)
+    counts = weights.sum(dim=(1, 2))
+    totals = (nll * weights).sum(dim=(1, 2))
+    return totals / counts.clamp_min(1.0), counts
+
+
+def ordinal_level_mass(
+    probabilities: torch.Tensor,
+    base_probabilities: torch.Tensor,
+    *,
+    supervision: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None,
+) -> dict[str, float | int | None]:
+    """How the styled mass sits relative to the base mode on the ordered axis.
+
+    ``adjacent_mass_fraction`` is ``p(base mode) + p(mode - 1) + p(mode + 1)`` with
+    the neighbours gathered **only when they exist**: the E05 script clamped the
+    index instead, so at level 0 or level 8 the boundary bin was counted twice and
+    the "fraction" could reach 2.  A fraction above 1 is not a fraction.
+
+    ``expected_level_displacement`` is the styled mass's mean ``|level - base mode|``
+    -- a property of the styled distribution, not of any kernel, so it does not
+    pretend to be a transition displacement.  A birth-death kernel's own
+    displacement has its own name (``kernel_level_displacement``) and is reported
+    nowhere here.
+    """
+    if probabilities.shape != base_probabilities.shape:
+        raise ValueError("probabilities and base_probabilities must share a shape")
+    levels = probabilities.shape[-1]
+    index = torch.arange(levels, device=probabilities.device, dtype=torch.float32)
+    base_mode = base_probabilities.argmax(dim=-1, keepdim=True)
+    base_mode_float = base_mode.to(torch.float32)
+    displacement = (probabilities * (index.view(1, 1, 1, -1) - base_mode_float).abs()).sum(-1)
+    adjacent = probabilities.gather(-1, base_mode).squeeze(-1)
+    for offset in (-1, 1):
+        neighbour = base_mode + offset
+        inside = (neighbour >= 0) & (neighbour <= levels - 1)
+        gathered = probabilities.gather(-1, neighbour.clamp(0, levels - 1)).squeeze(-1)
+        adjacent = adjacent + torch.where(inside.squeeze(-1), gathered, torch.zeros_like(gathered))
+    tv = 0.5 * (probabilities - base_probabilities).abs().sum(-1)
+    mask = torch.ones_like(displacement, dtype=torch.bool)
+    if supervision is not None:
+        mask = mask & supervision.to(mask.device).bool()
+    if valid_mask is not None:
+        mask = mask & valid_mask.to(mask.device).bool().unsqueeze(-1)
+    count = int(mask.sum())
+    if count == 0:
+        return {
+            "supervised_positions": 0,
+            "adjacent_mass_fraction": None,
+            "expected_level_displacement": None,
+            "tv_from_base": None,
+        }
+    return {
+        "supervised_positions": count,
+        "adjacent_mass_fraction": float(adjacent[mask].mean()),
+        "expected_level_displacement": float(displacement[mask].mean()),
+        "tv_from_base": float(tv[mask].mean()),
+    }
+
+
+def wasserstein_1d(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """``W1 = sum_i |CDF_left(i) - CDF_right(i)|`` over the last axis.
+
+    The one distance that compares a diffusion kernel's marginal against a logit
+    arm's marginal on the same ordered axis; the kernel's own transition
+    displacement (``sum p0(i) K(i, j) |i - j|``) is a different quantity and is
+    never mixed into it.  A one-level shift gives exactly 1.0 and equal
+    distributions give exactly 0.0.
+    """
+    if left.shape != right.shape:
+        raise ValueError("Wasserstein 1D needs two distributions of the same shape")
+    if left.shape[-1] < 2:
+        raise ValueError("The level axis must have at least two entries")
+    left_cdf = left.cumsum(dim=-1)[..., :-1]
+    right_cdf = right.cumsum(dim=-1)[..., :-1]
+    return (left_cdf - right_cdf).abs().sum(dim=-1)
+
+
+def third_difference_jerk(positions: torch.Tensor, dt: float) -> torch.Tensor:
+    """``d^3 position / dt^3`` over the time axis, in ``m/s^3``.
+
+    A constant-velocity trajectory gives exactly zero and a cubic ``a t^3`` gives
+    exactly ``6a``, which is what makes the number checkable against an analytic
+    value instead of only "bigger after an edit".
+    """
+    if positions.ndim < 3:
+        raise ValueError("positions must be [B, T, J, 3]")
+    if positions.shape[1] < 4:
+        raise ValueError("jerk needs at least four frames")
+    dt = float(dt)
+    if dt <= 0.0:
+        raise ValueError("dt must be positive")
+    third = (
+        positions[:, 3:]
+        - 3.0 * positions[:, 2:-1]
+        + 3.0 * positions[:, 1:-2]
+        - positions[:, :-3]
+    )
+    return third / dt**3
 
 
 def physics_metrics(
@@ -250,10 +435,15 @@ def physics_metrics(
     kinematic: Any,
     edit_interval: tuple[int, int] | None = None,
 ) -> dict[str, float]:
-    """FK, root, contact, foot-slide and boundary-jerk cost of one edit.
+    """FK, root, contact, foot-slide and jerk cost of one edit.
 
     ``baseline_motion`` and ``edited_motion`` are decoded, normalized motion
     feature tensors ``[B, T, motion_dim]`` that share everything except the edit.
+    Every unit is stated: jerk is ``m/s^3`` from FK world positions, foot slide is
+    ``m/s`` from FK world positions, and contact prevalence reports the gate it
+    used.  Metrics that cannot be computed are ``None`` with a count, never a
+    flattering zero: a foot-slide average over zero contact frames is not 0.0, it
+    does not exist.
     """
     if baseline_motion.shape != edited_motion.shape:
         raise ValueError("baseline and edited motion must share a shape")
@@ -303,32 +493,129 @@ def physics_metrics(
         baseline_velocity = (
             baseline_positions[:, 1:, toe_indices] - baseline_positions[:, :-1, toe_indices]
         )[..., (0, 2)].abs().mean(dim=-1) / float(kinematic.dt)
-        weighted_gate = contact_gate.sum().clamp_min(1.0)
-        metrics.update(
-            {
-                "contact_flip_rate": float(
-                    (edited_contacts != baseline_contacts).any(dim=-1).float().mean()
-                ),
-                "foot_slide_edited": float((foot_velocity * contact_gate).sum() / weighted_gate),
-                "foot_slide_baseline": float(
-                    (baseline_velocity * contact_gate).sum() / weighted_gate
-                ),
-                "foot_skate_ratio": float(
-                    (foot_velocity * contact_gate).sum()
-                    / (baseline_velocity * contact_gate).sum().clamp_min(1e-6)
-                ),
-            }
-        )
-    if edit_interval is not None:
-        start, stop = int(edit_interval[0]), int(edit_interval[1])
-        velocity = (edited_motion[:, 1:] - edited_motion[:, :-1]) - (
-            baseline_motion[:, 1:] - baseline_motion[:, :-1]
-        )
-        step = velocity.abs().amax(dim=(0, 2))
-        lower = max(start - 1, 0)
-        upper = min(max(stop, lower + 1), step.numel())
-        metrics["boundary_jerk_max"] = float(step[lower:upper].max()) if upper > lower else 0.0
+        gate_frames = int(contact_gate.sum())
+        metrics["contact_gate_frames"] = gate_frames
+        metrics["contact_threshold"] = float(kinematic.contact_threshold)
+        metrics["foot_slide_unit"] = "m/s"
+        if gate_frames > 0:
+            metrics.update(
+                {
+                    "contact_flip_rate": float(
+                        (edited_contacts != baseline_contacts).any(dim=-1).float().mean()
+                    ),
+                    "foot_slide_edited": float(
+                        (foot_velocity * contact_gate).sum() / gate_frames
+                    ),
+                    "foot_slide_baseline": float(
+                        (baseline_velocity * contact_gate).sum() / gate_frames
+                    ),
+                    "foot_skate_ratio": float(
+                        (foot_velocity * contact_gate).sum()
+                        / (baseline_velocity * contact_gate).sum().clamp_min(1e-6)
+                    ),
+                }
+            )
+        else:
+            # No contact frame: the average does not exist, and reporting 0.0 would
+            # look like a perfectly clean slide.
+            metrics.update(
+                {
+                    "contact_flip_rate": None,
+                    "foot_slide_edited": None,
+                    "foot_slide_baseline": None,
+                    "foot_skate_ratio": None,
+                    "foot_slide_reason": "no_contact_frames",
+                }
+            )
+    # Third derivative of the FK world positions, in m/s^3.  A constant-velocity
+    # trajectory has jerk exactly 0 and a cubic has the analytic 6a; a "jerk" that
+    # is really a first difference of features is a different quantity with a
+    # different unit, so it keeps its own name (``feature_delta_change_max``).
+    dt = float(kinematic.dt)
+    if dt <= 0.0:
+        raise ValueError("kinematic.dt must be positive")
+    if baseline_motion.shape[1] >= 4:
+        baseline_jerk = third_difference_jerk(baseline_positions, dt)
+        edited_jerk = third_difference_jerk(edited_positions, dt)
+        # Keep the comparison in the same measurement region for both sides.
+        magnitude = edited_jerk.norm(dim=-1)  # [B, T-3, J]
+        baseline_magnitude = baseline_jerk.norm(dim=-1)
+        metrics["jerk_mean"] = float(magnitude.mean())
+        metrics["jerk_max"] = float(magnitude.max())
+        metrics["jerk_mean_baseline"] = float(baseline_magnitude.mean())
+        metrics["jerk_change_mean"] = float((magnitude - baseline_magnitude).abs().mean())
+        if edit_interval is not None:
+            start, stop = int(edit_interval[0]), int(edit_interval[1])
+            # The interval applies to the *signal*: a third difference at index i
+            # uses frames i..i+3, so the boundary neighbourhood is the frames whose
+            # stencil touches the edit boundary.  An anomaly far outside the region
+            # must not leak into these numbers.
+            neighbourhood = 3
+            inner = (max(start, 0), min(max(stop - 3, start), magnitude.shape[1]))
+            metrics["jerk_mean_inside"] = (
+                float(magnitude[:, inner[0] : inner[1]].mean()) if inner[1] > inner[0] else None
+            )
+            left = (max(start - neighbourhood, 0), max(start, 0))
+            right = (max(stop - 3, 0), min(stop + neighbourhood - 3, magnitude.shape[1]))
+            boundary = []
+            if left[1] > left[0]:
+                boundary.append(magnitude[:, left[0] : left[1]])
+            if right[1] > right[0]:
+                boundary.append(magnitude[:, right[0] : right[1]])
+            metrics["jerk_max_boundary"] = (
+                float(torch.cat(boundary, dim=1).max()) if boundary else None
+            )
+        if edit_interval is not None:
+            start, stop = int(edit_interval[0]), int(edit_interval[1])
+            velocity = (edited_motion[:, 1:] - edited_motion[:, :-1]) - (
+                baseline_motion[:, 1:] - baseline_motion[:, :-1]
+            )
+            step = velocity.abs().amax(dim=(0, 2))
+            lower = max(start - 1, 0)
+            upper = min(max(stop, lower + 1), step.numel())
+            metrics["feature_delta_change_max"] = (
+                float(step[lower:upper].max()) if upper > lower else None
+            )
     return metrics
+
+
+def comparison_physics(
+    *,
+    source_motion: torch.Tensor,
+    base_motion: torch.Tensor,
+    styled_motion: torch.Tensor,
+    kinematic: Any,
+    edit_interval: tuple[int, int] | None = None,
+) -> dict[str, dict[str, float]]:
+    """Physics for the three comparisons the plan asks for, kept apart.
+
+    ``source->base`` is what sampling the base costs, ``base->styled`` is the style
+    edit proper, and ``source->styled`` is the end-to-end effect.  Reporting one
+    mixed number would hide which of the two steps moved the motion.
+    """
+    return {
+        "source_to_base": {
+            "comparison": "source_to_base",
+            **physics_metrics(
+                baseline_motion=source_motion, edited_motion=base_motion,
+                kinematic=kinematic, edit_interval=edit_interval,
+            ),
+        },
+        "base_to_styled": {
+            "comparison": "base_to_styled",
+            **physics_metrics(
+                baseline_motion=base_motion, edited_motion=styled_motion,
+                kinematic=kinematic, edit_interval=edit_interval,
+            ),
+        },
+        "source_to_styled": {
+            "comparison": "source_to_styled",
+            **physics_metrics(
+                baseline_motion=source_motion, edited_motion=styled_motion,
+                kinematic=kinematic, edit_interval=edit_interval,
+            ),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -367,14 +654,58 @@ def _with_strength(batch: OperatorBatch, strength: Any) -> OperatorBatch:
     return OperatorBatch(**payload)
 
 
+#: Fields whose first axis is the *batch*, so a row slice is valid.  Everything
+#: else keeps its shape: ``hard_mask`` is ``[T, K]`` or ``[B, T, K]``, and slicing
+#: it because ``T`` happens to equal ``B`` silently changes which tokens the row
+#: may edit.
+_BATCH_AXIS_FIELDS = frozenset(
+    {
+        "target_tokens",
+        "reference_tokens",
+        "visible_mask",
+        "anchor_mask",
+        "target_valid_mask",
+        "reference_valid_mask",
+        "style_ids",
+        "reference_style_ids",
+        "content_condition",
+        "strength",
+        "sample_metadata",
+    }
+)
+
+
 def _row(batch: OperatorBatch, row: int) -> OperatorBatch:
-    payload = {}
+    """One row of a batch, with per-field semantics instead of shape guessing.
+
+    ``hard_mask`` is kept when it is ``[T, K]`` (a shared region) and sliced only
+    when it is ``[B, T, K]``; the metadata list is sliced with the tensors so the
+    row keeps its own provenance.
+    """
+    import dataclasses
+
+    batch_size = int(batch.target_tokens.shape[0])
+    payload: dict[str, Any] = {}
     for name, value in batch.__dict__.items():
-        if isinstance(value, torch.Tensor) and value.ndim > 1 and value.shape[0] == batch.target_tokens.shape[0] or isinstance(value, torch.Tensor) and value.ndim == 1 and value.shape[0] == batch.target_tokens.shape[0]:
-            payload[name] = value[row : row + 1]
-        else:
+        if name not in _BATCH_AXIS_FIELDS:
             payload[name] = value
-    return OperatorBatch(**payload)
+            continue
+        if isinstance(value, list):
+            payload[name] = [value[row]] if 0 <= row < len(value) else []
+            continue
+        if isinstance(value, tuple):
+            payload[name] = (value[row],) if 0 <= row < len(value) else ()
+            continue
+        if not isinstance(value, torch.Tensor):
+            payload[name] = value
+            continue
+        if value.ndim == 0 or (value.shape and value.shape[0] != batch_size):
+            payload[name] = value
+            continue
+        payload[name] = value[row : row + 1]
+    if batch.hard_mask is not None and batch.hard_mask.ndim == 3:
+        payload["hard_mask"] = batch.hard_mask[row : row + 1]
+    return dataclasses.replace(batch, **payload)
 
 
 def _nll(model: MtsStyleOperator, batch: OperatorBatch) -> float:
@@ -412,8 +743,11 @@ def aggregate(rows: Sequence[Mapping[str, float]]) -> dict[str, dict[str, float]
 
 
 __all__ = [
+    "comparison_physics",
+    "token_likelihood_diagnostics",
     "aggregate",
     "content_preservation",
+    "ordinal_level_mass",
     "physics_metrics",
     "reference_sensitivity",
     "representation_metrics",
@@ -421,4 +755,5 @@ __all__ = [
     "style_retrieval",
     "support_locality",
     "unavailable_metrics",
+    "wasserstein_1d",
 ]

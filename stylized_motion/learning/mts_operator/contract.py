@@ -231,19 +231,77 @@ def require_frame_mask(
     return TokenSpec().validate_frame_mask(valid_mask.to(device).bool(), batch=batch, frames=frames)
 
 
+def _supervision_mask(
+    shape: tuple[int, ...],
+    *,
+    valid_mask: torch.Tensor | None,
+    coordinate_mask: torch.Tensor | None,
+    device: torch.device,
+) -> torch.Tensor:
+    """The single place the supervised positions are computed.
+
+    ``valid_mask`` [B, T] excludes padding, ``coordinate_mask`` [B, T, K] excludes
+    positions the caller is not predicting.  Counts are element counts of this
+    mask, never an average fraction, so accumulation across batches stays exact.
+    """
+    mask = torch.ones(shape, dtype=torch.bool, device=device)
+    if valid_mask is not None:
+        if valid_mask.shape != shape[:2]:
+            raise ValueError(f"valid_mask must be {shape[:2]}, got {tuple(valid_mask.shape)}")
+        mask &= valid_mask.to(device).bool().unsqueeze(-1)
+    if coordinate_mask is not None:
+        if coordinate_mask.shape != shape:
+            raise ValueError(f"coordinate_mask must be {shape}, got {tuple(coordinate_mask.shape)}")
+        mask &= coordinate_mask.to(device).bool()
+    return mask
+
+
+def _compute_dtype(reference: torch.Tensor) -> torch.dtype:
+    """Accumulate in float32, but never lose a float64 input's precision."""
+    return torch.float64 if reference.dtype == torch.float64 else torch.float32
+
+
+def _reduce_selected(nll: torch.Tensor, *, reduction: str, reference: torch.Tensor) -> torch.Tensor:
+    if reduction == "sum":
+        return nll.sum()
+    if reduction == "mean":
+        # nll is already restricted to supervised positions.
+        return nll.mean() if nll.numel() else reference.new_zeros(())
+    raise ValueError(f"Unsupported reduction {reduction!r}; expected 'mean' or 'sum'")
+
+
+def _selected_targets(
+    targets: torch.Tensor, mask: torch.Tensor, *, num_levels: int, device: torch.device
+) -> torch.Tensor:
+    """Targets at supervised positions only, range-checked where they count.
+
+    Filtering before the gather is what keeps an invalid target at a padded or
+    locked position from raising: only positions the loss actually scores are
+    validated.
+    """
+    chosen = targets.to(device).long()[mask]
+    if chosen.numel():
+        if int(chosen.min()) < 0 or int(chosen.max()) >= num_levels:
+            raise ValueError(
+                f"targets at supervised positions must be in [0, {num_levels - 1}], "
+                f"got [{int(chosen.min())}, {int(chosen.max())}]"
+            )
+    return chosen
+
+
 def masked_cross_entropy(
     logits: torch.Tensor,
     targets: torch.Tensor,
     *,
     valid_mask: torch.Tensor | None = None,
     coordinate_mask: torch.Tensor | None = None,
+    reduction: str = "mean",
 ) -> torch.Tensor:
-    """Mean token cross-entropy over the supervised positions only.
+    """Token cross-entropy over the supervised positions, from **logits**.
 
-    ``valid_mask`` [B, T] excludes padded frames, ``coordinate_mask`` [B, T, 40]
-    excludes tokens the caller is not predicting (masked or locked positions).
-    An empty supervision set returns a zero loss instead of NaN, so a batch that
-    happens to have no masked position cannot corrupt a training step.
+    An empty supervision set returns a zero that keeps the autograd graph, so a
+    batch without a single masked position cannot corrupt a training step; the
+    caller decides whether to skip the step (see the trainers' token counts).
     """
     if logits.ndim != 4:
         raise ValueError(f"logits must be [B, T, K, levels], got {tuple(logits.shape)}")
@@ -251,16 +309,67 @@ def masked_cross_entropy(
         raise ValueError(
             f"targets must be {tuple(logits.shape[:3])}, got {tuple(targets.shape)}"
         )
-    mask = torch.ones(logits.shape[:3], dtype=torch.bool, device=logits.device)
-    if valid_mask is not None:
-        mask &= valid_mask.to(logits.device).bool().unsqueeze(-1)
-    if coordinate_mask is not None:
-        mask &= coordinate_mask.to(logits.device).bool()
+    if reduction not in {"mean", "sum"}:
+        raise ValueError(f"Unsupported reduction {reduction!r}; expected 'mean' or 'sum'")
+    device = logits.device
+    mask = _supervision_mask(
+        logits.shape[:3], valid_mask=valid_mask, coordinate_mask=coordinate_mask, device=device
+    )
     if not bool(mask.any()):
-        return logits.new_zeros(())
-    log_probs = F.log_softmax(logits.float(), dim=-1)
-    gathered = log_probs.gather(-1, targets.to(logits.device).long().unsqueeze(-1)).squeeze(-1)
-    return -(gathered * mask.to(gathered.dtype)).sum() / mask.to(gathered.dtype).sum()
+        # A zero that still reaches the graph: a batch with nothing to predict
+        # must not break backward for the caller.
+        return logits.sum() * 0.0
+    chosen = _selected_targets(targets, mask, num_levels=logits.shape[-1], device=device)
+    log_probs = F.log_softmax(logits[mask].to(_compute_dtype(logits)), dim=-1)
+    nll = -log_probs.gather(-1, chosen.unsqueeze(-1)).squeeze(-1)
+    return _reduce_selected(nll, reduction=reduction, reference=logits)
+
+
+def masked_nll_from_probs(
+    probabilities: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor | None = None,
+    coordinate_mask: torch.Tensor | None = None,
+    reduction: str = "mean",
+    clamp_min: float = 1e-12,
+) -> torch.Tensor:
+    """Negative log-likelihood of the targets **from probabilities**.
+
+    This is the operator-side objective: the CTMC and kernel families emit
+    probabilities rather than logits, and feeding those into
+    :func:`masked_cross_entropy` silently computed a different quantity (audit:
+    1.3804 instead of 0.010050 for p_target = 0.99).  Finite/negative/mass checks
+    belong at the operator boundary, not in every call (they would force a
+    device sync per batch).
+    """
+    if probabilities.ndim != 4:
+        raise ValueError(
+            f"probabilities must be [B, T, K, levels], got {tuple(probabilities.shape)}"
+        )
+    if targets.shape != probabilities.shape[:3]:
+        raise ValueError(
+            f"targets must be {tuple(probabilities.shape[:3])}, got {tuple(targets.shape)}"
+        )
+    if reduction not in {"mean", "sum"}:
+        raise ValueError(f"Unsupported reduction {reduction!r}; expected 'mean' or 'sum'")
+    device = probabilities.device
+    mask = _supervision_mask(
+        probabilities.shape[:3],
+        valid_mask=valid_mask,
+        coordinate_mask=coordinate_mask,
+        device=device,
+    )
+    if not bool(mask.any()):
+        # A zero that still reaches the graph (see masked_cross_entropy).
+        return probabilities.sum() * 0.0
+    chosen = _selected_targets(
+        targets, mask, num_levels=probabilities.shape[-1], device=device
+    )
+    selected = probabilities[mask].to(_compute_dtype(probabilities))
+    picked = selected.gather(-1, chosen.unsqueeze(-1)).squeeze(-1)
+    nll = -picked.clamp_min(float(clamp_min)).log()
+    return _reduce_selected(nll, reduction=reduction, reference=probabilities)
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -406,6 +515,7 @@ __all__ = [
     "TransportOutput",
     "fingerprint_hash",
     "masked_cross_entropy",
+    "masked_nll_from_probs",
     "masked_mean",
     "draw_device",
     "normalize_mask_mixture",
