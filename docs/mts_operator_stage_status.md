@@ -147,3 +147,26 @@ bash /tmp/run_reference.sh   # 脚本内 --hidden-dim 128 现已被正确应用
 4. **flat 的接触指标是退化解**（解码足部几乎静止 → "永远接触" 得高准确率），不能读作 flat 接触建模更好。
 5. **P4 的 reference 算子容量为 dim 256**（覆盖失效时期的产物），与 transport 的 128 不一致，需在论文中
    注明或按 §7.4 重训。
+
+## 9. 勘误（revision-2 收口后补充，2026-09-17）
+
+本节只追加，不修改上面的历史记录。历史读数仍按当时的口径成立，但以下表述已被后续工作更正：
+
+1. **“恢复执行步骤”里的 `/tmp/*.sh` 脚本不再是入口**：transport 的 `--checkpoint` 现在是明确的
+   迁移错误，恢复语义由 `--warm-start` 承担（只载权重，optimizer/step/best 从零）。
+2. **固定协议此前并非 batch 无关**：C03 起每个验证项一行 mask，C09 用同一 manifest 在 B=2 与 B=1
+   各评一次复验（逐行 NLL 1e-4 内一致）。
+3. **“SHA 已绑定”此前不成立**：C02 之前 checkpoint 只是把 tokenizer SHA 写进 payload，加载时不比较；
+   现在 `load_operator_bundle` / 训练入口 / 评估入口都要求文件级比对，真实数据上已验证
+   （旧 1h tokenizer 配 holdout store 会被 store_identity 拒绝）。
+4. **在线编码路径的旧数值需重跑**：packed feature store 的原始帧曾被当成已归一化帧送入 tokenizer，
+   同一窗口约 71% token 不一致；修正后 CUDA 上逐位一致、CPU 边界量化差异 0.13%
+   （`nef_data.store_normalized_window`，C09-D 证据）。用该路径得到的 MTS/probe 读数按修正后的实现重跑。
+5. **物理指标（R11）**：旧的 `boundary_jerk_max` 已更名 `feature_delta_change_max`（单位不同），
+   新的 jerk 是 FK world position 的三阶差分（m/s³），source/base/styled 三个对比分开报告。
+6. **`/tmp/run_matrix.sh` 的 26-cell 矩阵**：`--operator` 覆盖在旧版本被接受但未生效，已修；
+   但矩阵里的旧算子 checkpoint 属 schema 1，不能作为 revision-2 结果引用。
+
+revision 2 的门槛状态、逐任务证据与下一轮实验申请见
+[MTS_FSQ_Code_Revision_Progress_zh.md](MTS_FSQ_Code_Revision_Progress_zh.md) 与
+[mts_revision2_experiment_request_zh.md](mts_revision2_experiment_request_zh.md)。

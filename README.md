@@ -229,6 +229,40 @@ python scripts/generate_mts_operator.py --checkpoint <operator.pt> --tokenizer-c
 [docs/mts_operator_landing.md](docs/mts_operator_landing.md)；Phase 0 两个探针怎么读见
 [docs/nef_phase0_probe.md](docs/nef_phase0_probe.md)。
 
+revision 2 的入口契约、逐条修订证据与门槛状态见
+[docs/MTS_FSQ_Code_Revision_Progress_zh.md](docs/MTS_FSQ_Code_Revision_Progress_zh.md)；
+下一轮实验的命令与预算申请见
+[docs/mts_revision2_experiment_request_zh.md](docs/mts_revision2_experiment_request_zh.md)
+（实验清单：`data/configs/mts_revision2_experiment_manifest.yaml`，只生成命令不执行）。
+训练前先跑预检，它会核对 tokenizer/store 的 SHA、划分隔离、标签与窗口可读性：
+
+```bash
+python scripts/preflight_mts_revision2.py \
+  --config data/configs/mts_revision2_style.yaml \
+  --output outputs/mts_revision2_closure/preflight
+```
+
+勘误（历史文档里的表述已过时，按 revision 2 的实际情况为准）：
+
+- 历史 MTS 配方（`mts_operator_*.yaml`）在修订轮中被追加过字段（`position_encoding`、
+  `content.kind`、`target_sampling`、`token_embed_dim`），因此它们描述的运行与当时实际执行的可能不同；
+  复现历史运行请先看差异表，不要 checkout 覆盖。
+- 旧 MTS transport/operator checkpoint（schema 1 / 旧 architecture revision）不再可加载，需按
+  revision 2 重训；NEF tokenizer 与既有 representation/physics 结果按原协议继续有效。
+- **feature 在线编码**路径曾有输入空间错误（把 packed store 的原始帧当已归一化帧），修好后
+  同窗口 token 与 token store 一致（CUDA 逐位、CPU 边界量化 0.13%）；该路径的旧数值需重跑。
+
+MTS revision 2 的能力边界（入口会拒绝，不会静默降级）：
+
+| 能力 | 状态 |
+|---|---|
+| unseen style（`data.pairs.held_out_styles`） | 只实现"排除 + 曝光记录"：被排除的 style 不参与训练，checkpoint 记录 `training_exposure`，评估时的 `--held-out-styles` 必须与记录一致。**尚未做过任何 held-out style 实验**；SEED 没有独占 style（每个 style 都出现在 train 与 test），所以该轴需要显式排除或换数据集 |
+| unseen performer | 由 store 自己的划分决定（v4-ah：52 演员整组进 test），训练/评估都按 store 的 split 走 |
+| multi-style | 未实现：一个 batch 只用**一个** reference 或一个 style id |
+| content loss（`content_weight`） | revision 2 已移除；配成非零会直接报错（旧项是对 base 分布测的，不是对 content） |
+| AMP / 混合精度 | MTS revision 2 只支持 fp32；`precision: amp` 与 `amp: true` 会被拒绝（上面 README 里的 AMP 说明只适用于 representation 训练） |
+| exact resume | 未实现：`--checkpoint` 是明确的迁移错误，`--warm-start` 只载权重（optimizer/step/best 从零） |
+
 ## TokenStore 与 Generator
 
 TokenStore 由匹配的 representation checkpoint 构建。它继承 FeatureStore 的 range、split 和 feature schema；不会重新划分数据。
